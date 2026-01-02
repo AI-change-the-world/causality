@@ -57,7 +57,11 @@ pub struct AppState {
         config::list_providers,
         config::create_provider,
         config::update_provider,
-        config::set_default_provider,
+        config::delete_provider,
+        config::list_llm_providers,
+        config::create_llm_provider,
+        config::update_llm_provider,
+        config::delete_llm_provider,
         audit::query_audit_logs,
         health::health_check,
         health::metrics,
@@ -72,13 +76,17 @@ pub struct AppState {
         retrieval::RetrieveApiRequest,
         retrieval::RetrieveApiResponse,
         retrieval::RetrievedMemoryResponse,
-        // Config types
+        // Config types - Embedding providers
         config::ListProvidersResponse,
         config::ProviderInfoResponse,
         config::CreateProviderRequest,
         config::UpdateProviderRequest,
-        config::SetDefaultProviderRequest,
         config::RateLimitConfigResponse,
+        // Config types - LLM providers
+        config::ListLlmProvidersResponse,
+        config::LlmProviderInfoResponse,
+        config::CreateLlmProviderRequest,
+        config::UpdateLlmProviderRequest,
         // Audit types
         audit::AuditQueryRequest,
         audit::AuditQueryResponse,
@@ -96,6 +104,7 @@ pub struct AppState {
         crate::domain::ProcessingStatus,
         crate::domain::MemoryCategory,
         crate::embedding::ProviderType,
+        crate::llm::LlmProviderType,
         // Error types
         crate::error::ErrorResponse,
         crate::error::ErrorCode,

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
+use utoipa::ToSchema;
 
 /// Errors that can occur during LLM operations
 #[derive(Debug, Error)]
@@ -53,7 +54,7 @@ pub enum LlmError {
 }
 
 /// Type of LLM provider
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "provider_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProviderType {

@@ -13,7 +13,9 @@ use std::time::Duration;
 use axum::http::header::HeaderName;
 use memory_server::api::{create_router, health::init_start_time, AppState};
 use memory_server::config::AppConfig;
-use memory_server::repository::{AuditRepository, ConfigRepository, MemoryRepository};
+use memory_server::repository::{
+    AuditRepository, ConfigRepository, LlmProviderRepository, MemoryRepository,
+};
 use memory_server::service::{ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
@@ -92,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
     let memory_repo = MemoryRepository::new(pool.clone());
     let audit_repo = AuditRepository::new(pool.clone());
     let config_repo = ConfigRepository::new(pool.clone());
+    let llm_repo = LlmProviderRepository::new(pool.clone());
 
     // Create services
     let memory_guard = MemoryGuard::new(
@@ -107,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         config.audit.enabled,
     );
 
-    let config_center = ConfigCenter::new(config_repo.clone());
+    let config_center = ConfigCenter::with_llm_repo(config_repo.clone(), llm_repo);
 
     // Initialize config center (load providers from database)
     if let Err(e) = config_center.initialize().await {
