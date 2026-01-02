@@ -451,6 +451,9 @@ mod tests {
             llm_provider: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            inference_type: None,
+            inference_confidence: None,
+            inference_reasoning: None,
         }
     }
 

@@ -11,8 +11,11 @@ mod retrieval_engine;
 
 pub use config_center::{ConfigCenter, LlmProviderInfo, ProviderInfo};
 pub use lifecycle_manager::LifecycleManager;
-pub use memory_guard::{MemoryGuard, UpdateMemoryRequest};
-pub use memory_processor::{
-    MemoryProcessor, ProcessMemoryRequest, ProcessMemoryResult, ProcessingError,
+pub use memory_guard::{
+    CreateFromEventRequest, CreateFromEventResult, MemoryGuard, UpdateMemoryRequest,
 };
-pub use retrieval_engine::{RetrievalEngine, RetrieveRequest, RetrievedMemory};
+pub use memory_processor::{
+    EnhancedQuery, ExtractFromEventRequest, ExtractFromEventResult, MemoryProcessor,
+    ProcessMemoryRequest, ProcessMemoryResult, ProcessingError,
+};
+pub use retrieval_engine::{RetrievalEngine, RetrieveRequest, RetrieveResponse, RetrievedMemory};

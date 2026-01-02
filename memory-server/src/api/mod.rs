@@ -4,12 +4,14 @@
 
 mod audit;
 mod config;
+mod event;
 pub mod health;
 mod memory;
 mod retrieval;
 
 pub use audit::audit_routes;
 pub use config::config_routes;
+pub use event::event_routes;
 pub use health::health_routes;
 pub use memory::memory_routes;
 pub use retrieval::retrieval_routes;
@@ -53,6 +55,7 @@ pub struct AppState {
         memory::get_memory,
         memory::update_memory,
         memory::delete_memory,
+        event::create_from_event,
         retrieval::retrieve_memories,
         config::list_providers,
         config::create_provider,
@@ -72,6 +75,10 @@ pub struct AppState {
         memory::CreateMemoryResponse,
         memory::GetMemoryResponse,
         memory::UpdateMemoryApiRequest,
+        // Event processing types
+        event::CreateFromEventApiRequest,
+        event::CreateFromEventApiResponse,
+        event::ExtractedMemoryResponse,
         // Retrieval types
         retrieval::RetrieveApiRequest,
         retrieval::RetrieveApiResponse,
@@ -103,6 +110,8 @@ pub struct AppState {
         crate::domain::EmbeddingStatus,
         crate::domain::ProcessingStatus,
         crate::domain::MemoryCategory,
+        crate::domain::InferenceType,
+        crate::domain::ProcessingMode,
         crate::embedding::ProviderType,
         crate::llm::LlmProviderType,
         // Error types
@@ -118,6 +127,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .nest("/api/v1/memories", memory_routes())
         .nest("/api/v1/memories", retrieval_routes())
+        .nest("/api/v1/memories", event_routes())
         .nest("/api/v1/config", config_routes())
         .nest("/api/v1/audit", audit_routes())
         .merge(health_routes())

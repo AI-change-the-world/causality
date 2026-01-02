@@ -64,6 +64,10 @@ CREATE TABLE memories (
     embedding_provider VARCHAR(100),
     processing_status processing_status NOT NULL DEFAULT 'skipped',
     llm_provider VARCHAR(100),
+    -- Inference fields (for memories extracted from events)
+    inference_type VARCHAR(50),
+    inference_confidence REAL,
+    inference_reasoning TEXT,
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

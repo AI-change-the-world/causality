@@ -3,6 +3,8 @@
 //! Responsible for write validation, layer constraints, update mode processing,
 //! and optional LLM-driven memory processing (compression, classification, tag extraction).
 //! Acts as a gatekeeper for all memory write operations.
+//!
+//! Extended to support event-to-memory extraction and query enhancement.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -10,12 +12,16 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::domain::{
-    CreateMemoryInput, CreateMemoryValidation, Memory, ProcessingStatus, UpdateMode,
+    CreateMemoryFromEventInput, CreateMemoryInput, CreateMemoryValidation, ExtractedMemory, Layer,
+    Memory, ProcessingMode, ProcessingStatus, ScopeType, UpdateMode,
 };
 use crate::error::{AppError, AppResult};
 use crate::repository::{AuditOperation, AuditRepository, MemoryRepository, UpdateMemoryInput};
 
-use super::{MemoryProcessor, ProcessMemoryRequest};
+use super::{
+    ExtractFromEventRequest, MemoryProcessor, ProcessMemoryRequest, RetrievalEngine,
+    RetrieveRequest, RetrieveResponse,
+};
 
 /// Request for updating a memory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +82,44 @@ impl UpdateMemoryRequest {
     }
 }
 
+/// Request for creating memories from an event
+///
+/// This struct represents a request to extract and optionally create memories
+/// from raw event content. The LLM will automatically understand the event type
+/// and extract relevant memories.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFromEventRequest {
+    /// Event content (any form: click description, conversation history, operation log, etc.)
+    pub content: String,
+    /// Optional context to help LLM better understand the event
+    #[serde(default)]
+    pub context: Option<String>,
+    /// Scope type for created memories
+    pub scope_type: ScopeType,
+    /// Scope identifier for created memories
+    pub scope_id: String,
+    /// Usage scene for created memories
+    pub scene: String,
+    /// Processing mode (auto, assisted, manual)
+    /// Defaults to "assisted" if not specified
+    #[serde(default)]
+    pub mode: Option<ProcessingMode>,
+}
+
+/// Result of creating memories from an event
+///
+/// Contains the event summary, extracted memories, and optionally the IDs
+/// of created memories (only in "auto" mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFromEventResult {
+    /// Event summary (LLM-generated understanding of the event)
+    pub event_summary: String,
+    /// List of extracted memories
+    pub extracted_memories: Vec<ExtractedMemory>,
+    /// IDs of created memories (only populated in "auto" mode)
+    pub created_memory_ids: Option<Vec<Uuid>>,
+}
+
 /// MemoryGuard service for write validation and constraint enforcement
 #[derive(Clone)]
 pub struct MemoryGuard {
@@ -84,6 +128,8 @@ pub struct MemoryGuard {
     audit_enabled: bool,
     /// Optional memory processor for LLM-driven processing
     memory_processor: Option<Arc<MemoryProcessor>>,
+    /// Optional retrieval engine for query enhancement
+    retrieval_engine: Option<Arc<RetrievalEngine>>,
 }
 
 impl MemoryGuard {
@@ -98,6 +144,7 @@ impl MemoryGuard {
             audit_repo,
             audit_enabled,
             memory_processor: None,
+            retrieval_engine: None,
         }
     }
 
@@ -113,12 +160,18 @@ impl MemoryGuard {
             audit_repo,
             audit_enabled,
             memory_processor: Some(memory_processor),
+            retrieval_engine: None,
         }
     }
 
     /// Set the memory processor
     pub fn set_processor(&mut self, processor: Arc<MemoryProcessor>) {
         self.memory_processor = Some(processor);
+    }
+
+    /// Set the retrieval engine
+    pub fn set_retrieval_engine(&mut self, engine: Arc<RetrievalEngine>) {
+        self.retrieval_engine = Some(engine);
     }
 
     /// Create a new memory with validation
@@ -380,6 +433,202 @@ impl MemoryGuard {
             "supersede" => Ok(UpdateMode::Supersede),
             _ => Err(AppError::InvalidUpdateMode(mode.to_string())),
         }
+    }
+
+    /// Create memories from an event
+    ///
+    /// Extracts memories from raw event content using LLM processing.
+    /// The behavior depends on the processing mode:
+    /// - Auto: Extract and create memories without confirmation
+    /// - Assisted: Return proposed memories for user approval (default)
+    /// - Manual: Only summarize events without extraction
+    ///
+    /// # Arguments
+    /// * `request` - The event extraction request containing content and metadata
+    /// * `actor_id` - Optional actor ID for audit logging
+    ///
+    /// # Returns
+    /// * `CreateFromEventResult` containing event summary, extracted memories,
+    ///   and optionally created memory IDs (in auto mode)
+    pub async fn create_from_event(
+        &self,
+        request: CreateFromEventRequest,
+        actor_id: Option<String>,
+    ) -> AppResult<CreateFromEventResult> {
+        let mode = request.mode.unwrap_or_default();
+
+        debug!(
+            content_len = request.content.len(),
+            scope_type = %request.scope_type,
+            scope_id = %request.scope_id,
+            scene = %request.scene,
+            mode = %mode,
+            "Creating memories from event"
+        );
+
+        // Ensure we have a memory processor
+        let processor = self
+            .memory_processor
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("No memory processor configured".to_string()))?;
+
+        // Handle manual mode - only summarize, no extraction
+        if mode == ProcessingMode::Manual {
+            let summary = if processor.needs_summary(&request.content) {
+                processor
+                    .summarize_conversation(&request.content)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+            } else {
+                request.content.clone()
+            };
+
+            return Ok(CreateFromEventResult {
+                event_summary: summary,
+                extracted_memories: Vec::new(),
+                created_memory_ids: None,
+            });
+        }
+
+        // Extract memories from the event
+        let extract_request = ExtractFromEventRequest {
+            content: request.content.clone(),
+            context: request.context.clone(),
+        };
+
+        let extract_result = processor
+            .extract_from_event(extract_request)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // In assisted mode, just return the extracted memories without creating them
+        if mode == ProcessingMode::Assisted {
+            return Ok(CreateFromEventResult {
+                event_summary: extract_result.event_summary,
+                extracted_memories: extract_result.extracted_memories,
+                created_memory_ids: None,
+            });
+        }
+
+        // Auto mode: create memories from extracted results
+        let mut created_ids = Vec::new();
+
+        for extracted in &extract_result.extracted_memories {
+            let memory_input = CreateMemoryFromEventInput {
+                layer: Layer::Session, // Default to session layer
+                scope_type: request.scope_type,
+                scope_id: request.scope_id.clone(),
+                scene: request.scene.clone(),
+                content: extracted.content.clone(),
+                raw_content: Some(request.content.clone()),
+                category: Some(extracted.category),
+                tags: Some(extracted.tags.clone()),
+                importance: extracted.importance,
+                confidence: extracted.confidence,
+                ttl_seconds: None,
+                event_source: None,
+                event_time: None,
+                embedding_provider: None,
+                llm_provider: None,
+                inference_type: extracted.inference_type,
+                inference_confidence: extracted.confidence,
+                inference_reasoning: extracted.reasoning.clone(),
+            };
+
+            let memory = Memory::new_from_event(memory_input);
+            let created = self.memory_repo.create(&memory).await?;
+
+            // Create audit log entry
+            if self.audit_enabled {
+                let new_value = serde_json::to_value(&created).ok();
+                self.audit_repo
+                    .create(
+                        created.id,
+                        AuditOperation::Create,
+                        actor_id.clone(),
+                        None,
+                        new_value,
+                        Some("Created from event extraction".to_string()),
+                    )
+                    .await?;
+            }
+
+            created_ids.push(created.id);
+        }
+
+        info!(
+            memory_count = created_ids.len(),
+            mode = %mode,
+            "Memories created from event"
+        );
+
+        Ok(CreateFromEventResult {
+            event_summary: extract_result.event_summary,
+            extracted_memories: extract_result.extracted_memories,
+            created_memory_ids: Some(created_ids),
+        })
+    }
+
+    /// Retrieve memories with optional query enhancement
+    ///
+    /// If `enhance` is true and a MemoryProcessor is configured, the query
+    /// will be expanded with semantic synonyms before retrieval.
+    /// If `enhance` is false, the original query is used directly.
+    ///
+    /// # Arguments
+    /// * `request` - The retrieval request
+    /// * `enhance` - Whether to enhance the query with semantic expansion
+    /// * `similarities` - Optional vector similarities from Qdrant
+    /// * `actor_id` - Optional actor ID for audit logging
+    ///
+    /// # Returns
+    /// * `RetrieveResponse` containing matched memories
+    pub async fn retrieve_with_enhancement(
+        &self,
+        mut request: RetrieveRequest,
+        enhance: bool,
+        similarities: Option<Vec<(Uuid, f32)>>,
+        actor_id: Option<String>,
+    ) -> AppResult<RetrieveResponse> {
+        debug!(
+            query = %request.query,
+            enhance = enhance,
+            "Retrieving memories with enhancement option"
+        );
+
+        // Enhance query if requested and processor is available
+        if enhance {
+            if let Some(ref processor) = self.memory_processor {
+                match processor.enhance_query(&request.query, None).await {
+                    Ok(enhanced) => {
+                        debug!(
+                            original = %request.query,
+                            enhanced = %enhanced.enhanced_query,
+                            "Query enhanced"
+                        );
+                        request.query = enhanced.enhanced_query;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Query enhancement failed, using original query"
+                        );
+                        // Continue with original query on enhancement failure
+                    }
+                }
+            } else {
+                warn!("Query enhancement requested but no processor configured");
+            }
+        }
+
+        // Ensure we have a retrieval engine
+        let engine = self
+            .retrieval_engine
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("No retrieval engine configured".to_string()))?;
+
+        // Perform retrieval
+        engine.retrieve(request, similarities, actor_id).await
     }
 }
 

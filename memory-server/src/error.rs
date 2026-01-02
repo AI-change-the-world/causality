@@ -44,6 +44,12 @@ pub enum ErrorCode {
     ConfigError,
     /// Internal server error
     InternalError,
+    /// Event content is too short for processing
+    EventContentTooShort,
+    /// No valid memories could be extracted from event
+    NoMemoriesExtracted,
+    /// Query enhancement failed
+    QueryEnhancementFailed,
 }
 
 impl ErrorCode {
@@ -54,17 +60,21 @@ impl ErrorCode {
             | ErrorCode::InvalidLayer
             | ErrorCode::InvalidScopeType
             | ErrorCode::InvalidUpdateMode
-            | ErrorCode::ProviderDisabled => StatusCode::BAD_REQUEST,
+            | ErrorCode::ProviderDisabled
+            | ErrorCode::EventContentTooShort => StatusCode::BAD_REQUEST,
 
             ErrorCode::MemoryNotFound | ErrorCode::ProviderNotFound => StatusCode::NOT_FOUND,
 
             ErrorCode::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+
+            ErrorCode::NoMemoriesExtracted => StatusCode::UNPROCESSABLE_ENTITY,
 
             ErrorCode::NoDefaultProvider
             | ErrorCode::EmbeddingFailed
             | ErrorCode::DatabaseError
             | ErrorCode::VectorDbError
             | ErrorCode::ConfigError
+            | ErrorCode::QueryEnhancementFailed
             | ErrorCode::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -160,6 +170,15 @@ pub enum AppError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Event content too short: minimum {min} characters required, got {actual}")]
+    EventContentTooShort { min: usize, actual: usize },
+
+    #[error("No valid memories could be extracted from event")]
+    NoMemoriesExtracted,
+
+    #[error("Query enhancement failed: {0}")]
+    QueryEnhancementFailed(String),
 }
 
 impl AppError {
@@ -180,6 +199,9 @@ impl AppError {
             AppError::VectorDb(_) => ErrorCode::VectorDbError,
             AppError::Config(_) => ErrorCode::ConfigError,
             AppError::Internal(_) => ErrorCode::InternalError,
+            AppError::EventContentTooShort { .. } => ErrorCode::EventContentTooShort,
+            AppError::NoMemoriesExtracted => ErrorCode::NoMemoriesExtracted,
+            AppError::QueryEnhancementFailed(_) => ErrorCode::QueryEnhancementFailed,
         }
     }
 
@@ -238,6 +260,25 @@ mod tests {
     }
 
     #[test]
+    fn test_event_processing_error_codes() {
+        // EventContentTooShort should return BAD_REQUEST (400)
+        assert_eq!(
+            ErrorCode::EventContentTooShort.status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        // NoMemoriesExtracted should return UNPROCESSABLE_ENTITY (422)
+        assert_eq!(
+            ErrorCode::NoMemoriesExtracted.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // QueryEnhancementFailed should return INTERNAL_SERVER_ERROR (500)
+        assert_eq!(
+            ErrorCode::QueryEnhancementFailed.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
     fn test_error_response_creation() {
         let response = ErrorResponse::new(ErrorCode::ValidationError, "Invalid input");
         assert_eq!(response.code, ErrorCode::ValidationError);
@@ -269,5 +310,29 @@ mod tests {
             AppError::InvalidScopeType("test".to_string()).error_code(),
             ErrorCode::InvalidScopeType
         );
+    }
+
+    #[test]
+    fn test_event_processing_app_errors() {
+        // Test EventContentTooShort
+        let err = AppError::EventContentTooShort { min: 10, actual: 5 };
+        assert_eq!(err.error_code(), ErrorCode::EventContentTooShort);
+        assert_eq!(
+            err.to_string(),
+            "Event content too short: minimum 10 characters required, got 5"
+        );
+
+        // Test NoMemoriesExtracted
+        let err = AppError::NoMemoriesExtracted;
+        assert_eq!(err.error_code(), ErrorCode::NoMemoriesExtracted);
+        assert_eq!(
+            err.to_string(),
+            "No valid memories could be extracted from event"
+        );
+
+        // Test QueryEnhancementFailed
+        let err = AppError::QueryEnhancementFailed("LLM timeout".to_string());
+        assert_eq!(err.error_code(), ErrorCode::QueryEnhancementFailed);
+        assert_eq!(err.to_string(), "Query enhancement failed: LLM timeout");
     }
 }

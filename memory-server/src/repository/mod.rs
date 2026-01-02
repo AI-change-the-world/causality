@@ -20,3 +20,6 @@ pub use memory_repo::{
 pub use qdrant_repo::{
     MultiCollectionSearch, QdrantRepository, VectorFilter, VectorPayload, VectorSearchResult,
 };
+
+// Re-export domain types that are commonly used with repositories
+pub use crate::domain::CreateMemoryFromEventInput;

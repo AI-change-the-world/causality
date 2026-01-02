@@ -6,7 +6,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{EmbeddingStatus, Layer, MemoryCategory, ProcessingStatus, ScopeType, Status};
+use super::{
+    EmbeddingStatus, InferenceType, Layer, MemoryCategory, ProcessingStatus, ScopeType, Status,
+};
 use crate::error::AppError;
 
 /// Memory entity representing a structured context/conclusion/rule
@@ -60,6 +62,12 @@ pub struct Memory {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
     pub updated_at: DateTime<Utc>,
+    /// Inference type (if memory was extracted from an event)
+    pub inference_type: Option<InferenceType>,
+    /// Inference confidence score (0.0 - 1.0, if memory was extracted from an event)
+    pub inference_confidence: Option<f32>,
+    /// Reasoning for the inference (if memory was extracted from an event)
+    pub inference_reasoning: Option<String>,
 }
 
 /// Input for creating a new memory
@@ -92,6 +100,51 @@ pub struct CreateMemoryInput {
     pub process_with_llm: bool,
     /// LLM provider to use for processing (uses default if not specified)
     pub llm_provider: Option<String>,
+}
+
+/// Input for creating a memory from an event extraction
+///
+/// This struct contains all fields needed to create a memory from an event
+/// that has been processed by the LLM. It includes inference-related fields
+/// that track the origin and confidence of the extracted memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMemoryFromEventInput {
+    /// Memory layer (session or task only - long_term is rejected)
+    pub layer: Layer,
+    /// Scope type
+    pub scope_type: ScopeType,
+    /// Scope identifier
+    pub scope_id: String,
+    /// Usage scene
+    pub scene: String,
+    /// Memory content (extracted by LLM)
+    pub content: String,
+    /// Raw content before LLM processing (original event content)
+    pub raw_content: Option<String>,
+    /// Memory category (auto-classified by LLM)
+    pub category: Option<MemoryCategory>,
+    /// Tags/keywords extracted from content
+    pub tags: Option<Vec<String>>,
+    /// Importance score (0.0 - 1.0), auto-evaluated by LLM
+    pub importance: f32,
+    /// Confidence score (0.0 - 1.0), auto-evaluated by LLM
+    pub confidence: f32,
+    /// Time-to-live in seconds
+    pub ttl_seconds: Option<i64>,
+    /// Event source that triggered memory creation
+    pub event_source: Option<String>,
+    /// Timestamp when the triggering event occurred
+    pub event_time: Option<DateTime<Utc>>,
+    /// Embedding provider to use (uses default if not specified)
+    pub embedding_provider: Option<String>,
+    /// LLM provider used for extraction
+    pub llm_provider: Option<String>,
+    /// Inference type (fact, preference, pattern, rule)
+    pub inference_type: InferenceType,
+    /// Inference confidence score (0.0 - 1.0)
+    pub inference_confidence: f32,
+    /// Reasoning for the inference
+    pub inference_reasoning: String,
 }
 
 /// Validation result for memory creation
@@ -206,6 +259,51 @@ impl Memory {
             llm_provider: input.llm_provider,
             created_at: now,
             updated_at: now,
+            inference_type: None,
+            inference_confidence: None,
+            inference_reasoning: None,
+        }
+    }
+
+    /// Create a new Memory from an event extraction
+    ///
+    /// This creates a memory with all inference-related fields populated,
+    /// indicating that this memory was extracted from an event by LLM processing.
+    pub fn new_from_event(input: CreateMemoryFromEventInput) -> Self {
+        let now = Utc::now();
+        let ttl_seconds = input
+            .ttl_seconds
+            .or_else(|| input.layer.default_ttl_seconds());
+        let expires_at = ttl_seconds.map(|ttl| now + chrono::Duration::seconds(ttl));
+
+        Memory {
+            id: Uuid::new_v4(),
+            layer: input.layer,
+            scope_type: input.scope_type,
+            scope_id: input.scope_id,
+            scene: input.scene,
+            status: Status::Active,
+            content: input.content,
+            raw_content: input.raw_content,
+            category: input.category,
+            tags: input.tags,
+            importance: input.importance,
+            confidence: input.confidence,
+            hit_count: 0,
+            last_hit_at: None,
+            ttl_seconds,
+            expires_at,
+            event_source: input.event_source,
+            event_time: input.event_time,
+            embedding_status: EmbeddingStatus::Pending,
+            embedding_provider: input.embedding_provider,
+            processing_status: ProcessingStatus::Completed, // Already processed by LLM
+            llm_provider: input.llm_provider,
+            created_at: now,
+            updated_at: now,
+            inference_type: Some(input.inference_type),
+            inference_confidence: Some(input.inference_confidence),
+            inference_reasoning: Some(input.inference_reasoning),
         }
     }
 
@@ -407,6 +505,10 @@ mod tests {
         // Session layer has default TTL of 3600 seconds
         assert_eq!(memory.ttl_seconds, Some(3600));
         assert!(memory.expires_at.is_some());
+        // Inference fields should be None for directly created memories
+        assert!(memory.inference_type.is_none());
+        assert!(memory.inference_confidence.is_none());
+        assert!(memory.inference_reasoning.is_none());
     }
 
     #[test]

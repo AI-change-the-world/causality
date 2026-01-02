@@ -1,7 +1,7 @@
 //! Status enums for Memory Server
 //!
 //! Contains Status (memory lifecycle state), EmbeddingStatus, UpdateMode,
-//! ProcessingStatus, and MemoryCategory.
+//! ProcessingStatus, MemoryCategory, and InferenceType.
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -202,6 +202,124 @@ impl std::str::FromStr for MemoryCategory {
             _ => Err(format!("Unknown memory category: {}", s)),
         }
     }
+}
+
+/// Inference type for memories extracted from events
+///
+/// Used to mark the type of inference made when extracting memories from raw events.
+/// This helps distinguish between direct facts and inferred information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
+#[sqlx(type_name = "inference_type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceType {
+    /// Direct fact extracted from the event (e.g., "user clicked button X")
+    Fact,
+    /// Inferred user preference (e.g., "user prefers dark theme")
+    Preference,
+    /// Identified behavior pattern (e.g., "user usually works in the morning")
+    Pattern,
+    /// Extracted business rule (e.g., "contracts require 3 signatures")
+    Rule,
+}
+
+impl Default for InferenceType {
+    fn default() -> Self {
+        InferenceType::Fact
+    }
+}
+
+impl std::fmt::Display for InferenceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InferenceType::Fact => write!(f, "fact"),
+            InferenceType::Preference => write!(f, "preference"),
+            InferenceType::Pattern => write!(f, "pattern"),
+            InferenceType::Rule => write!(f, "rule"),
+        }
+    }
+}
+
+impl std::str::FromStr for InferenceType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fact" => Ok(InferenceType::Fact),
+            "preference" => Ok(InferenceType::Preference),
+            "pattern" => Ok(InferenceType::Pattern),
+            "rule" => Ok(InferenceType::Rule),
+            _ => Err(format!("Unknown inference type: {}", s)),
+        }
+    }
+}
+
+/// Processing mode for event-to-memory extraction
+///
+/// Controls how much automation the system uses when processing events into memories.
+/// This allows developers to balance between convenience and control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
+#[sqlx(type_name = "processing_mode", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessingMode {
+    /// Full automation: extract and create memories without confirmation
+    Auto,
+    /// Assisted mode: return proposed memories for user approval (default)
+    Assisted,
+    /// Manual mode: only summarize events without extraction
+    Manual,
+}
+
+impl Default for ProcessingMode {
+    fn default() -> Self {
+        ProcessingMode::Assisted
+    }
+}
+
+impl std::fmt::Display for ProcessingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessingMode::Auto => write!(f, "auto"),
+            ProcessingMode::Assisted => write!(f, "assisted"),
+            ProcessingMode::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProcessingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(ProcessingMode::Auto),
+            "assisted" => Ok(ProcessingMode::Assisted),
+            "manual" => Ok(ProcessingMode::Manual),
+            _ => Err(format!("Unknown processing mode: {}", s)),
+        }
+    }
+}
+
+/// Memory extracted from an event by LLM processing
+///
+/// Represents a single memory extracted from a raw event. The LLM automatically
+/// determines the inference type, category, tags, and importance based on the
+/// event content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMemory {
+    /// The extracted memory content
+    pub content: String,
+    /// Type of inference made (fact, preference, pattern, rule)
+    pub inference_type: InferenceType,
+    /// Confidence score for this extraction (0.0 - 1.0)
+    /// Facts should have confidence >= 0.9, preferences/patterns in [0.6, 0.8]
+    pub confidence: f32,
+    /// Auto-classified category
+    pub category: MemoryCategory,
+    /// Auto-extracted tags/keywords
+    pub tags: Vec<String>,
+    /// Importance score (0.0 - 1.0)
+    pub importance: f32,
+    /// Reasoning explaining why this memory was extracted
+    pub reasoning: String,
 }
 
 #[cfg(test)]
@@ -420,5 +538,160 @@ mod tests {
             MemoryCategory::Other
         );
         assert!("unknown".parse::<MemoryCategory>().is_err());
+    }
+
+    #[test]
+    fn test_inference_type_default() {
+        assert_eq!(InferenceType::default(), InferenceType::Fact);
+    }
+
+    #[test]
+    fn test_inference_type_serialization() {
+        assert_eq!(
+            serde_json::to_string(&InferenceType::Fact).unwrap(),
+            "\"fact\""
+        );
+        assert_eq!(
+            serde_json::to_string(&InferenceType::Preference).unwrap(),
+            "\"preference\""
+        );
+        assert_eq!(
+            serde_json::to_string(&InferenceType::Pattern).unwrap(),
+            "\"pattern\""
+        );
+        assert_eq!(
+            serde_json::to_string(&InferenceType::Rule).unwrap(),
+            "\"rule\""
+        );
+    }
+
+    #[test]
+    fn test_inference_type_deserialization() {
+        assert_eq!(
+            serde_json::from_str::<InferenceType>("\"fact\"").unwrap(),
+            InferenceType::Fact
+        );
+        assert_eq!(
+            serde_json::from_str::<InferenceType>("\"preference\"").unwrap(),
+            InferenceType::Preference
+        );
+        assert_eq!(
+            serde_json::from_str::<InferenceType>("\"pattern\"").unwrap(),
+            InferenceType::Pattern
+        );
+        assert_eq!(
+            serde_json::from_str::<InferenceType>("\"rule\"").unwrap(),
+            InferenceType::Rule
+        );
+    }
+
+    #[test]
+    fn test_inference_type_display() {
+        assert_eq!(InferenceType::Fact.to_string(), "fact");
+        assert_eq!(InferenceType::Preference.to_string(), "preference");
+        assert_eq!(InferenceType::Pattern.to_string(), "pattern");
+        assert_eq!(InferenceType::Rule.to_string(), "rule");
+    }
+
+    #[test]
+    fn test_inference_type_from_str() {
+        assert_eq!(
+            "fact".parse::<InferenceType>().unwrap(),
+            InferenceType::Fact
+        );
+        assert_eq!(
+            "preference".parse::<InferenceType>().unwrap(),
+            InferenceType::Preference
+        );
+        assert_eq!(
+            "pattern".parse::<InferenceType>().unwrap(),
+            InferenceType::Pattern
+        );
+        assert_eq!(
+            "rule".parse::<InferenceType>().unwrap(),
+            InferenceType::Rule
+        );
+        // Test case insensitivity
+        assert_eq!(
+            "FACT".parse::<InferenceType>().unwrap(),
+            InferenceType::Fact
+        );
+        assert_eq!(
+            "Preference".parse::<InferenceType>().unwrap(),
+            InferenceType::Preference
+        );
+        // Test unknown value
+        assert!("unknown".parse::<InferenceType>().is_err());
+    }
+
+    #[test]
+    fn test_processing_mode_default() {
+        assert_eq!(ProcessingMode::default(), ProcessingMode::Assisted);
+    }
+
+    #[test]
+    fn test_processing_mode_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ProcessingMode::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProcessingMode::Assisted).unwrap(),
+            "\"assisted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProcessingMode::Manual).unwrap(),
+            "\"manual\""
+        );
+    }
+
+    #[test]
+    fn test_processing_mode_deserialization() {
+        assert_eq!(
+            serde_json::from_str::<ProcessingMode>("\"auto\"").unwrap(),
+            ProcessingMode::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<ProcessingMode>("\"assisted\"").unwrap(),
+            ProcessingMode::Assisted
+        );
+        assert_eq!(
+            serde_json::from_str::<ProcessingMode>("\"manual\"").unwrap(),
+            ProcessingMode::Manual
+        );
+    }
+
+    #[test]
+    fn test_processing_mode_display() {
+        assert_eq!(ProcessingMode::Auto.to_string(), "auto");
+        assert_eq!(ProcessingMode::Assisted.to_string(), "assisted");
+        assert_eq!(ProcessingMode::Manual.to_string(), "manual");
+    }
+
+    #[test]
+    fn test_processing_mode_from_str() {
+        assert_eq!(
+            "auto".parse::<ProcessingMode>().unwrap(),
+            ProcessingMode::Auto
+        );
+        assert_eq!(
+            "assisted".parse::<ProcessingMode>().unwrap(),
+            ProcessingMode::Assisted
+        );
+        assert_eq!(
+            "manual".parse::<ProcessingMode>().unwrap(),
+            ProcessingMode::Manual
+        );
+        // Test case insensitivity
+        assert_eq!(
+            "AUTO".parse::<ProcessingMode>().unwrap(),
+            ProcessingMode::Auto
+        );
+        assert_eq!(
+            "Assisted".parse::<ProcessingMode>().unwrap(),
+            ProcessingMode::Assisted
+        );
+        // Test unknown value
+        assert!("unknown".parse::<ProcessingMode>().is_err());
     }
 }

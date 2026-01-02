@@ -26,6 +26,9 @@ use crate::error::AppResult;
 use crate::service::UpdateMemoryRequest;
 
 /// Request body for creating a new memory
+///
+/// This endpoint is for direct memory creation where the user provides all fields.
+/// For LLM-assisted memory extraction from events, use POST /api/v1/memories/from-event instead.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateMemoryApiRequest {
     /// Memory layer (session or task - long_term is rejected)
@@ -38,6 +41,10 @@ pub struct CreateMemoryApiRequest {
     pub scene: String,
     /// Memory content (Markdown format)
     pub content: String,
+    /// Memory category (user-specified, optional)
+    pub category: Option<MemoryCategory>,
+    /// Tags/keywords (user-specified, optional)
+    pub tags: Option<Vec<String>>,
     /// Importance score (0.0 - 1.0), defaults to 0.5
     pub importance: Option<f32>,
     /// Confidence score (0.0 - 1.0), defaults to 1.0
@@ -50,11 +57,6 @@ pub struct CreateMemoryApiRequest {
     pub event_time: Option<DateTime<Utc>>,
     /// Embedding provider to use (uses default if not specified)
     pub embedding_provider: Option<String>,
-    /// Whether to process content with LLM (compression, classification, tag extraction)
-    #[serde(default)]
-    pub process_with_llm: bool,
-    /// LLM provider to use for processing (uses default if not specified)
-    pub llm_provider: Option<String>,
 }
 
 impl From<CreateMemoryApiRequest> for CreateMemoryInput {
@@ -71,8 +73,10 @@ impl From<CreateMemoryApiRequest> for CreateMemoryInput {
             event_source: req.event_source,
             event_time: req.event_time,
             embedding_provider: req.embedding_provider,
-            process_with_llm: req.process_with_llm,
-            llm_provider: req.llm_provider,
+            // Direct creation never uses LLM processing
+            // Use POST /api/v1/memories/from-event for LLM-assisted extraction
+            process_with_llm: false,
+            llm_provider: None,
         }
     }
 }
@@ -319,14 +323,14 @@ mod tests {
             scope_id: "user123".to_string(),
             scene: "test.scene".to_string(),
             content: "Test content".to_string(),
+            category: Some(MemoryCategory::UserPreference),
+            tags: Some(vec!["tag1".to_string(), "tag2".to_string()]),
             importance: Some(0.8),
             confidence: Some(0.9),
             ttl_seconds: Some(3600),
             event_source: Some("button_click:like".to_string()),
             event_time: Some(Utc::now()),
             embedding_provider: Some("openai".to_string()),
-            process_with_llm: false,
-            llm_provider: None,
         };
 
         let input: CreateMemoryInput = api_request.clone().into();
@@ -341,8 +345,9 @@ mod tests {
         assert_eq!(input.ttl_seconds, api_request.ttl_seconds);
         assert_eq!(input.event_source, api_request.event_source);
         assert_eq!(input.embedding_provider, api_request.embedding_provider);
-        assert_eq!(input.process_with_llm, api_request.process_with_llm);
-        assert_eq!(input.llm_provider, api_request.llm_provider);
+        // Direct creation never uses LLM processing
+        assert!(!input.process_with_llm);
+        assert!(input.llm_provider.is_none());
     }
 
     #[test]
@@ -396,6 +401,9 @@ mod tests {
             llm_provider: Some("openai".to_string()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            inference_type: None,
+            inference_confidence: None,
+            inference_reasoning: None,
         };
 
         let response: GetMemoryResponse = memory.clone().into();
@@ -418,5 +426,28 @@ mod tests {
         assert_eq!(response.processing_status, memory.processing_status);
         assert_eq!(response.llm_provider, memory.llm_provider);
         assert_eq!(response.embedding_provider, memory.embedding_provider);
+    }
+
+    #[test]
+    fn test_create_memory_request_minimal() {
+        let json = r#"{
+            "layer": "session",
+            "scope_type": "user",
+            "scope_id": "user123",
+            "scene": "test.scene",
+            "content": "Test content"
+        }"#;
+
+        let api_request: CreateMemoryApiRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(api_request.layer, Layer::Session);
+        assert_eq!(api_request.scope_type, ScopeType::User);
+        assert_eq!(api_request.scope_id, "user123");
+        assert_eq!(api_request.scene, "test.scene");
+        assert_eq!(api_request.content, "Test content");
+        assert!(api_request.category.is_none());
+        assert!(api_request.tags.is_none());
+        assert!(api_request.importance.is_none());
+        assert!(api_request.confidence.is_none());
     }
 }

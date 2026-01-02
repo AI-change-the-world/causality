@@ -44,6 +44,10 @@ pub struct RetrieveApiRequest {
     pub fulltext_weight: Option<f32>,
     /// Whether to return highlighted snippets (default: false)
     pub highlight: Option<bool>,
+    /// Whether to enhance the query with semantic synonyms (default: false)
+    /// When enabled, the query will be expanded with related terms to improve retrieval results.
+    #[serde(default)]
+    pub enhance_query: bool,
 }
 
 impl From<RetrieveApiRequest> for RetrieveRequest {
@@ -102,10 +106,11 @@ pub fn retrieval_routes() -> Router<AppState> {
 ///
 /// Retrieves memories based on query and filters:
 /// 1. Applies structured filters (scope, scene, layer, event_source_prefix)
-/// 2. Performs vector similarity search
-/// 3. Computes composite scores
-/// 4. Returns top-K results sorted by score
-/// 5. Updates hit counts for returned memories
+/// 2. Optionally enhances query with semantic synonyms (if enhance_query=true)
+/// 3. Performs vector similarity search
+/// 4. Computes composite scores
+/// 5. Returns top-K results sorted by score
+/// 6. Updates hit counts for returned memories
 #[utoipa::path(
     post,
     path = "/api/v1/memories/retrieve",
@@ -121,15 +126,21 @@ pub async fn retrieve_memories(
     State(state): State<AppState>,
     Json(request): Json<RetrieveApiRequest>,
 ) -> AppResult<Json<RetrieveApiResponse>> {
+    let enhance_query = request.enhance_query;
     let retrieve_request: RetrieveRequest = request.into();
 
-    // For now, we pass None for similarities since Qdrant integration
-    // will be done in a later task. The retrieval engine will use
-    // default similarity scores.
-    let result = state
-        .retrieval_engine
-        .retrieve(retrieve_request, None, None)
-        .await?;
+    // Use retrieve_with_enhancement if enhance_query is true, otherwise use regular retrieve
+    let result = if enhance_query {
+        state
+            .memory_guard
+            .retrieve_with_enhancement(retrieve_request, true, None, None)
+            .await?
+    } else {
+        state
+            .retrieval_engine
+            .retrieve(retrieve_request, None, None)
+            .await?
+    };
 
     let memories: Vec<RetrievedMemoryResponse> = result
         .memories
@@ -175,6 +186,7 @@ mod tests {
             use_vector: Some(true),
             fulltext_weight: Some(0.2),
             highlight: Some(true),
+            enhance_query: false,
         };
 
         let retrieve_request: RetrieveRequest = api_request.clone().into();
@@ -218,6 +230,7 @@ mod tests {
             use_vector: None,
             fulltext_weight: None,
             highlight: None,
+            enhance_query: false,
         };
 
         let retrieve_request: RetrieveRequest = api_request.into();
@@ -236,5 +249,26 @@ mod tests {
         assert!(retrieve_request.use_vector.is_none());
         assert!(retrieve_request.fulltext_weight.is_none());
         assert!(retrieve_request.highlight.is_none());
+    }
+
+    #[test]
+    fn test_retrieve_request_with_enhance_query() {
+        let json = r#"{
+            "query": "test query",
+            "enhance_query": true
+        }"#;
+
+        let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
+        assert!(api_request.enhance_query);
+    }
+
+    #[test]
+    fn test_retrieve_request_enhance_query_default() {
+        let json = r#"{
+            "query": "test query"
+        }"#;
+
+        let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
+        assert!(!api_request.enhance_query); // Default is false
     }
 }

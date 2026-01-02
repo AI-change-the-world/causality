@@ -9,7 +9,8 @@ use sqlx::{FromRow, PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::{
-    EmbeddingStatus, Layer, Memory, MemoryCategory, ProcessingStatus, ScopeType, Status, UpdateMode,
+    EmbeddingStatus, InferenceType, Layer, Memory, MemoryCategory, ProcessingStatus, ScopeType,
+    Status, UpdateMode,
 };
 use crate::error::{AppError, AppResult};
 
@@ -66,16 +67,20 @@ impl MemoryRepository {
             r#"
             INSERT INTO memories (
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
             RETURNING
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             "#,
         )
         .bind(memory.id)
@@ -85,6 +90,9 @@ impl MemoryRepository {
         .bind(&memory.scene)
         .bind(&memory.status)
         .bind(&memory.content)
+        .bind(&memory.raw_content)
+        .bind(&memory.category)
+        .bind(&memory.tags)
         .bind(memory.importance)
         .bind(memory.confidence)
         .bind(memory.hit_count)
@@ -95,6 +103,11 @@ impl MemoryRepository {
         .bind(memory.event_time)
         .bind(&memory.embedding_status)
         .bind(&memory.embedding_provider)
+        .bind(&memory.processing_status)
+        .bind(&memory.llm_provider)
+        .bind(&memory.inference_type)
+        .bind(memory.inference_confidence)
+        .bind(&memory.inference_reasoning)
         .bind(memory.created_at)
         .bind(memory.updated_at)
         .fetch_one(&self.pool)
@@ -109,9 +122,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             FROM memories
             WHERE id = $1
             "#,
@@ -174,9 +189,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             "#,
         )
         .bind(id)
@@ -201,9 +218,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             "#,
         )
         .bind(id)
@@ -226,9 +245,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             "#,
         )
         .bind(id)
@@ -248,9 +269,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             "#,
         )
         .bind(id)
@@ -275,9 +298,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             "#,
         )
         .bind(id)
@@ -295,9 +320,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             FROM memories
             WHERE expires_at IS NOT NULL
               AND expires_at < NOW()
@@ -321,9 +348,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             FROM memories
             WHERE status IN ('active', 'stable', 'candidate')
               AND (
@@ -440,9 +469,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at
+                raw_content, category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at
             FROM memories
             WHERE id = ANY($1)
             "#,
@@ -541,6 +572,9 @@ impl MemoryRepository {
                 llm_provider: row.get("llm_provider"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
+                inference_type: row.get("inference_type"),
+                inference_confidence: row.get("inference_confidence"),
+                inference_reasoning: row.get("inference_reasoning"),
             };
 
             let rank: f32 = row.get("rank");
@@ -699,6 +733,9 @@ struct MemoryRow {
     llm_provider: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    inference_type: Option<InferenceType>,
+    inference_confidence: Option<f32>,
+    inference_reasoning: Option<String>,
 }
 
 impl From<MemoryRow> for Memory {
@@ -728,6 +765,9 @@ impl From<MemoryRow> for Memory {
             llm_provider: row.llm_provider,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            inference_type: row.inference_type,
+            inference_confidence: row.inference_confidence,
+            inference_reasoning: row.inference_reasoning,
         }
     }
 }

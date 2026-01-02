@@ -8,6 +8,9 @@ mod scope;
 mod status;
 
 pub use layer::Layer;
-pub use memory::{CreateMemoryInput, CreateMemoryValidation, Memory};
+pub use memory::{CreateMemoryFromEventInput, CreateMemoryInput, CreateMemoryValidation, Memory};
 pub use scope::ScopeType;
-pub use status::{EmbeddingStatus, MemoryCategory, ProcessingStatus, Status, UpdateMode};
+pub use status::{
+    EmbeddingStatus, ExtractedMemory, InferenceType, MemoryCategory, ProcessingMode,
+    ProcessingStatus, Status, UpdateMode,
+};
