@@ -69,10 +69,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("PostgreSQL connection pool established");
 
-    // Run database migrations
-    info!("Running database migrations");
-    run_migrations(&pool).await?;
-    info!("Database migrations completed");
+    // Run database migrations (if enabled)
+    if config.database.run_migrations {
+        info!("Running database migrations");
+        run_migrations(&pool).await?;
+        info!("Database migrations completed");
+    } else {
+        info!("Database migrations skipped (run_migrations=false)");
+    }
 
     // Initialize Qdrant client (placeholder - actual implementation in later task)
     info!(

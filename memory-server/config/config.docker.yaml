@@ -1,20 +1,20 @@
 # Memory Server Configuration
-# Development mode - connects to localhost with exposed ports
+# Docker mode - connects to containers via internal network
 
 server:
   host: "0.0.0.0"
   port: 8080
 
-# PostgreSQL - localhost for development
+# PostgreSQL - internal docker network
 database:
-  url: "postgres://memory:memory@localhost:5432/memory_db"
+  url: "postgres://memory:memory@postgres:5432/memory_db"
   max_connections: 10
   min_connections: 2
-  run_migrations: false  # Set to true for fresh database
+  run_migrations: true  # Auto-migrate in docker
 
-# Qdrant - localhost for development
+# Qdrant - internal docker network
 qdrant:
-  url: "http://localhost:6334"
+  url: "http://qdrant:6334"
   collection_name: "memories"
 
 # Embedding providers are managed via API

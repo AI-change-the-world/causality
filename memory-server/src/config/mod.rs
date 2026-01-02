@@ -43,6 +43,13 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
     #[serde(default = "default_min_connections")]
     pub min_connections: u32,
+    /// Whether to run migrations on startup (default: true)
+    #[serde(default = "default_run_migrations")]
+    pub run_migrations: bool,
+}
+
+fn default_run_migrations() -> bool {
+    true
 }
 
 fn default_max_connections() -> u32 {
