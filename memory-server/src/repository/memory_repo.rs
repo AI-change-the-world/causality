@@ -66,16 +66,16 @@ impl MemoryRepository {
         let row = sqlx::query_as::<_, MemoryRow>(
             r#"
             INSERT INTO memories (
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
             RETURNING
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -84,6 +84,7 @@ impl MemoryRepository {
             "#,
         )
         .bind(memory.id)
+        .bind(&memory.owner_id)
         .bind(&memory.layer)
         .bind(&memory.scope_type)
         .bind(&memory.scope_id)
@@ -121,7 +122,7 @@ impl MemoryRepository {
         let row = sqlx::query_as::<_, MemoryRow>(
             r#"
             SELECT
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -188,7 +189,7 @@ impl MemoryRepository {
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -217,7 +218,7 @@ impl MemoryRepository {
             SET status = 'archived', updated_at = NOW()
             WHERE id = $1
             RETURNING
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -244,7 +245,7 @@ impl MemoryRepository {
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -268,7 +269,7 @@ impl MemoryRepository {
             SET status = $2, updated_at = NOW()
             WHERE id = $1
             RETURNING
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -297,7 +298,7 @@ impl MemoryRepository {
             SET embedding_status = $2, updated_at = NOW()
             WHERE id = $1
             RETURNING
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -319,7 +320,7 @@ impl MemoryRepository {
         let rows = sqlx::query_as::<_, MemoryRow>(
             r#"
             SELECT
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -347,7 +348,7 @@ impl MemoryRepository {
         let rows = sqlx::query_as::<_, MemoryRow>(
             r#"
             SELECT
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -374,6 +375,7 @@ impl MemoryRepository {
     /// Find memories with structured filters for retrieval
     ///
     /// Supports filtering by:
+    /// - owner_id (required for proper isolation)
     /// - scope_type and scope_id
     /// - layers (multiple)
     /// - scenes (multiple)
@@ -383,6 +385,7 @@ impl MemoryRepository {
     /// - excludes ignored and archived statuses
     pub async fn find_for_retrieval(
         &self,
+        owner_id: Option<&str>,
         scope_type: Option<&ScopeType>,
         scope_id: Option<&str>,
         layers: Option<&[Layer]>,
@@ -396,20 +399,23 @@ impl MemoryRepository {
         let rows = sqlx::query_as::<_, MemoryRow>(
             r#"
             SELECT
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
                 created_at, updated_at
             FROM memories
             WHERE status NOT IN ('ignored', 'archived')
-              AND ($1::scope_type IS NULL OR scope_type = $1)
-              AND ($2::text IS NULL OR scope_id = $2)
-              AND ($3::text IS NULL OR event_source LIKE $3 || '%')
+              AND ($1::text IS NULL OR owner_id = $1)
+              AND ($2::scope_type IS NULL OR scope_type = $2)
+              AND ($3::text IS NULL OR scope_id = $3)
+              AND ($4::text IS NULL OR event_source LIKE $4 || '%')
             ORDER BY updated_at DESC
             LIMIT 1000
             "#,
         )
+        .bind(owner_id)
         .bind(scope_type)
         .bind(scope_id)
         .bind(event_source_prefix)
@@ -468,7 +474,7 @@ impl MemoryRepository {
         let rows = sqlx::query_as::<_, MemoryRow>(
             r#"
             SELECT
-                id, layer, scope_type, scope_id, scene, status, content,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
                 raw_content, category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
@@ -516,10 +522,12 @@ impl MemoryRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, layer, scope_type, scope_id, scene, status, content,
-                importance, confidence, hit_count, last_hit_at, ttl_seconds,
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
+                raw_content, category, tags, importance, confidence, hit_count, last_hit_at, ttl_seconds,
                 expires_at, event_source, event_time, embedding_status,
-                embedding_provider, created_at, updated_at,
+                embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                created_at, updated_at,
                 ts_rank(content_tsv, plainto_tsquery('simple', $1)) as rank,
                 CASE WHEN $6 THEN
                     ts_headline('simple', content, plainto_tsquery('simple', $1),
@@ -549,6 +557,7 @@ impl MemoryRepository {
         for row in rows {
             let memory = Memory {
                 id: row.get("id"),
+                owner_id: row.get("owner_id"),
                 layer: row.get("layer"),
                 scope_type: row.get("scope_type"),
                 scope_id: row.get("scope_id"),
@@ -710,6 +719,7 @@ impl MemoryRepository {
 #[derive(Debug, FromRow)]
 struct MemoryRow {
     id: Uuid,
+    owner_id: String,
     layer: Layer,
     scope_type: ScopeType,
     scope_id: String,
@@ -742,6 +752,7 @@ impl From<MemoryRow> for Memory {
     fn from(row: MemoryRow) -> Self {
         Memory {
             id: row.id,
+            owner_id: row.owner_id,
             layer: row.layer,
             scope_type: row.scope_type,
             scope_id: row.scope_id,

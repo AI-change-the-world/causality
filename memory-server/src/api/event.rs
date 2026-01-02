@@ -20,6 +20,8 @@ use crate::service::CreateFromEventRequest;
 /// and extracts relevant facts, preferences, patterns, and rules.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateFromEventApiRequest {
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
     pub content: String,
     /// Optional context to help LLM better understand the event
@@ -42,6 +44,7 @@ pub struct CreateFromEventApiRequest {
 impl From<CreateFromEventApiRequest> for CreateFromEventRequest {
     fn from(req: CreateFromEventApiRequest) -> Self {
         CreateFromEventRequest {
+            owner_id: req.owner_id,
             content: req.content,
             context: req.context,
             scope_type: req.scope_type,
@@ -163,6 +166,7 @@ mod tests {
     #[test]
     fn test_create_from_event_request_conversion() {
         let api_request = CreateFromEventApiRequest {
+            owner_id: "owner123".to_string(),
             content: "User clicked the dark mode button".to_string(),
             context: Some("Settings page".to_string()),
             mode: Some(ProcessingMode::Auto),
@@ -173,6 +177,7 @@ mod tests {
 
         let service_request: CreateFromEventRequest = api_request.clone().into();
 
+        assert_eq!(service_request.owner_id, api_request.owner_id);
         assert_eq!(service_request.content, api_request.content);
         assert_eq!(service_request.context, api_request.context);
         assert_eq!(service_request.mode, api_request.mode);
@@ -184,6 +189,7 @@ mod tests {
     #[test]
     fn test_create_from_event_request_defaults() {
         let json = r#"{
+            "owner_id": "owner123",
             "content": "Test event content",
             "scope_type": "user",
             "scope_id": "user123",
@@ -192,6 +198,7 @@ mod tests {
 
         let api_request: CreateFromEventApiRequest = serde_json::from_str(json).unwrap();
 
+        assert_eq!(api_request.owner_id, "owner123");
         assert_eq!(api_request.content, "Test event content");
         assert!(api_request.context.is_none());
         assert!(api_request.mode.is_none()); // Will default to Assisted in service layer

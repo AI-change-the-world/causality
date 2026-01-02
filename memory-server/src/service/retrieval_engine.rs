@@ -23,6 +23,8 @@ use crate::repository::{AuditOperation, AuditRepository, MemoryRepository};
 pub struct RetrieveRequest {
     /// Query text for semantic search and full-text search
     pub query: String,
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: Option<String>,
     /// Filter by scope type
     pub scope_type: Option<ScopeType>,
     /// Filter by scope ID
@@ -154,6 +156,7 @@ impl RetrievalEngine {
         let candidates = self
             .memory_repo
             .find_for_retrieval(
+                request.owner_id.as_deref(),
                 request.scope_type.as_ref(),
                 request.scope_id.as_deref(),
                 request.layers.as_deref(),
@@ -428,6 +431,7 @@ mod tests {
     fn test_memory(status: Status) -> Memory {
         Memory {
             id: Uuid::new_v4(),
+            owner_id: "owner123".to_string(),
             layer: Layer::Session,
             scope_type: ScopeType::User,
             scope_id: "user123".to_string(),

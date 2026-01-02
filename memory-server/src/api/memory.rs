@@ -31,6 +31,8 @@ use crate::service::UpdateMemoryRequest;
 /// For LLM-assisted memory extraction from events, use POST /api/v1/memories/from-event instead.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateMemoryApiRequest {
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: String,
     /// Memory layer (session or task - long_term is rejected)
     pub layer: Layer,
     /// Scope type (user, org, project, task, session)
@@ -62,6 +64,7 @@ pub struct CreateMemoryApiRequest {
 impl From<CreateMemoryApiRequest> for CreateMemoryInput {
     fn from(req: CreateMemoryApiRequest) -> Self {
         CreateMemoryInput {
+            owner_id: req.owner_id,
             layer: req.layer,
             scope_type: req.scope_type,
             scope_id: req.scope_id,
@@ -100,6 +103,7 @@ pub struct CreateMemoryResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GetMemoryResponse {
     pub id: Uuid,
+    pub owner_id: String,
     pub layer: Layer,
     pub scope_type: ScopeType,
     pub scope_id: String,
@@ -129,6 +133,7 @@ impl From<Memory> for GetMemoryResponse {
     fn from(m: Memory) -> Self {
         GetMemoryResponse {
             id: m.id,
+            owner_id: m.owner_id,
             layer: m.layer,
             scope_type: m.scope_type,
             scope_id: m.scope_id,
@@ -367,6 +372,7 @@ mod tests {
     #[test]
     fn test_create_memory_request_conversion() {
         let api_request = CreateMemoryApiRequest {
+            owner_id: "owner123".to_string(),
             layer: Layer::Session,
             scope_type: ScopeType::User,
             scope_id: "user123".to_string(),
@@ -384,6 +390,7 @@ mod tests {
 
         let input: CreateMemoryInput = api_request.clone().into();
 
+        assert_eq!(input.owner_id, api_request.owner_id);
         assert_eq!(input.layer, api_request.layer);
         assert_eq!(input.scope_type, api_request.scope_type);
         assert_eq!(input.scope_id, api_request.scope_id);
@@ -427,6 +434,7 @@ mod tests {
     fn test_memory_to_response_conversion() {
         let memory = Memory {
             id: Uuid::new_v4(),
+            owner_id: "owner123".to_string(),
             layer: Layer::Task,
             scope_type: ScopeType::Project,
             scope_id: "project456".to_string(),
@@ -458,6 +466,7 @@ mod tests {
         let response: GetMemoryResponse = memory.clone().into();
 
         assert_eq!(response.id, memory.id);
+        assert_eq!(response.owner_id, memory.owner_id);
         assert_eq!(response.layer, memory.layer);
         assert_eq!(response.scope_type, memory.scope_type);
         assert_eq!(response.scope_id, memory.scope_id);
@@ -480,6 +489,7 @@ mod tests {
     #[test]
     fn test_create_memory_request_minimal() {
         let json = r#"{
+            "owner_id": "owner123",
             "layer": "session",
             "scope_type": "user",
             "scope_id": "user123",
@@ -489,6 +499,7 @@ mod tests {
 
         let api_request: CreateMemoryApiRequest = serde_json::from_str(json).unwrap();
 
+        assert_eq!(api_request.owner_id, "owner123");
         assert_eq!(api_request.layer, Layer::Session);
         assert_eq!(api_request.scope_type, ScopeType::User);
         assert_eq!(api_request.scope_id, "user123");

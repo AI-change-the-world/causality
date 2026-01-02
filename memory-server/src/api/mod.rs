@@ -57,6 +57,7 @@ pub struct AppState {
         memory::delete_memory,
         event::create_from_event,
         retrieval::retrieve_memories,
+        retrieval::auto_retrieve_memories,
         config::list_providers,
         config::create_provider,
         config::update_provider,
@@ -83,6 +84,9 @@ pub struct AppState {
         retrieval::RetrieveApiRequest,
         retrieval::RetrieveApiResponse,
         retrieval::RetrievedMemoryResponse,
+        retrieval::AutoRetrieveApiRequest,
+        retrieval::AutoRetrieveApiResponse,
+        retrieval::AutoRetrieveRecord,
         // Config types - Embedding providers
         config::ListProvidersResponse,
         config::ProviderInfoResponse,

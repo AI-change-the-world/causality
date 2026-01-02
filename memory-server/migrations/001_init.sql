@@ -37,6 +37,7 @@ CREATE TYPE memory_category AS ENUM ('user_preference', 'behavior_pattern', 'bus
 -- Memory main table
 CREATE TABLE memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id VARCHAR(255) NOT NULL,
     layer layer NOT NULL,
     scope_type scope_type NOT NULL,
     scope_id VARCHAR(255) NOT NULL,
@@ -84,8 +85,6 @@ CREATE TABLE embedding_providers (
     dimension INTEGER NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT true,
     is_default BOOLEAN NOT NULL DEFAULT false,
-    rpm_limit INTEGER,
-    tpm_limit INTEGER,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -99,8 +98,6 @@ CREATE TABLE llm_providers (
     model VARCHAR(200) NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT true,
     is_default BOOLEAN NOT NULL DEFAULT false,
-    rpm_limit INTEGER,
-    tpm_limit INTEGER,
     -- Processing configuration
     compression_prompt TEXT,
     classification_prompt TEXT,
@@ -135,6 +132,8 @@ CREATE TABLE lifecycle_config (
 -- ============================================================================
 
 -- Memory table indexes
+CREATE INDEX idx_memories_owner ON memories(owner_id);
+CREATE INDEX idx_memories_owner_scope ON memories(owner_id, scope_type, scope_id);
 CREATE INDEX idx_memories_scope ON memories(scope_type, scope_id);
 CREATE INDEX idx_memories_scene ON memories(scene);
 CREATE INDEX idx_memories_layer ON memories(layer);

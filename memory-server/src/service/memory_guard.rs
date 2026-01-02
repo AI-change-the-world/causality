@@ -89,6 +89,8 @@ impl UpdateMemoryRequest {
 /// and extract relevant memories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateFromEventRequest {
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
     pub content: String,
     /// Optional context to help LLM better understand the event
@@ -515,6 +517,7 @@ impl MemoryGuard {
 
         for extracted in &extract_result.extracted_memories {
             let memory_input = CreateMemoryFromEventInput {
+                owner_id: request.owner_id.clone(),
                 layer: Layer::Session, // Default to session layer
                 scope_type: request.scope_type,
                 scope_id: request.scope_id.clone(),

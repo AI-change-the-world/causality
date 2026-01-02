@@ -16,6 +16,8 @@ use crate::error::AppError;
 pub struct Memory {
     /// Unique identifier
     pub id: Uuid,
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: String,
     /// Memory layer (session, task, long_term)
     pub layer: Layer,
     /// Scope type (user, org, project, task, session)
@@ -73,6 +75,8 @@ pub struct Memory {
 /// Input for creating a new memory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMemoryInput {
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: String,
     /// Memory layer (session or task only - long_term is rejected)
     pub layer: Layer,
     /// Scope type
@@ -109,6 +113,8 @@ pub struct CreateMemoryInput {
 /// that track the origin and confidence of the extracted memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMemoryFromEventInput {
+    /// Owner ID - the unique identifier of the memory owner
+    pub owner_id: String,
     /// Memory layer (session or task only - long_term is rejected)
     pub layer: Layer,
     /// Scope type
@@ -158,6 +164,7 @@ impl CreateMemoryValidation {
     ///
     /// Validation rules:
     /// - Layer cannot be LongTerm (requires manual confirmation)
+    /// - owner_id cannot be empty
     /// - scope_id cannot be empty
     /// - scene cannot be empty
     /// - content cannot be empty
@@ -167,6 +174,11 @@ impl CreateMemoryValidation {
         // Rule: Long-term memories cannot be created directly
         if !input.layer.allows_direct_creation() {
             return Err(AppError::InvalidLayer);
+        }
+
+        // Validate owner_id is not empty
+        if input.owner_id.trim().is_empty() {
+            return Err(AppError::Validation("owner_id cannot be empty".to_string()));
         }
 
         // Validate scope_id is not empty
@@ -236,6 +248,7 @@ impl Memory {
 
         Memory {
             id: Uuid::new_v4(),
+            owner_id: input.owner_id,
             layer: input.layer,
             scope_type: input.scope_type,
             scope_id: input.scope_id,
@@ -278,6 +291,7 @@ impl Memory {
 
         Memory {
             id: Uuid::new_v4(),
+            owner_id: input.owner_id,
             layer: input.layer,
             scope_type: input.scope_type,
             scope_id: input.scope_id,
@@ -374,6 +388,7 @@ mod tests {
 
     fn valid_input() -> CreateMemoryInput {
         CreateMemoryInput {
+            owner_id: "owner123".to_string(),
             layer: Layer::Session,
             scope_type: ScopeType::User,
             scope_id: "user123".to_string(),
@@ -476,6 +491,7 @@ mod tests {
     #[test]
     fn test_memory_creation_with_defaults() {
         let input = CreateMemoryInput {
+            owner_id: "owner123".to_string(),
             layer: Layer::Session,
             scope_type: ScopeType::User,
             scope_id: "user123".to_string(),
@@ -515,6 +531,7 @@ mod tests {
     fn test_memory_with_event_source() {
         let event_time = Utc::now();
         let input = CreateMemoryInput {
+            owner_id: "owner123".to_string(),
             layer: Layer::Task,
             scope_type: ScopeType::Project,
             scope_id: "project456".to_string(),
