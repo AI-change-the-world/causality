@@ -12,5 +12,5 @@ pub use local::LocalLlmProvider;
 pub use openai::OpenAILlmProvider;
 pub use provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderConfig,
-    LlmProviderType, LlmRetryConfig, Role,
+    LlmProviderType, LlmRetryConfig, ResponseFormat, Role,
 };

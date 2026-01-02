@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     ChatMessage, ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderConfig,
-    LlmProviderType, LlmRetryConfig, Role,
+    LlmProviderType, LlmRetryConfig, ResponseFormat, Role,
 };
 
 /// OpenAI-compatible Chat Completion request body
@@ -26,6 +26,13 @@ struct LocalChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<LocalResponseFormat>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalResponseFormat {
+    r#type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,12 +158,20 @@ impl LocalLlmProvider {
 
         let messages: Vec<LocalChatMessage> = request.messages.iter().map(|m| m.into()).collect();
 
+        let response_format = match request.response_format {
+            ResponseFormat::JsonObject => Some(LocalResponseFormat {
+                r#type: "json_object".to_string(),
+            }),
+            ResponseFormat::Text => None,
+        };
+
         let request_body = LocalChatRequest {
             model: model.to_string(),
             messages,
             temperature: Some(temperature),
             max_tokens: Some(max_tokens),
             stream: Some(false),
+            response_format,
         };
 
         debug!(

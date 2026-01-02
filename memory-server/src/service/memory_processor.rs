@@ -130,8 +130,10 @@ impl MemoryProcessor {
         // Build the prompt with content
         let prompt = self.unified_prompt.replace("{content}", &request.content);
 
-        // Single LLM call for all processing tasks
-        let chat_request = ChatRequest::new(prompt).with_temperature(0.3);
+        // Single LLM call for all processing tasks with JSON response format
+        let chat_request = ChatRequest::new(prompt)
+            .with_temperature(0.3)
+            .with_json_response();
 
         let response = self.llm_provider.chat(chat_request).await?;
 

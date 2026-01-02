@@ -215,6 +215,21 @@ impl ChatMessage {
     }
 }
 
+/// Response format for structured output
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFormat {
+    /// Plain text response (default)
+    Text,
+    /// JSON object response (enables structured output)
+    JsonObject,
+}
+
+impl Default for ResponseFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
 /// Request for chat completion
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -226,6 +241,8 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     /// Optional max tokens override
     pub max_tokens: Option<u32>,
+    /// Response format (text or json_object)
+    pub response_format: ResponseFormat,
 }
 
 impl ChatRequest {
@@ -236,6 +253,7 @@ impl ChatRequest {
             model: None,
             temperature: None,
             max_tokens: None,
+            response_format: ResponseFormat::default(),
         }
     }
 
@@ -246,6 +264,7 @@ impl ChatRequest {
             model: None,
             temperature: None,
             max_tokens: None,
+            response_format: ResponseFormat::default(),
         }
     }
 
@@ -270,6 +289,18 @@ impl ChatRequest {
     /// Set the max tokens
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Set response format to JSON object (for structured output)
+    pub fn with_json_response(mut self) -> Self {
+        self.response_format = ResponseFormat::JsonObject;
+        self
+    }
+
+    /// Set response format
+    pub fn with_response_format(mut self, format: ResponseFormat) -> Self {
+        self.response_format = format;
         self
     }
 }
@@ -418,11 +449,19 @@ mod tests {
         let request = ChatRequest::new("Hello")
             .with_model("gpt-4")
             .with_temperature(0.7)
-            .with_max_tokens(500);
+            .with_max_tokens(500)
+            .with_json_response();
 
         assert_eq!(request.model, Some("gpt-4".to_string()));
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.max_tokens, Some(500));
+        assert_eq!(request.response_format, ResponseFormat::JsonObject);
+    }
+
+    #[test]
+    fn test_response_format_default() {
+        let request = ChatRequest::new("Hello");
+        assert_eq!(request.response_format, ResponseFormat::Text);
     }
 
     #[test]
