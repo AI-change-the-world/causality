@@ -11,5 +11,5 @@ pub use local::LocalProvider;
 pub use openai::OpenAIProvider;
 pub use provider::{
     EmbeddingError, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, ProviderConfig,
-    ProviderType, RateLimitConfig, RetryConfig,
+    ProviderType, RetryConfig,
 };

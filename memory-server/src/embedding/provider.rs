@@ -50,7 +50,9 @@ pub enum EmbeddingError {
 }
 
 /// Type of embedding provider
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema,
+)]
 #[sqlx(type_name = "provider_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderType {
@@ -59,6 +61,7 @@ pub enum ProviderType {
     /// Azure OpenAI Service
     Azure,
     /// Local embedding model (OpenAI-compatible API)
+    #[default]
     Local,
 }
 
@@ -103,22 +106,10 @@ pub struct ProviderConfig {
     /// Whether this provider is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Rate limit configuration
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitConfig>,
 }
 
 fn default_enabled() -> bool {
     true
-}
-
-/// Rate limiting configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitConfig {
-    /// Maximum requests per minute
-    pub requests_per_minute: Option<u32>,
-    /// Maximum tokens per minute
-    pub tokens_per_minute: Option<u32>,
 }
 
 /// Retry configuration for embedding requests
@@ -351,10 +342,6 @@ mod tests {
             model: "text-embedding-3-small".to_string(),
             dimension: 1536,
             enabled: true,
-            rate_limit: Some(RateLimitConfig {
-                requests_per_minute: Some(500),
-                tokens_per_minute: Some(1000000),
-            }),
         };
 
         let json = serde_json::to_string(&config).unwrap();

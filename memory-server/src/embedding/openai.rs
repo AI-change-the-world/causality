@@ -310,7 +310,6 @@ mod tests {
             model: "text-embedding-3-small".to_string(),
             dimension: 1536,
             enabled: true,
-            rate_limit: None,
         }
     }
 

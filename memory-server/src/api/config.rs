@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::AppState;
-use crate::embedding::{ProviderConfig, ProviderType, RateLimitConfig};
+use crate::embedding::{ProviderConfig, ProviderType};
 use crate::error::AppResult;
 use crate::llm::{LlmProviderConfig, LlmProviderType};
 use crate::repository::{LlmPromptConfig, UpdateLlmProviderInput};
@@ -54,8 +54,6 @@ pub struct ProviderInfoResponse {
     pub model: String,
     /// Embedding dimension
     pub dimension: usize,
-    /// Rate limit configuration
-    pub rate_limit: Option<RateLimitConfigResponse>,
 }
 
 impl From<ProviderInfo> for ProviderInfoResponse {
@@ -67,10 +65,6 @@ impl From<ProviderInfo> for ProviderInfoResponse {
             is_default: info.is_default,
             model: info.model,
             dimension: info.dimension,
-            rate_limit: info.rate_limit.map(|r| RateLimitConfigResponse {
-                requests_per_minute: r.requests_per_minute,
-                tokens_per_minute: r.tokens_per_minute,
-            }),
         }
     }
 }
@@ -82,15 +76,6 @@ pub struct RateLimitConfigResponse {
     pub requests_per_minute: Option<u32>,
     /// Maximum tokens per minute
     pub tokens_per_minute: Option<u32>,
-}
-
-impl From<RateLimitConfigResponse> for RateLimitConfig {
-    fn from(r: RateLimitConfigResponse) -> Self {
-        RateLimitConfig {
-            requests_per_minute: r.requests_per_minute,
-            tokens_per_minute: r.tokens_per_minute,
-        }
-    }
 }
 
 /// Request body for creating a new embedding provider
@@ -111,8 +96,6 @@ pub struct CreateProviderRequest {
     /// Set as default provider
     #[serde(default)]
     pub is_default: bool,
-    /// Rate limit configuration
-    pub rate_limit: Option<RateLimitConfigResponse>,
 }
 
 impl From<CreateProviderRequest> for ProviderConfig {
@@ -125,7 +108,6 @@ impl From<CreateProviderRequest> for ProviderConfig {
             model: req.model,
             dimension: req.dimension,
             enabled: true,
-            rate_limit: req.rate_limit.map(Into::into),
         }
     }
 }
@@ -143,8 +125,6 @@ pub struct UpdateProviderRequest {
     pub enabled: Option<bool>,
     /// Set as default provider
     pub is_default: Option<bool>,
-    /// New rate limit configuration
-    pub rate_limit: Option<RateLimitConfigResponse>,
 }
 
 // ============================================================================
@@ -173,10 +153,6 @@ pub struct LlmProviderInfoResponse {
     pub is_default: bool,
     /// Model name
     pub model: String,
-    /// Requests per minute limit
-    pub rpm_limit: Option<u32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<u32>,
     /// Maximum input tokens
     pub max_input_tokens: u32,
     /// Maximum output tokens
@@ -197,8 +173,6 @@ impl From<LlmProviderInfo> for LlmProviderInfoResponse {
             enabled: info.enabled,
             is_default: info.is_default,
             model: info.model,
-            rpm_limit: info.rpm_limit,
-            tpm_limit: info.tpm_limit,
             max_input_tokens: info.max_input_tokens,
             max_output_tokens: info.max_output_tokens,
             temperature: info.temperature,
@@ -224,10 +198,6 @@ pub struct CreateLlmProviderRequest {
     /// Set as default provider
     #[serde(default)]
     pub is_default: bool,
-    /// Requests per minute limit
-    pub rpm_limit: Option<u32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<u32>,
     /// Maximum input tokens (default: 4096)
     #[serde(default = "default_max_input_tokens")]
     pub max_input_tokens: u32,
@@ -388,7 +358,6 @@ pub async fn update_provider(
             request.api_key,
             request.model,
             request.enabled,
-            request.rate_limit.map(Into::into),
         )
         .await?;
 
@@ -475,8 +444,6 @@ pub async fn create_llm_provider(
         api_key: request.api_key,
         model: request.model,
         enabled: true,
-        rpm_limit: request.rpm_limit,
-        tpm_limit: request.tpm_limit,
         max_input_tokens: request.max_input_tokens,
         max_output_tokens: request.max_output_tokens,
         temperature: request.temperature,
@@ -590,10 +557,6 @@ mod tests {
             model: "text-embedding-3-small".to_string(),
             dimension: 1536,
             is_default: false,
-            rate_limit: Some(RateLimitConfigResponse {
-                requests_per_minute: Some(500),
-                tokens_per_minute: Some(1000000),
-            }),
         };
 
         let config: ProviderConfig = request.clone().into();
@@ -605,19 +568,5 @@ mod tests {
         assert_eq!(config.model, request.model);
         assert_eq!(config.dimension, request.dimension);
         assert!(config.enabled);
-        assert!(config.rate_limit.is_some());
-    }
-
-    #[test]
-    fn test_rate_limit_config_conversion() {
-        let response = RateLimitConfigResponse {
-            requests_per_minute: Some(100),
-            tokens_per_minute: Some(50000),
-        };
-
-        let config: RateLimitConfig = response.clone().into();
-
-        assert_eq!(config.requests_per_minute, response.requests_per_minute);
-        assert_eq!(config.tokens_per_minute, response.tokens_per_minute);
     }
 }

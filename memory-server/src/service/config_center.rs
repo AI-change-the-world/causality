@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::embedding::{ProviderConfig, ProviderType, RateLimitConfig};
+use crate::embedding::{ProviderConfig, ProviderType};
 use crate::error::{AppError, AppResult};
 use crate::llm::{LlmProviderConfig, LlmProviderType};
 use crate::repository::{
@@ -33,30 +33,18 @@ pub struct ProviderInfo {
     pub model: String,
     /// Embedding dimension
     pub dimension: usize,
-    /// Rate limit configuration
-    pub rate_limit: Option<RateLimitConfig>,
     /// Whether this is the default provider
     pub is_default: bool,
 }
 
 impl From<EmbeddingProviderRecord> for ProviderInfo {
     fn from(record: EmbeddingProviderRecord) -> Self {
-        let rate_limit = if record.rpm_limit.is_some() || record.tpm_limit.is_some() {
-            Some(RateLimitConfig {
-                requests_per_minute: record.rpm_limit.map(|v| v as u32),
-                tokens_per_minute: record.tpm_limit.map(|v| v as u32),
-            })
-        } else {
-            None
-        };
-
         ProviderInfo {
             name: record.name,
             provider_type: record.provider_type,
             enabled: record.enabled,
             model: record.model,
             dimension: record.dimension as usize,
-            rate_limit,
             is_default: record.is_default,
         }
     }
@@ -75,10 +63,6 @@ pub struct LlmProviderInfo {
     pub model: String,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Requests per minute limit
-    pub rpm_limit: Option<u32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<u32>,
     /// Maximum input tokens
     pub max_input_tokens: u32,
     /// Maximum output tokens
@@ -99,8 +83,6 @@ impl From<LlmProviderRecord> for LlmProviderInfo {
             enabled: record.enabled,
             model: record.model,
             is_default: record.is_default,
-            rpm_limit: record.rpm_limit.map(|v| v as u32),
-            tpm_limit: record.tpm_limit.map(|v| v as u32),
             max_input_tokens: record.max_input_tokens as u32,
             max_output_tokens: record.max_output_tokens as u32,
             temperature: record.temperature,
@@ -110,76 +92,14 @@ impl From<LlmProviderRecord> for LlmProviderInfo {
     }
 }
 
-/// Rate limiter state for a provider
-#[derive(Debug, Clone)]
-struct RateLimiterState {
-    /// Requests made in current window
-    requests_in_window: u32,
-    /// Tokens used in current window
-    tokens_in_window: u32,
-    /// Window start time
-    window_start: std::time::Instant,
-    /// Rate limit config
-    config: Option<RateLimitConfig>,
-}
-
-impl RateLimiterState {
-    fn new(config: Option<RateLimitConfig>) -> Self {
-        Self {
-            requests_in_window: 0,
-            tokens_in_window: 0,
-            window_start: std::time::Instant::now(),
-            config,
-        }
-    }
-
-    /// Check if a request can be made (and record it if so)
-    fn try_acquire(&mut self, tokens: u32) -> Result<(), u64> {
-        // Reset window if minute has passed
-        if self.window_start.elapsed().as_secs() >= 60 {
-            self.requests_in_window = 0;
-            self.tokens_in_window = 0;
-            self.window_start = std::time::Instant::now();
-        }
-
-        if let Some(ref config) = self.config {
-            // Check RPM limit
-            if let Some(rpm) = config.requests_per_minute {
-                if self.requests_in_window >= rpm {
-                    let wait_ms = (60 - self.window_start.elapsed().as_secs()) * 1000;
-                    return Err(wait_ms.max(1));
-                }
-            }
-
-            // Check TPM limit
-            if let Some(tpm) = config.tokens_per_minute {
-                if self.tokens_in_window + tokens > tpm {
-                    let wait_ms = (60 - self.window_start.elapsed().as_secs()) * 1000;
-                    return Err(wait_ms.max(1));
-                }
-            }
-        }
-
-        // Record the request
-        self.requests_in_window += 1;
-        self.tokens_in_window += tokens;
-
-        Ok(())
-    }
-}
-
 /// ConfigCenter service for provider management
 #[derive(Clone)]
 pub struct ConfigCenter {
     config_repo: ConfigRepository,
     llm_repo: Option<LlmProviderRepository>,
     qdrant_repo: Option<QdrantRepository>,
-    /// In-memory rate limiters per embedding provider
-    rate_limiters: Arc<RwLock<HashMap<String, RateLimiterState>>>,
     /// Cached embedding provider configs for hot access
     provider_cache: Arc<RwLock<HashMap<String, ProviderConfig>>>,
-    /// In-memory rate limiters per LLM provider
-    llm_rate_limiters: Arc<RwLock<HashMap<String, RateLimiterState>>>,
     /// Cached LLM provider configs for hot access
     llm_provider_cache: Arc<RwLock<HashMap<String, LlmProviderConfig>>>,
 }
@@ -191,9 +111,7 @@ impl ConfigCenter {
             config_repo,
             llm_repo: None,
             qdrant_repo: None,
-            rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             provider_cache: Arc::new(RwLock::new(HashMap::new())),
-            llm_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             llm_provider_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -204,9 +122,7 @@ impl ConfigCenter {
             config_repo,
             llm_repo: Some(llm_repo),
             qdrant_repo: None,
-            rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             provider_cache: Arc::new(RwLock::new(HashMap::new())),
-            llm_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             llm_provider_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -221,9 +137,7 @@ impl ConfigCenter {
             config_repo,
             llm_repo: Some(llm_repo),
             qdrant_repo: Some(qdrant_repo),
-            rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             provider_cache: Arc::new(RwLock::new(HashMap::new())),
-            llm_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             llm_provider_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -241,14 +155,10 @@ impl ConfigCenter {
         let providers = self.config_repo.list_providers().await?;
 
         let mut cache = self.provider_cache.write().await;
-        let mut limiters = self.rate_limiters.write().await;
 
         for record in &providers {
             let config = record.to_provider_config();
-            let rate_limit = config.rate_limit.clone();
-
             cache.insert(config.name.clone(), config);
-            limiters.insert(record.name.clone(), RateLimiterState::new(rate_limit));
         }
 
         info!(
@@ -286,21 +196,10 @@ impl ConfigCenter {
             let llm_providers = llm_repo.list_providers().await?;
 
             let mut llm_cache = self.llm_provider_cache.write().await;
-            let mut llm_limiters = self.llm_rate_limiters.write().await;
 
             for record in llm_providers {
                 let config = record.to_provider_config();
-                let rate_limit = if config.rpm_limit.is_some() || config.tpm_limit.is_some() {
-                    Some(RateLimitConfig {
-                        requests_per_minute: config.rpm_limit,
-                        tokens_per_minute: config.tpm_limit,
-                    })
-                } else {
-                    None
-                };
-
                 llm_cache.insert(config.name.clone(), config);
-                llm_limiters.insert(record.name.clone(), RateLimiterState::new(rate_limit));
             }
 
             info!(llm_provider_count = llm_cache.len(), "LLM providers loaded");
@@ -372,15 +271,6 @@ impl ConfigCenter {
             cache.insert(config.name.clone(), config.clone());
         }
 
-        // Initialize rate limiter
-        {
-            let mut limiters = self.rate_limiters.write().await;
-            limiters.insert(
-                config.name.clone(),
-                RateLimiterState::new(config.rate_limit),
-            );
-        }
-
         info!(provider_name = %record.name, "Provider created");
 
         Ok(record.into())
@@ -394,7 +284,6 @@ impl ConfigCenter {
         api_key: Option<String>,
         model: Option<String>,
         enabled: Option<bool>,
-        rate_limit: Option<RateLimitConfig>,
     ) -> AppResult<ProviderInfo> {
         debug!(provider_name = %name, "Updating provider");
 
@@ -403,7 +292,6 @@ impl ConfigCenter {
             api_key,
             model,
             enabled,
-            rate_limit,
         };
 
         let record = self.config_repo.update_provider(name, &update).await?;
@@ -413,12 +301,6 @@ impl ConfigCenter {
         {
             let mut cache = self.provider_cache.write().await;
             cache.insert(name.to_string(), config.clone());
-        }
-
-        // Update rate limiter if rate limit changed
-        if update.rate_limit.is_some() {
-            let mut limiters = self.rate_limiters.write().await;
-            limiters.insert(name.to_string(), RateLimiterState::new(config.rate_limit));
         }
 
         info!(provider_name = %name, "Provider updated");
@@ -486,39 +368,9 @@ impl ConfigCenter {
             cache.remove(name);
         }
 
-        // Remove rate limiter
-        {
-            let mut limiters = self.rate_limiters.write().await;
-            limiters.remove(name);
-        }
-
         info!(provider_name = %name, "Provider deleted");
 
         Ok(())
-    }
-
-    /// Check rate limit for a provider
-    ///
-    /// Returns Ok(()) if request can proceed, or Err with wait time in ms.
-    pub async fn check_rate_limit(&self, provider_name: &str, tokens: u32) -> AppResult<()> {
-        let mut limiters = self.rate_limiters.write().await;
-
-        if let Some(limiter) = limiters.get_mut(provider_name) {
-            match limiter.try_acquire(tokens) {
-                Ok(()) => Ok(()),
-                Err(wait_ms) => {
-                    warn!(
-                        provider_name = %provider_name,
-                        wait_ms = wait_ms,
-                        "Rate limit exceeded"
-                    );
-                    Err(AppError::RateLimitExceeded(provider_name.to_string()))
-                }
-            }
-        } else {
-            // No rate limiter configured, allow request
-            Ok(())
-        }
     }
 
     /// Get a cached provider config
@@ -653,21 +505,6 @@ impl ConfigCenter {
             cache.insert(config.name.clone(), config.clone());
         }
 
-        // Initialize rate limiter
-        {
-            let rate_limit = if config.rpm_limit.is_some() || config.tpm_limit.is_some() {
-                Some(RateLimitConfig {
-                    requests_per_minute: config.rpm_limit,
-                    tokens_per_minute: config.tpm_limit,
-                })
-            } else {
-                None
-            };
-
-            let mut limiters = self.llm_rate_limiters.write().await;
-            limiters.insert(config.name.clone(), RateLimiterState::new(rate_limit));
-        }
-
         info!(provider_name = %record.name, "LLM provider created");
 
         Ok(record.into())
@@ -692,21 +529,6 @@ impl ConfigCenter {
         {
             let mut cache = self.llm_provider_cache.write().await;
             cache.insert(name.to_string(), config.clone());
-        }
-
-        // Update rate limiter if rate limit changed
-        if update.rpm_limit.is_some() || update.tpm_limit.is_some() {
-            let rate_limit = if config.rpm_limit.is_some() || config.tpm_limit.is_some() {
-                Some(RateLimitConfig {
-                    requests_per_minute: config.rpm_limit,
-                    tokens_per_minute: config.tpm_limit,
-                })
-            } else {
-                None
-            };
-
-            let mut limiters = self.llm_rate_limiters.write().await;
-            limiters.insert(name.to_string(), RateLimiterState::new(rate_limit));
         }
 
         info!(provider_name = %name, "LLM provider updated");
@@ -772,39 +594,9 @@ impl ConfigCenter {
             cache.remove(name);
         }
 
-        // Remove rate limiter
-        {
-            let mut limiters = self.llm_rate_limiters.write().await;
-            limiters.remove(name);
-        }
-
         info!(provider_name = %name, "LLM provider deleted");
 
         Ok(())
-    }
-
-    /// Check rate limit for an LLM provider
-    ///
-    /// Returns Ok(()) if request can proceed, or Err with wait time in ms.
-    pub async fn check_llm_rate_limit(&self, provider_name: &str, tokens: u32) -> AppResult<()> {
-        let mut limiters = self.llm_rate_limiters.write().await;
-
-        if let Some(limiter) = limiters.get_mut(provider_name) {
-            match limiter.try_acquire(tokens) {
-                Ok(()) => Ok(()),
-                Err(wait_ms) => {
-                    warn!(
-                        provider_name = %provider_name,
-                        wait_ms = wait_ms,
-                        "LLM rate limit exceeded"
-                    );
-                    Err(AppError::RateLimitExceeded(provider_name.to_string()))
-                }
-            }
-        } else {
-            // No rate limiter configured, allow request
-            Ok(())
-        }
     }
 
     /// Get a cached LLM provider config
@@ -882,53 +674,99 @@ impl ConfigCenter {
         let record = llm_repo.get_provider(name).await?;
         Ok(record.get_prompt_config())
     }
+
+    // =========================================================================
+    // Embedding Generation Methods
+    // =========================================================================
+
+    /// Generate embedding for content and store it in Qdrant
+    ///
+    /// This method:
+    /// 1. Resolves the embedding provider (specified or default)
+    /// 2. Creates the appropriate embedding client (OpenAI or Local)
+    /// 3. Generates the embedding vector
+    /// 4. Stores the vector in Qdrant
+    ///
+    /// Returns the provider name used for embedding.
+    pub async fn generate_and_store_embedding(
+        &self,
+        memory_id: uuid::Uuid,
+        content: &str,
+        provider_name: Option<&str>,
+        payload: crate::repository::VectorPayload,
+    ) -> AppResult<String> {
+        use crate::embedding::{
+            EmbeddingProvider, EmbeddingRequest, LocalProvider, OpenAIProvider,
+        };
+
+        // Resolve provider
+        let config = self.resolve_provider(provider_name).await?;
+        let resolved_name = config.name.clone();
+
+        debug!(
+            memory_id = %memory_id,
+            provider = %resolved_name,
+            content_len = content.len(),
+            "Generating embedding"
+        );
+
+        // Check rate limit
+        // Estimate tokens: ~4 chars per token for English, ~2 for Chinese
+        let estimated_tokens = (content.len() / 3) as u32;
+
+        // Create embedding provider based on type
+        let embedding = match config.provider_type {
+            crate::embedding::ProviderType::OpenAI | crate::embedding::ProviderType::Azure => {
+                let provider = OpenAIProvider::new(config.clone()).map_err(|e| {
+                    AppError::Internal(format!("Failed to create OpenAI provider: {}", e))
+                })?;
+
+                let request = EmbeddingRequest::new(content);
+                provider.embed(request).await.map_err(|e| {
+                    AppError::Internal(format!("Embedding generation failed: {}", e))
+                })?
+            }
+            crate::embedding::ProviderType::Local => {
+                let provider = LocalProvider::new(config.clone()).map_err(|e| {
+                    AppError::Internal(format!("Failed to create local provider: {}", e))
+                })?;
+
+                let request = EmbeddingRequest::new(content);
+                provider.embed(request).await.map_err(|e| {
+                    AppError::Internal(format!("Embedding generation failed: {}", e))
+                })?
+            }
+        };
+
+        debug!(
+            memory_id = %memory_id,
+            dimension = embedding.embedding.len(),
+            "Embedding generated"
+        );
+
+        // Store in Qdrant
+        let qdrant = self
+            .qdrant_repo
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("Qdrant repository not configured".to_string()))?;
+
+        qdrant
+            .upsert_vector(&resolved_name, memory_id, embedding.embedding, payload)
+            .await?;
+
+        info!(
+            memory_id = %memory_id,
+            provider = %resolved_name,
+            "Embedding stored in Qdrant"
+        );
+
+        Ok(resolved_name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_rate_limiter_state_no_limit() {
-        let mut state = RateLimiterState::new(None);
-
-        // Should always succeed with no limit
-        assert!(state.try_acquire(100).is_ok());
-        assert!(state.try_acquire(1000).is_ok());
-        assert!(state.try_acquire(10000).is_ok());
-    }
-
-    #[test]
-    fn test_rate_limiter_state_rpm_limit() {
-        let config = RateLimitConfig {
-            requests_per_minute: Some(2),
-            tokens_per_minute: None,
-        };
-        let mut state = RateLimiterState::new(Some(config));
-
-        // First two requests should succeed
-        assert!(state.try_acquire(0).is_ok());
-        assert!(state.try_acquire(0).is_ok());
-
-        // Third request should fail
-        assert!(state.try_acquire(0).is_err());
-    }
-
-    #[test]
-    fn test_rate_limiter_state_tpm_limit() {
-        let config = RateLimitConfig {
-            requests_per_minute: None,
-            tokens_per_minute: Some(100),
-        };
-        let mut state = RateLimiterState::new(Some(config));
-
-        // Should succeed until token limit
-        assert!(state.try_acquire(50).is_ok());
-        assert!(state.try_acquire(40).is_ok());
-
-        // Should fail when exceeding limit
-        assert!(state.try_acquire(20).is_err());
-    }
 
     #[test]
     fn test_provider_info_from_record() {
@@ -943,8 +781,6 @@ mod tests {
             dimension: 1536,
             enabled: true,
             is_default: true,
-            rpm_limit: Some(500),
-            tpm_limit: Some(1000000),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -956,11 +792,6 @@ mod tests {
         assert!(info.enabled);
         assert!(info.is_default);
         assert_eq!(info.dimension, 1536);
-        assert!(info.rate_limit.is_some());
-
-        let rate_limit = info.rate_limit.unwrap();
-        assert_eq!(rate_limit.requests_per_minute, Some(500));
-        assert_eq!(rate_limit.tokens_per_minute, Some(1000000));
     }
 
     #[test]
@@ -975,8 +806,6 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             enabled: true,
             is_default: true,
-            rpm_limit: Some(500),
-            tpm_limit: Some(100000),
             compression_prompt: Some("Compress: {content}".to_string()),
             classification_prompt: None,
             max_input_tokens: 4000,
@@ -993,8 +822,6 @@ mod tests {
         assert!(info.enabled);
         assert!(info.is_default);
         assert_eq!(info.model, "gpt-4o-mini");
-        assert_eq!(info.rpm_limit, Some(500));
-        assert_eq!(info.tpm_limit, Some(100000));
         assert_eq!(info.max_input_tokens, 4000);
         assert_eq!(info.max_output_tokens, 1000);
         assert!((info.temperature - 0.3).abs() < f32::EPSILON);
@@ -1014,8 +841,6 @@ mod tests {
             model: "llama2".to_string(),
             enabled: true,
             is_default: false,
-            rpm_limit: None,
-            tpm_limit: None,
             compression_prompt: None,
             classification_prompt: None,
             max_input_tokens: 4000,
@@ -1029,8 +854,6 @@ mod tests {
 
         assert_eq!(info.name, "local-llm");
         assert_eq!(info.provider_type, LlmProviderType::Local);
-        assert!(info.rpm_limit.is_none());
-        assert!(info.tpm_limit.is_none());
         assert!(!info.has_compression_prompt);
         assert!(!info.has_classification_prompt);
     }

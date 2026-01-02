@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use tracing::{debug, info};
 
-use crate::embedding::{ProviderConfig, ProviderType, RateLimitConfig};
+use crate::embedding::{ProviderConfig, ProviderType};
 use crate::error::{AppError, AppResult};
 
 /// Repository for embedding provider configuration operations
@@ -40,13 +40,13 @@ impl ConfigRepository {
             r#"
             INSERT INTO embedding_providers (
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, $9, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW(), NOW())
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             "#,
         )
@@ -57,20 +57,6 @@ impl ConfigRepository {
         .bind(&config.model)
         .bind(config.dimension as i32)
         .bind(config.enabled)
-        .bind(
-            config
-                .rate_limit
-                .as_ref()
-                .and_then(|r| r.requests_per_minute)
-                .map(|v| v as i32),
-        )
-        .bind(
-            config
-                .rate_limit
-                .as_ref()
-                .and_then(|r| r.tokens_per_minute)
-                .map(|v| v as i32),
-        )
         .fetch_one(&self.pool)
         .await?;
 
@@ -84,7 +70,7 @@ impl ConfigRepository {
             r#"
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             FROM embedding_providers
             WHERE name = $1
@@ -104,7 +90,7 @@ impl ConfigRepository {
             r#"
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             FROM embedding_providers
             ORDER BY name
@@ -131,18 +117,6 @@ impl ConfigRepository {
         let endpoint = update.endpoint.as_ref().unwrap_or(&existing.endpoint);
         let model = update.model.as_ref().unwrap_or(&existing.model);
         let enabled = update.enabled.unwrap_or(existing.enabled);
-        let rpm_limit = update
-            .rate_limit
-            .as_ref()
-            .and_then(|r| r.requests_per_minute)
-            .map(|v| v as i32)
-            .or(existing.rpm_limit);
-        let tpm_limit = update
-            .rate_limit
-            .as_ref()
-            .and_then(|r| r.tokens_per_minute)
-            .map(|v| v as i32)
-            .or(existing.tpm_limit);
 
         // Handle API key update
         let api_key_encrypted = if let Some(ref key) = update.api_key {
@@ -158,13 +132,11 @@ impl ConfigRepository {
                 api_key_encrypted = $3,
                 model = $4,
                 enabled = $5,
-                rpm_limit = $6,
-                tpm_limit = $7,
                 updated_at = NOW()
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             "#,
         )
@@ -173,8 +145,6 @@ impl ConfigRepository {
         .bind(&api_key_encrypted)
         .bind(model)
         .bind(enabled)
-        .bind(rpm_limit)
-        .bind(tpm_limit)
         .fetch_one(&self.pool)
         .await?;
 
@@ -236,7 +206,7 @@ impl ConfigRepository {
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             "#,
         )
@@ -256,7 +226,7 @@ impl ConfigRepository {
             r#"
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             FROM embedding_providers
             WHERE is_default = true AND enabled = true
@@ -295,7 +265,7 @@ impl ConfigRepository {
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                dimension, enabled, is_default, rpm_limit, tpm_limit,
+                dimension, enabled, is_default,
                 created_at, updated_at
             "#,
         )
@@ -334,8 +304,6 @@ pub struct UpdateProviderInput {
     pub model: Option<String>,
     /// Enable/disable the provider
     pub enabled: Option<bool>,
-    /// New rate limit configuration
-    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Embedding provider record from database
@@ -357,10 +325,6 @@ pub struct EmbeddingProviderRecord {
     pub enabled: bool,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Requests per minute limit
-    pub rpm_limit: Option<i32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<i32>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
@@ -375,15 +339,6 @@ impl EmbeddingProviderRecord {
             .as_ref()
             .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
 
-        let rate_limit = if self.rpm_limit.is_some() || self.tpm_limit.is_some() {
-            Some(RateLimitConfig {
-                requests_per_minute: self.rpm_limit.map(|v| v as u32),
-                tokens_per_minute: self.tpm_limit.map(|v| v as u32),
-            })
-        } else {
-            None
-        };
-
         ProviderConfig {
             name: self.name.clone(),
             provider_type: self.provider_type,
@@ -392,7 +347,6 @@ impl EmbeddingProviderRecord {
             model: self.model.clone(),
             dimension: self.dimension as usize,
             enabled: self.enabled,
-            rate_limit,
         }
     }
 }
@@ -408,8 +362,6 @@ struct EmbeddingProviderRow {
     dimension: i32,
     enabled: bool,
     is_default: bool,
-    rpm_limit: Option<i32>,
-    tpm_limit: Option<i32>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -425,8 +377,6 @@ impl From<EmbeddingProviderRow> for EmbeddingProviderRecord {
             dimension: row.dimension,
             enabled: row.enabled,
             is_default: row.is_default,
-            rpm_limit: row.rpm_limit,
-            tpm_limit: row.tpm_limit,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -448,8 +398,6 @@ mod tests {
             dimension: 1536,
             enabled: true,
             is_default: true,
-            rpm_limit: Some(500),
-            tpm_limit: Some(1000000),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -463,11 +411,6 @@ mod tests {
         assert_eq!(config.model, "text-embedding-3-small");
         assert_eq!(config.dimension, 1536);
         assert!(config.enabled);
-        assert!(config.rate_limit.is_some());
-
-        let rate_limit = config.rate_limit.unwrap();
-        assert_eq!(rate_limit.requests_per_minute, Some(500));
-        assert_eq!(rate_limit.tokens_per_minute, Some(1000000));
     }
 
     #[test]
@@ -481,8 +424,6 @@ mod tests {
             dimension: 1024,
             enabled: true,
             is_default: false,
-            rpm_limit: None,
-            tpm_limit: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -492,7 +433,6 @@ mod tests {
         assert_eq!(config.name, "local-provider");
         assert_eq!(config.provider_type, ProviderType::Local);
         assert!(config.api_key.is_none());
-        assert!(config.rate_limit.is_none());
     }
 
     #[test]
@@ -503,6 +443,5 @@ mod tests {
         assert!(input.api_key.is_none());
         assert!(input.model.is_none());
         assert!(input.enabled.is_none());
-        assert!(input.rate_limit.is_none());
     }
 }

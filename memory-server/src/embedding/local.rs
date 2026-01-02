@@ -302,7 +302,6 @@ mod tests {
             model: "bge-large-zh-v1.5".to_string(),
             dimension: 1024,
             enabled: true,
-            rate_limit: None,
         }
     }
 

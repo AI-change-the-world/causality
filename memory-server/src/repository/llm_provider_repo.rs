@@ -42,15 +42,15 @@ impl LlmProviderRepository {
             r#"
             INSERT INTO llm_providers (
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, NOW(), NOW())
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -62,8 +62,6 @@ impl LlmProviderRepository {
         .bind(&api_key_encrypted)
         .bind(&config.model)
         .bind(config.enabled)
-        .bind(config.rpm_limit.map(|v| v as i32))
-        .bind(config.tpm_limit.map(|v| v as i32))
         .bind(prompts.and_then(|p| p.compression_prompt.as_ref()))
         .bind(prompts.and_then(|p| p.classification_prompt.as_ref()))
         .bind(config.max_input_tokens as i32)
@@ -82,7 +80,7 @@ impl LlmProviderRepository {
             r#"
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -104,7 +102,7 @@ impl LlmProviderRepository {
             r#"
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -133,8 +131,6 @@ impl LlmProviderRepository {
         let endpoint = update.endpoint.as_ref().unwrap_or(&existing.endpoint);
         let model = update.model.as_ref().unwrap_or(&existing.model);
         let enabled = update.enabled.unwrap_or(existing.enabled);
-        let rpm_limit = update.rpm_limit.map(|v| v as i32).or(existing.rpm_limit);
-        let tpm_limit = update.tpm_limit.map(|v| v as i32).or(existing.tpm_limit);
         let compression_prompt = update
             .compression_prompt
             .as_ref()
@@ -167,18 +163,16 @@ impl LlmProviderRepository {
                 api_key_encrypted = $3,
                 model = $4,
                 enabled = $5,
-                rpm_limit = $6,
-                tpm_limit = $7,
-                compression_prompt = $8,
-                classification_prompt = $9,
-                max_input_tokens = $10,
-                max_output_tokens = $11,
-                temperature = $12,
+                compression_prompt = $6,
+                classification_prompt = $7,
+                max_input_tokens = $8,
+                max_output_tokens = $9,
+                temperature = $10,
                 updated_at = NOW()
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -189,8 +183,6 @@ impl LlmProviderRepository {
         .bind(&api_key_encrypted)
         .bind(model)
         .bind(enabled)
-        .bind(rpm_limit)
-        .bind(tpm_limit)
         .bind(compression_prompt)
         .bind(classification_prompt)
         .bind(max_input_tokens)
@@ -257,7 +249,7 @@ impl LlmProviderRepository {
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -279,7 +271,7 @@ impl LlmProviderRepository {
             r#"
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -320,7 +312,7 @@ impl LlmProviderRepository {
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
+                enabled, is_default,
                 compression_prompt, classification_prompt,
                 max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
@@ -442,10 +434,6 @@ pub struct LlmProviderRecord {
     pub enabled: bool,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Requests per minute limit
-    pub rpm_limit: Option<i32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<i32>,
     /// Compression prompt template
     pub compression_prompt: Option<String>,
     /// Classification prompt template
@@ -480,8 +468,6 @@ impl LlmProviderRecord {
             max_input_tokens: self.max_input_tokens as u32,
             max_output_tokens: self.max_output_tokens as u32,
             temperature: self.temperature,
-            rpm_limit: self.rpm_limit.map(|v| v as u32),
-            tpm_limit: self.tpm_limit.map(|v| v as u32),
         }
     }
 
@@ -504,8 +490,6 @@ struct LlmProviderRow {
     model: String,
     enabled: bool,
     is_default: bool,
-    rpm_limit: Option<i32>,
-    tpm_limit: Option<i32>,
     compression_prompt: Option<String>,
     classification_prompt: Option<String>,
     max_input_tokens: i32,
@@ -525,8 +509,6 @@ impl From<LlmProviderRow> for LlmProviderRecord {
             model: row.model,
             enabled: row.enabled,
             is_default: row.is_default,
-            rpm_limit: row.rpm_limit,
-            tpm_limit: row.tpm_limit,
             compression_prompt: row.compression_prompt,
             classification_prompt: row.classification_prompt,
             max_input_tokens: row.max_input_tokens,
@@ -552,8 +534,6 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             enabled: true,
             is_default: true,
-            rpm_limit: Some(500),
-            tpm_limit: Some(100000),
             compression_prompt: Some("Compress this: {content}".to_string()),
             classification_prompt: Some("Classify this: {content}".to_string()),
             max_input_tokens: 4000,
@@ -574,8 +554,6 @@ mod tests {
         assert_eq!(config.max_input_tokens, 4000);
         assert_eq!(config.max_output_tokens, 1000);
         assert!((config.temperature - 0.3).abs() < f32::EPSILON);
-        assert_eq!(config.rpm_limit, Some(500));
-        assert_eq!(config.tpm_limit, Some(100000));
     }
 
     #[test]
@@ -588,8 +566,6 @@ mod tests {
             model: "llama2".to_string(),
             enabled: true,
             is_default: false,
-            rpm_limit: None,
-            tpm_limit: None,
             compression_prompt: None,
             classification_prompt: None,
             max_input_tokens: 4000,
@@ -604,8 +580,6 @@ mod tests {
         assert_eq!(config.name, "local-llm");
         assert_eq!(config.provider_type, LlmProviderType::Local);
         assert!(config.api_key.is_none());
-        assert!(config.rpm_limit.is_none());
-        assert!(config.tpm_limit.is_none());
     }
 
     #[test]
@@ -618,8 +592,6 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             enabled: true,
             is_default: false,
-            rpm_limit: None,
-            tpm_limit: None,
             compression_prompt: Some("Compress: {content}".to_string()),
             classification_prompt: Some("Classify: {content}".to_string()),
             max_input_tokens: 4000,

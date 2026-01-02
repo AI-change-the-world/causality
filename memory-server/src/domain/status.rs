@@ -4,6 +4,7 @@
 //! ProcessingStatus, MemoryCategory, and InferenceType.
 
 use serde::{Deserialize, Serialize};
+use sqlx::TypeInfo;
 use utoipa::ToSchema;
 
 /// Memory lifecycle status
@@ -208,8 +209,7 @@ impl std::str::FromStr for MemoryCategory {
 ///
 /// Used to mark the type of inference made when extracting memories from raw events.
 /// This helps distinguish between direct facts and inferred information.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
-#[sqlx(type_name = "inference_type", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceType {
     /// Direct fact extracted from the event (e.g., "user clicked button X")
@@ -220,6 +220,42 @@ pub enum InferenceType {
     Pattern,
     /// Extracted business rule (e.g., "contracts require 3 signatures")
     Rule,
+}
+
+// Manual sqlx implementation for VARCHAR storage
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for InferenceType {
+    fn decode(
+        value: sqlx::postgres::PgValueRef<'r>,
+    ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+        let s = <&str as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+        s.parse::<InferenceType>().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                as Box<dyn std::error::Error + Send + Sync>
+        })
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for InferenceType {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        // Compatible with VARCHAR and TEXT
+        *ty == <String as sqlx::Type<sqlx::Postgres>>::type_info()
+            || ty.name() == "VARCHAR"
+            || ty.name() == "TEXT"
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Postgres> for InferenceType {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync>> {
+        let s = self.to_string();
+        <String as sqlx::Encode<sqlx::Postgres>>::encode(s, buf)
+    }
 }
 
 impl Default for InferenceType {

@@ -114,10 +114,6 @@ pub struct LlmProviderConfig {
     /// Temperature for generation
     #[serde(default = "default_temperature")]
     pub temperature: f32,
-    /// Rate limit: requests per minute
-    pub rpm_limit: Option<u32>,
-    /// Rate limit: tokens per minute
-    pub tpm_limit: Option<u32>,
 }
 
 fn default_enabled() -> bool {
@@ -476,8 +472,6 @@ mod tests {
             max_input_tokens: 4000,
             max_output_tokens: 1000,
             temperature: 0.3,
-            rpm_limit: Some(500),
-            tpm_limit: Some(100000),
         };
 
         let json = serde_json::to_string(&config).unwrap();

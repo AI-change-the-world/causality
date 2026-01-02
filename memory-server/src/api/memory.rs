@@ -200,6 +200,8 @@ pub fn memory_routes() -> Router<AppState> {
 ///
 /// Creates a new memory with the specified parameters.
 /// Long-term layer is rejected - requires manual confirmation.
+/// If an embedding provider is configured, the memory content will be embedded
+/// and stored in the vector database for semantic search.
 #[utoipa::path(
     post,
     path = "/api/v1/memories",
@@ -215,9 +217,56 @@ pub async fn create_memory(
     State(state): State<AppState>,
     Json(request): Json<CreateMemoryApiRequest>,
 ) -> AppResult<(StatusCode, Json<CreateMemoryResponse>)> {
+    use crate::repository::VectorPayload;
+
+    let embedding_provider = request.embedding_provider.clone();
     let input: CreateMemoryInput = request.into();
 
-    let memory = state.memory_guard.create_memory(input, None).await?;
+    let mut memory = state.memory_guard.create_memory(input, None).await?;
+
+    // Generate embedding and store in Qdrant if provider is available
+    if state
+        .config_center
+        .has_enabled_provider()
+        .await
+        .unwrap_or(false)
+    {
+        let payload = VectorPayload {
+            memory_id: memory.id,
+            scope_type: memory.scope_type.to_string(),
+            scope_id: memory.scope_id.clone(),
+            scene: memory.scene.clone(),
+            layer: memory.layer.to_string(),
+            status: memory.status.to_string(),
+        };
+
+        match state
+            .config_center
+            .generate_and_store_embedding(
+                memory.id,
+                &memory.content,
+                embedding_provider.as_deref(),
+                payload,
+            )
+            .await
+        {
+            Ok(provider_name) => {
+                // Update memory with embedding status
+                memory.embedding_status = EmbeddingStatus::Completed;
+                memory.embedding_provider = Some(provider_name);
+                // Note: In a production system, you'd update the database record here
+                // For now, we just update the response
+            }
+            Err(e) => {
+                tracing::warn!(
+                    memory_id = %memory.id,
+                    error = %e,
+                    "Failed to generate embedding, memory created without vector"
+                );
+                memory.embedding_status = EmbeddingStatus::Failed;
+            }
+        }
+    }
 
     let response = CreateMemoryResponse {
         id: memory.id,

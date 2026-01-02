@@ -915,8 +915,6 @@ mod tests {
             max_input_tokens: 4000,
             max_output_tokens: 1000,
             temperature: 0.3,
-            rpm_limit: None,
-            tpm_limit: None,
         };
         let provider = Arc::new(LocalLlmProvider::new(config).unwrap());
         let processor = MemoryProcessor::new(provider);
