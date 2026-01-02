@@ -1,0 +1,46 @@
+# Memory Server Docker Ignore File
+# Excludes files from Docker build context for faster builds
+
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Docker files (not needed in context)
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Environment files (sensitive data)
+.env
+.env.*
+!.env.example
+
+# Documentation
+*.md
+docs/
+
+# Test files
+tests/
+*_test.rs
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Misc
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

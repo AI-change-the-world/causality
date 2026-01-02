@@ -1,0 +1,59 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+database:
+  url: "${DATABASE_URL}"
+  max_connections: 10
+  min_connections: 2
+
+qdrant:
+  url: "${QDRANT_URL}"
+  collection_name: "memories"
+
+embedding:
+  default_provider: "openai"
+  providers:
+    - name: "openai"
+      type: "openai"
+      endpoint: "https://api.openai.com/v1"
+      api_key: "${OPENAI_API_KEY}"
+      model: "text-embedding-3-small"
+      dimension: 1536
+      rate_limit:
+        requests_per_minute: 500
+        tokens_per_minute: 1000000
+    
+    - name: "local-bge"
+      type: "local"
+      endpoint: "http://embedding-service:8000/v1"
+      model: "bge-large-zh-v1.5"
+      dimension: 1024
+      rate_limit:
+        requests_per_minute: 1000
+
+lifecycle:
+  cooldown_check_interval_seconds: 3600
+  cooldown_thresholds:
+    session: 86400      # 1 day
+    task: 604800        # 7 days
+    long_term: 2592000  # 30 days
+  default_ttl:
+    session: 3600       # 1 hour
+    task: 604800        # 7 days
+    long_term: null     # no expiry
+
+retrieval:
+  default_top_k: 10
+  max_top_k: 100
+  cooldown_penalty: 0.5
+  score_weights:
+    similarity: 0.35
+    importance: 0.25
+    recency: 0.15
+    hit_count: 0.1
+    fulltext: 0.15
+
+audit:
+  enabled: true
+  retention_days: 90
