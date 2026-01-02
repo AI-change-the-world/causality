@@ -14,7 +14,7 @@ use axum::http::header::HeaderName;
 use memory_server::api::{create_router, health::init_start_time, AppState};
 use memory_server::config::AppConfig;
 use memory_server::repository::{
-    AuditRepository, ConfigRepository, LlmProviderRepository, MemoryRepository,
+    AuditRepository, ConfigRepository, LlmProviderRepository, MemoryRepository, QdrantRepository,
 };
 use memory_server::service::{ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine};
 use sqlx::postgres::PgPoolOptions;
@@ -80,15 +80,21 @@ async fn main() -> anyhow::Result<()> {
         info!("Database migrations skipped (run_migrations=false)");
     }
 
-    // Initialize Qdrant client (placeholder - actual implementation in later task)
+    // Initialize Qdrant client
     info!(
         url = %config.qdrant.url,
         collection = %config.qdrant.collection_name,
         "Initializing Qdrant client"
     );
-    // TODO: Initialize actual Qdrant client when Qdrant integration is implemented
-    // For now, we log the configuration but don't create a client
-    warn!("Qdrant client initialization is a placeholder - vector search will use default similarities");
+
+    let qdrant_repo = QdrantRepository::new(&config.qdrant.url)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to initialize Qdrant client");
+            anyhow::anyhow!("Qdrant initialization error: {}", e)
+        })?;
+
+    info!("Qdrant client initialized");
 
     // Create repositories
     let memory_repo = MemoryRepository::new(pool.clone());
@@ -110,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         config.audit.enabled,
     );
 
-    let config_center = ConfigCenter::with_llm_repo(config_repo.clone(), llm_repo);
+    let config_center = ConfigCenter::with_full_support(config_repo.clone(), llm_repo, qdrant_repo);
 
     // Initialize config center (load providers from database)
     if let Err(e) = config_center.initialize().await {

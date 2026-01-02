@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::llm::{LlmProviderConfig, LlmProviderType};
 use crate::repository::{
     ConfigRepository, EmbeddingProviderRecord, LlmPromptConfig, LlmProviderRecord,
-    LlmProviderRepository, UpdateLlmProviderInput, UpdateProviderInput,
+    LlmProviderRepository, QdrantRepository, UpdateLlmProviderInput, UpdateProviderInput,
 };
 
 /// Provider information for API responses
@@ -173,6 +173,7 @@ impl RateLimiterState {
 pub struct ConfigCenter {
     config_repo: ConfigRepository,
     llm_repo: Option<LlmProviderRepository>,
+    qdrant_repo: Option<QdrantRepository>,
     /// In-memory rate limiters per embedding provider
     rate_limiters: Arc<RwLock<HashMap<String, RateLimiterState>>>,
     /// Cached embedding provider configs for hot access
@@ -189,6 +190,7 @@ impl ConfigCenter {
         Self {
             config_repo,
             llm_repo: None,
+            qdrant_repo: None,
             rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             provider_cache: Arc::new(RwLock::new(HashMap::new())),
             llm_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
@@ -201,11 +203,34 @@ impl ConfigCenter {
         Self {
             config_repo,
             llm_repo: Some(llm_repo),
+            qdrant_repo: None,
             rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             provider_cache: Arc::new(RwLock::new(HashMap::new())),
             llm_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             llm_provider_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Create a new ConfigCenter service with full support (LLM + Qdrant)
+    pub fn with_full_support(
+        config_repo: ConfigRepository,
+        llm_repo: LlmProviderRepository,
+        qdrant_repo: QdrantRepository,
+    ) -> Self {
+        Self {
+            config_repo,
+            llm_repo: Some(llm_repo),
+            qdrant_repo: Some(qdrant_repo),
+            rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            provider_cache: Arc::new(RwLock::new(HashMap::new())),
+            llm_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            llm_provider_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Get the Qdrant repository (if configured)
+    pub fn qdrant_repo(&self) -> Option<&QdrantRepository> {
+        self.qdrant_repo.as_ref()
     }
 
     /// Initialize the config center by loading providers from database
@@ -218,7 +243,7 @@ impl ConfigCenter {
         let mut cache = self.provider_cache.write().await;
         let mut limiters = self.rate_limiters.write().await;
 
-        for record in providers {
+        for record in &providers {
             let config = record.to_provider_config();
             let rate_limit = config.rate_limit.clone();
 
@@ -230,6 +255,31 @@ impl ConfigCenter {
             embedding_provider_count = cache.len(),
             "Embedding providers loaded"
         );
+
+        // Ensure Qdrant collections exist for all providers
+        if let Some(ref qdrant) = self.qdrant_repo {
+            for record in &providers {
+                if !qdrant.collection_exists(&record.name).await {
+                    if let Err(e) = qdrant
+                        .create_collection(&record.name, record.dimension as usize)
+                        .await
+                    {
+                        warn!(
+                            provider_name = %record.name,
+                            dimension = record.dimension,
+                            error = %e,
+                            "Failed to create Qdrant collection during initialization"
+                        );
+                    } else {
+                        info!(
+                            provider_name = %record.name,
+                            dimension = record.dimension,
+                            "Created Qdrant collection during initialization"
+                        );
+                    }
+                }
+            }
+        }
 
         // Load LLM providers if repository is configured
         if let Some(ref llm_repo) = self.llm_repo {
@@ -293,6 +343,28 @@ impl ConfigCenter {
         debug!(provider_name = %config.name, "Creating provider");
 
         let record = self.config_repo.create_provider(&config).await?;
+
+        // Create Qdrant collection for this provider
+        if let Some(ref qdrant) = self.qdrant_repo {
+            if let Err(e) = qdrant
+                .create_collection(&config.name, config.dimension)
+                .await
+            {
+                // Log warning but don't fail - collection might already exist
+                warn!(
+                    provider_name = %config.name,
+                    dimension = config.dimension,
+                    error = %e,
+                    "Failed to create Qdrant collection (may already exist)"
+                );
+            } else {
+                info!(
+                    provider_name = %config.name,
+                    dimension = config.dimension,
+                    "Created Qdrant collection for provider"
+                );
+            }
+        }
 
         // Update cache
         {
@@ -394,6 +466,19 @@ impl ConfigCenter {
         debug!(provider_name = %name, "Deleting provider");
 
         self.config_repo.delete_provider(name).await?;
+
+        // Delete Qdrant collection for this provider
+        if let Some(ref qdrant) = self.qdrant_repo {
+            if let Err(e) = qdrant.delete_collection(name).await {
+                warn!(
+                    provider_name = %name,
+                    error = %e,
+                    "Failed to delete Qdrant collection"
+                );
+            } else {
+                info!(provider_name = %name, "Deleted Qdrant collection for provider");
+            }
+        }
 
         // Remove from cache
         {

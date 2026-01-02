@@ -1,8 +1,9 @@
 //! MemoryProcessor service
 //!
 //! Responsible for LLM-driven memory processing: compression, classification,
-//! and tag extraction. This is an optional processing pipeline that can be
-//! enabled per-memory via the `process_with_llm` flag.
+//! and tag extraction in a single LLM call for efficiency.
+//! This is an optional processing pipeline that can be enabled per-memory
+//! via the `process_with_llm` flag.
 
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -66,58 +67,36 @@ pub struct ProcessMemoryResult {
     pub confidence: f32,
 }
 
-/// Default prompt template for memory compression
-const DEFAULT_COMPRESSION_PROMPT: &str = r#"你是一个记忆压缩助手。请从以下对话/操作记录中提取关键信息，生成简洁的结构化记忆。
+/// Default unified prompt template for memory processing (compression, classification, tag extraction)
+const DEFAULT_UNIFIED_PROMPT: &str = r#"你是一个记忆处理助手。请对以下内容进行处理，完成三个任务：
 
-要求：
-1. 保留核心事实和用户偏好
-2. 去除冗余和无关信息
-3. 使用简洁的陈述句
-4. 保持原意不变
-5. 输出应该是一段简洁的文字，不要使用列表格式
+1. **压缩**：提取关键信息，生成简洁的结构化记忆（保留核心事实和用户偏好，去除冗余）
+2. **分类**：将记忆分类到以下类别之一：
+   - user_preference: 用户偏好（如喜好、习惯设置）
+   - behavior_pattern: 行为模式（如工作习惯、操作方式）
+   - business_rule: 业务规则（如流程、规定）
+   - factual_knowledge: 事实知识（如日期、数据）
+   - other: 其他
+3. **标签**：提取3-5个关键词/标签用于检索
 
 原始内容：
 {content}
 
-压缩后的记忆："#;
-
-/// Default prompt template for memory classification
-const DEFAULT_CLASSIFICATION_PROMPT: &str = r#"请将以下记忆分类到最合适的类别：
-- user_preference: 用户偏好（如喜好、习惯设置）
-- behavior_pattern: 行为模式（如工作习惯、操作方式）
-- business_rule: 业务规则（如流程、规定）
-- factual_knowledge: 事实知识（如日期、数据）
-- other: 其他
-
-记忆内容：
-{content}
-
-请只返回类别名称（如 user_preference），不要返回其他内容："#;
-
-/// Default prompt template for tag extraction
-const DEFAULT_TAG_EXTRACTION_PROMPT: &str = r#"请从以下记忆内容中提取3-5个关键词/标签，用于后续检索。
-
-要求：
-1. 标签应该是名词或名词短语
-2. 标签应该能够代表记忆的核心主题
-3. 每个标签用逗号分隔
-4. 只返回标签，不要返回其他内容
-
-记忆内容：
-{content}
-
-标签："#;
+请严格按照以下JSON格式返回结果，不要返回其他内容：
+```json
+{
+  "compressed": "压缩后的记忆内容",
+  "category": "分类名称",
+  "tags": ["标签1", "标签2", "标签3"]
+}
+```"#;
 
 /// MemoryProcessor service for LLM-driven memory processing
 pub struct MemoryProcessor {
     /// LLM provider for processing
     llm_provider: Arc<dyn LlmProvider>,
-    /// Compression prompt template
-    compression_prompt: String,
-    /// Classification prompt template
-    classification_prompt: String,
-    /// Tag extraction prompt template
-    tag_extraction_prompt: String,
+    /// Unified processing prompt template
+    unified_prompt: String,
 }
 
 impl MemoryProcessor {
@@ -125,31 +104,19 @@ impl MemoryProcessor {
     pub fn new(llm_provider: Arc<dyn LlmProvider>) -> Self {
         Self {
             llm_provider,
-            compression_prompt: DEFAULT_COMPRESSION_PROMPT.to_string(),
-            classification_prompt: DEFAULT_CLASSIFICATION_PROMPT.to_string(),
-            tag_extraction_prompt: DEFAULT_TAG_EXTRACTION_PROMPT.to_string(),
+            unified_prompt: DEFAULT_UNIFIED_PROMPT.to_string(),
         }
     }
 
-    /// Create a new MemoryProcessor with custom prompts
-    pub fn with_prompts(
-        llm_provider: Arc<dyn LlmProvider>,
-        compression_prompt: Option<String>,
-        classification_prompt: Option<String>,
-        tag_extraction_prompt: Option<String>,
-    ) -> Self {
+    /// Create a new MemoryProcessor with a custom unified prompt
+    pub fn with_prompt(llm_provider: Arc<dyn LlmProvider>, unified_prompt: Option<String>) -> Self {
         Self {
             llm_provider,
-            compression_prompt: compression_prompt
-                .unwrap_or_else(|| DEFAULT_COMPRESSION_PROMPT.to_string()),
-            classification_prompt: classification_prompt
-                .unwrap_or_else(|| DEFAULT_CLASSIFICATION_PROMPT.to_string()),
-            tag_extraction_prompt: tag_extraction_prompt
-                .unwrap_or_else(|| DEFAULT_TAG_EXTRACTION_PROMPT.to_string()),
+            unified_prompt: unified_prompt.unwrap_or_else(|| DEFAULT_UNIFIED_PROMPT.to_string()),
         }
     }
 
-    /// Process raw content: compress, classify, and extract tags
+    /// Process raw content: compress, classify, and extract tags in a single LLM call
     pub async fn process(
         &self,
         request: ProcessMemoryRequest,
@@ -160,94 +127,131 @@ impl MemoryProcessor {
             "Processing memory content"
         );
 
-        // Step 1: Compress/refine the content
-        let processed_content = self.compress(&request.content).await?;
+        // Build the prompt with content
+        let prompt = self.unified_prompt.replace("{content}", &request.content);
 
-        // Step 2: Classify the memory
-        let category = self.classify(&processed_content).await?;
+        // Single LLM call for all processing tasks
+        let chat_request = ChatRequest::new(prompt).with_temperature(0.3);
 
-        // Step 3: Extract tags
-        let tags = self.extract_tags(&processed_content).await?;
+        let response = self.llm_provider.chat(chat_request).await?;
+
+        // Parse the JSON response
+        let result = Self::parse_unified_response(&response.content)?;
 
         info!(
             original_len = request.content.len(),
-            processed_len = processed_content.len(),
-            category = %category,
-            tag_count = tags.len(),
+            processed_len = result.processed_content.len(),
+            category = %result.category,
+            tag_count = result.tags.len(),
             "Memory processing completed"
         );
+
+        Ok(result)
+    }
+
+    /// Parse the unified JSON response from LLM
+    fn parse_unified_response(response: &str) -> Result<ProcessMemoryResult, ProcessingError> {
+        // Try to extract JSON from the response (handle markdown code blocks)
+        let json_str = Self::extract_json(response);
+
+        // Parse JSON
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            warn!(
+                response = %response,
+                error = %e,
+                "Failed to parse JSON response"
+            );
+            ProcessingError::ParseError(format!("Invalid JSON: {}", e))
+        })?;
+
+        // Extract fields
+        let compressed = parsed["compressed"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let category_str = parsed["category"].as_str().unwrap_or("other");
+        let category = Self::parse_category(category_str);
+
+        let tags: Vec<String> = parsed["tags"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s.len() <= 50)
+                    .take(10)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Fallback if compressed content is empty
+        let processed_content = if compressed.is_empty() {
+            warn!("Compressed content is empty, this may indicate a parsing issue");
+            response.to_string()
+        } else {
+            compressed
+        };
 
         Ok(ProcessMemoryResult {
             processed_content,
             category,
             tags,
-            confidence: 0.9, // Default confidence for successful processing
+            confidence: 0.9,
         })
     }
 
-    /// Compress/refine raw content
-    pub async fn compress(&self, content: &str) -> Result<String, ProcessingError> {
-        let prompt = self.compression_prompt.replace("{content}", content);
-        let request = ChatRequest::new(prompt)
-            .with_temperature(0.3)
-            .with_max_tokens(500);
+    /// Extract JSON from response (handles markdown code blocks)
+    fn extract_json(response: &str) -> String {
+        let response = response.trim();
 
-        let response = self.llm_provider.chat(request).await?;
-        let compressed = response.content.trim().to_string();
+        // Try to find JSON in markdown code block
+        if let Some(start) = response.find("```json") {
+            if let Some(end) = response[start..]
+                .find("```\n")
+                .or(response[start..].rfind("```"))
+            {
+                let json_start = start + 7; // Skip "```json"
+                let json_end = start + end;
+                if json_start < json_end {
+                    return response[json_start..json_end].trim().to_string();
+                }
+            }
+        }
 
-        debug!(
-            original_len = content.len(),
-            compressed_len = compressed.len(),
-            "Content compressed"
-        );
+        // Try to find JSON in generic code block
+        if let Some(start) = response.find("```") {
+            let after_start = start + 3;
+            if let Some(end) = response[after_start..].find("```") {
+                let content = &response[after_start..after_start + end];
+                // Skip language identifier if present
+                let json_content = content
+                    .lines()
+                    .skip_while(|line| !line.trim().starts_with('{'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !json_content.is_empty() {
+                    return json_content.trim().to_string();
+                }
+            }
+        }
 
-        Ok(compressed)
+        // Try to find raw JSON object
+        if let Some(start) = response.find('{') {
+            if let Some(end) = response.rfind('}') {
+                if start < end {
+                    return response[start..=end].to_string();
+                }
+            }
+        }
+
+        // Return as-is if no JSON found
+        response.to_string()
     }
 
-    /// Classify memory into a category
-    pub async fn classify(&self, content: &str) -> Result<MemoryCategory, ProcessingError> {
-        let prompt = self.classification_prompt.replace("{content}", content);
-        let request = ChatRequest::new(prompt)
-            .with_temperature(0.1)
-            .with_max_tokens(50);
-
-        let response = self.llm_provider.chat(request).await?;
-        let category_str = response.content.trim().to_lowercase();
-
-        // Parse the category from the response
-        let category = Self::parse_category(&category_str);
-
-        debug!(
-            raw_response = %category_str,
-            category = %category,
-            "Memory classified"
-        );
-
-        Ok(category)
-    }
-
-    /// Extract tags/keywords from content
-    pub async fn extract_tags(&self, content: &str) -> Result<Vec<String>, ProcessingError> {
-        let prompt = self.tag_extraction_prompt.replace("{content}", content);
-        let request = ChatRequest::new(prompt)
-            .with_temperature(0.3)
-            .with_max_tokens(100);
-
-        let response = self.llm_provider.chat(request).await?;
-        let tags = Self::parse_tags(&response.content);
-
-        debug!(
-            tag_count = tags.len(),
-            tags = ?tags,
-            "Tags extracted"
-        );
-
-        Ok(tags)
-    }
-
-    /// Parse category from LLM response
+    /// Parse category from string
     fn parse_category(response: &str) -> MemoryCategory {
-        // Try to find a known category in the response
         let response_lower = response.to_lowercase();
 
         if response_lower.contains("user_preference") || response_lower.contains("userpreference") {
@@ -265,22 +269,18 @@ impl MemoryProcessor {
         {
             MemoryCategory::FactualKnowledge
         } else {
-            // Default to Other if we can't parse
-            warn!(
-                response = %response,
-                "Could not parse category, defaulting to Other"
-            );
             MemoryCategory::Other
         }
     }
 
-    /// Parse tags from LLM response
+    /// Parse tags from comma-separated string (used in tests)
+    #[cfg(test)]
     fn parse_tags(response: &str) -> Vec<String> {
         response
             .split(',')
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && s.len() <= 50) // Filter out empty and overly long tags
-            .take(10) // Limit to 10 tags
+            .filter(|s| !s.is_empty() && s.len() <= 50)
+            .take(10)
             .collect()
     }
 }
@@ -400,9 +400,54 @@ mod tests {
     }
 
     #[test]
-    fn test_default_prompts_contain_placeholder() {
-        assert!(DEFAULT_COMPRESSION_PROMPT.contains("{content}"));
-        assert!(DEFAULT_CLASSIFICATION_PROMPT.contains("{content}"));
-        assert!(DEFAULT_TAG_EXTRACTION_PROMPT.contains("{content}"));
+    fn test_default_prompt_contains_placeholder() {
+        assert!(DEFAULT_UNIFIED_PROMPT.contains("{content}"));
+    }
+
+    #[test]
+    fn test_extract_json_from_code_block() {
+        let response = r#"```json
+{
+  "compressed": "test content",
+  "category": "user_preference",
+  "tags": ["tag1", "tag2"]
+}
+```"#;
+        let json = MemoryProcessor::extract_json(response);
+        assert!(json.contains("compressed"));
+        assert!(json.contains("user_preference"));
+    }
+
+    #[test]
+    fn test_extract_json_raw() {
+        let response = r#"{"compressed": "test", "category": "other", "tags": []}"#;
+        let json = MemoryProcessor::extract_json(response);
+        assert_eq!(json, response);
+    }
+
+    #[test]
+    fn test_parse_unified_response() {
+        let response = r#"{"compressed": "压缩后的内容", "category": "user_preference", "tags": ["标签1", "标签2"]}"#;
+        let result = MemoryProcessor::parse_unified_response(response).unwrap();
+
+        assert_eq!(result.processed_content, "压缩后的内容");
+        assert_eq!(result.category, MemoryCategory::UserPreference);
+        assert_eq!(result.tags, vec!["标签1", "标签2"]);
+    }
+
+    #[test]
+    fn test_parse_unified_response_with_code_block() {
+        let response = r#"```json
+{
+  "compressed": "测试内容",
+  "category": "behavior_pattern",
+  "tags": ["工作", "习惯"]
+}
+```"#;
+        let result = MemoryProcessor::parse_unified_response(response).unwrap();
+
+        assert_eq!(result.processed_content, "测试内容");
+        assert_eq!(result.category, MemoryCategory::BehaviorPattern);
+        assert_eq!(result.tags, vec!["工作", "习惯"]);
     }
 }
