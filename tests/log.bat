@@ -1,0 +1,1 @@
+set RUST_LOG=memory_server=debug,tower_http=debug

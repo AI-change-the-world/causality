@@ -3,14 +3,14 @@
 
 server:
   host: "0.0.0.0"
-  port: 8080
+  port: 18081
 
 # PostgreSQL - localhost for development
 database:
   url: "postgres://memory:memory@localhost:5432/memory_db"
   max_connections: 10
   min_connections: 2
-  run_migrations: false  # Set to true for fresh database
+  run_migrations: false # Set to true for fresh database
 
 # Qdrant - localhost for development
 qdrant:

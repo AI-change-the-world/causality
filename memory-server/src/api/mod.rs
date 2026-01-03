@@ -14,6 +14,7 @@ pub use admin::admin_routes;
 pub use audit::audit_routes;
 pub use config::config_routes;
 pub use event::event_routes;
+pub use event::event_async_routes;
 pub use health::health_routes;
 pub use memory::memory_routes;
 pub use retrieval::retrieval_routes;
@@ -66,6 +67,7 @@ pub struct AppState {
         memory::get_memory_history,
         memory::promote_memory,
         event::create_event,
+        event::create_event_async,
         event::get_event,
         retrieval::retrieve_memories,
         retrieval::auto_retrieve_memories,
@@ -96,6 +98,7 @@ pub struct AppState {
         // Event processing types
         event::CreateEventApiRequest,
         event::CreateEventApiResponse,
+        event::CreateEventAsyncResponse,
         event::GetEventApiResponse,
         event::RelatedMemoryResponse,
         // Retrieval types
@@ -155,6 +158,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/api/v1/memories", memory_routes())
         .nest("/api/v1/memories", retrieval_routes())
         .nest("/api/v1/events", event_routes())
+        .nest("/api/v1/events-async", event_async_routes())
         .nest("/api/v1/admin", admin_routes())
         .nest("/api/v1/config", config_routes())
         .nest("/api/v1/audit", audit_routes())

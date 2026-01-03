@@ -22,8 +22,8 @@ pub use eviction_manager::{EvictionConfig, EvictionManager, EvictionResult};
 pub use global_promoter::{GlobalPromoter, PromotionCheck, PromotionCriteria};
 pub use lifecycle_manager::LifecycleManager;
 pub use memory_guard::{
-    CreateFromEventRequest, CreateFromEventResult, MemoryGuard, ProcessEventResult,
-    UpdateMemoryRequest,
+    CreateFromEventRequest, CreateFromEventResult, EventProcessingContext, MemoryGuard,
+    ProcessEventResult, UpdateMemoryRequest,
 };
 pub use memory_matcher::{MatchResult, MatcherConfig, MemoryMatcher};
 pub use memory_processor::{

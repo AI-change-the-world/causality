@@ -816,6 +816,55 @@ impl MemoryRepository {
 
         Ok(row.into())
     }
+
+    /// Find all memories for an owner/scope, grouped by embedding_provider
+    ///
+    /// Returns memories that are:
+    /// - Current version
+    /// - Not superseded or archived
+    /// - Matching the owner_id and scope_id (or global if include_global is true)
+    pub async fn find_by_owner_scope_grouped_by_provider(
+        &self,
+        owner_id: &str,
+        scope_id: Option<&str>,
+        include_global: bool,
+    ) -> AppResult<std::collections::HashMap<String, Vec<Memory>>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                SELECT {}
+                FROM memories
+                WHERE owner_id = $1
+                  AND is_current_version = true
+                  AND status NOT IN ('superseded', 'archived')
+                  AND embedding_status = 'completed'
+                  AND embedding_provider IS NOT NULL
+                  AND (
+                    ($2::text IS NULL AND is_global = true)
+                    OR scope_id = $2
+                    OR ($3 = true AND is_global = true)
+                  )
+                ORDER BY embedding_provider, decay_score DESC
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(owner_id)
+        .bind(scope_id)
+        .bind(include_global)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut grouped: std::collections::HashMap<String, Vec<Memory>> =
+            std::collections::HashMap::new();
+
+        for row in rows {
+            let memory: Memory = row.into();
+            if let Some(ref provider) = memory.embedding_provider {
+                grouped.entry(provider.clone()).or_default().push(memory);
+            }
+        }
+
+        Ok(grouped)
+    }
 }
 
 /// Internal row type for sqlx mapping

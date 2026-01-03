@@ -18,9 +18,7 @@ use memory_server::repository::{
     AuditRepository, ConfigRepository, EventRepository, LlmProviderRepository, MemoryRepository,
     QdrantRepository,
 };
-use memory_server::service::{
-    AlwaysConsistentChecker, ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine,
-};
+use memory_server::service::{ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -108,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let llm_repo = LlmProviderRepository::new(pool.clone());
 
     // Create services
-    let memory_guard: MemoryGuard<AlwaysConsistentChecker> = MemoryGuard::new(
+    let memory_guard = MemoryGuard::new_basic(
         memory_repo.clone(),
         event_repo.clone(),
         audit_repo.clone(),
@@ -155,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
                 .allow_headers(Any),
         )
         .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        .layer(TimeoutLayer::new(Duration::from_secs(300)))
         .layer(SetRequestIdLayer::new(
             x_request_id.clone(),
             MakeRequestUuid,
