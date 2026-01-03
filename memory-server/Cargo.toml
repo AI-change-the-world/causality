@@ -7,14 +7,26 @@ authors = ["Memory Server Team"]
 
 [dependencies]
 # Web framework
-axum = { version = "0.7", features = ["macros"] }
-tower-http = { version = "0.5", features = ["cors","trace","request-id","timeout"] }
+axum = { version = "0.8.8", features = ["macros"] }
+tower-http = { version = "0.5", features = [
+    "cors",
+    "trace",
+    "request-id",
+    "timeout",
+] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+] }
 
 # Vector database
 qdrant-client = "1.7"
@@ -53,8 +65,8 @@ anyhow = "1"
 async-trait = "0.1"
 
 # API Documentation
-utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "7", features = ["axum"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 [dev-dependencies]
 proptest = "1"
