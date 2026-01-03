@@ -3,6 +3,12 @@
 //! Implements:
 //! - POST /api/v1/memories/retrieve - Retrieve memories based on query and filters
 //! - POST /api/v1/memories/retrieve/auto - Auto retrieve with query parsing and formatted output
+//!
+//! New architecture:
+//! - Removed scope_type, layer, scene, event_source_prefix filters
+//! - Added category_prefix filter
+//! - Added include_evidence and include_history options
+//! - owner_id is now required
 
 use axum::{extract::State, routing::post, Json, Router};
 use chrono::{DateTime, Utc};
@@ -11,7 +17,7 @@ use utoipa::ToSchema;
 
 use crate::api::memory::GetMemoryResponse;
 use crate::api::AppState;
-use crate::domain::{Layer, MemoryCategory, ScopeType};
+use crate::domain::{Event, Memory};
 use crate::error::AppResult;
 use crate::service::RetrieveRequest;
 
@@ -20,26 +26,20 @@ use crate::service::RetrieveRequest;
 pub struct RetrieveApiRequest {
     /// Query text for semantic search and full-text search
     pub query: String,
-    /// Owner ID - the unique identifier of the memory owner
-    pub owner_id: Option<String>,
-    /// Filter by scope type
-    pub scope_type: Option<ScopeType>,
-    /// Filter by scope ID
+    /// Owner ID - the unique identifier of the memory owner (required)
+    pub owner_id: String,
+    /// Filter by scope ID (when provided, also includes global memories)
     pub scope_id: Option<String>,
-    /// Filter by layers
-    pub layers: Option<Vec<Layer>>,
-    /// Filter by scenes
-    pub scenes: Option<Vec<String>>,
-    /// Filter by memory categories (LLM-classified)
-    pub categories: Option<Vec<MemoryCategory>>,
+    /// Filter by category prefix (e.g., "work.code" matches "work.code.eslint")
+    pub category_prefix: Option<String>,
     /// Filter by tags (extracted keywords)
     pub tags: Option<Vec<String>>,
-    /// Filter by event source prefix
-    pub event_source_prefix: Option<String>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
     /// Minimum score threshold
     pub min_score: Option<f32>,
+    /// Minimum confidence threshold
+    pub min_confidence: Option<f32>,
     /// Whether to use full-text search (default: true)
     pub use_fulltext: Option<bool>,
     /// Whether to use vector search (default: true)
@@ -48,8 +48,13 @@ pub struct RetrieveApiRequest {
     pub fulltext_weight: Option<f32>,
     /// Whether to return highlighted snippets (default: false)
     pub highlight: Option<bool>,
+    /// Whether to include source events (evidence) for each memory
+    #[serde(default)]
+    pub include_evidence: Option<bool>,
+    /// Whether to include version history for each memory
+    #[serde(default)]
+    pub include_history: Option<bool>,
     /// Whether to enhance the query with semantic synonyms (default: false)
-    /// When enabled, the query will be expanded with related terms to improve retrieval results.
     #[serde(default)]
     pub enhance_query: bool,
 }
@@ -59,19 +64,100 @@ impl From<RetrieveApiRequest> for RetrieveRequest {
         RetrieveRequest {
             query: req.query,
             owner_id: req.owner_id,
-            scope_type: req.scope_type,
             scope_id: req.scope_id,
-            layers: req.layers,
-            scenes: req.scenes,
-            categories: req.categories,
+            category_prefix: req.category_prefix,
             tags: req.tags,
-            event_source_prefix: req.event_source_prefix,
             top_k: req.top_k,
             min_score: req.min_score,
+            min_confidence: req.min_confidence,
             use_fulltext: req.use_fulltext,
             use_vector: req.use_vector,
             fulltext_weight: req.fulltext_weight,
             highlight: req.highlight,
+            include_evidence: req.include_evidence,
+            include_history: req.include_history,
+        }
+    }
+}
+
+/// Evidence (source events) for a memory in API response
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EvidenceResponse {
+    /// Events that created or reinforced this memory
+    pub events: Vec<EventResponse>,
+    /// Total count of supporting events
+    pub total_count: usize,
+}
+
+/// Event in API response
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EventResponse {
+    /// Event ID
+    pub id: String,
+    /// Event content
+    pub content: String,
+    /// Event context
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Event summary
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Event source
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Event time
+    pub event_time: DateTime<Utc>,
+}
+
+impl From<Event> for EventResponse {
+    fn from(event: Event) -> Self {
+        EventResponse {
+            id: event.id.to_string(),
+            content: event.content,
+            context: event.context,
+            summary: event.summary,
+            source: event.source,
+            event_time: event.event_time,
+        }
+    }
+}
+
+/// Version history for a memory in API response
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HistoryResponse {
+    /// All versions of this memory (ordered by version_number)
+    pub versions: Vec<VersionResponse>,
+    /// The current (latest) version ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_version_id: Option<String>,
+}
+
+/// A version in the history
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VersionResponse {
+    /// Memory ID
+    pub id: String,
+    /// Version number
+    pub version_number: i32,
+    /// Whether this is the current version
+    pub is_current_version: bool,
+    /// Content of this version
+    pub content: String,
+    /// Status of this version
+    pub status: String,
+    /// Created at
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<Memory> for VersionResponse {
+    fn from(memory: Memory) -> Self {
+        VersionResponse {
+            id: memory.id.to_string(),
+            version_number: memory.version_number,
+            is_current_version: memory.is_current_version,
+            content: memory.content,
+            status: memory.status.to_string(),
+            created_at: memory.created_at,
         }
     }
 }
@@ -91,6 +177,12 @@ pub struct RetrievedMemoryResponse {
     /// Highlighted snippets from the content (if highlighting was requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
+    /// Source events (evidence) for this memory (if include_evidence was true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceResponse>,
+    /// Version history for this memory (if include_history was true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryResponse>,
 }
 
 /// Response for memory retrieval
@@ -112,10 +204,10 @@ pub struct AutoRetrieveApiRequest {
     /// Optional context to help LLM better understand the query
     #[serde(default)]
     pub context: Option<String>,
-    /// Filter by scope type
-    pub scope_type: Option<ScopeType>,
     /// Filter by scope ID
     pub scope_id: Option<String>,
+    /// Filter by category prefix
+    pub category_prefix: Option<String>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
     /// Minimum score threshold
@@ -129,15 +221,13 @@ pub struct AutoRetrieveRecord {
     pub record: usize,
     /// Event time (when the memory was created or event occurred)
     pub time: DateTime<Utc>,
-    /// Event description (from event_source or scene)
-    pub event: String,
+    /// Category of the memory
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// Inferred memory content
     pub infer: String,
     /// Relevance score
     pub score: f32,
-    /// Memory category if available
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<MemoryCategory>,
     /// Tags if available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
@@ -166,12 +256,14 @@ pub fn retrieval_routes() -> Router<AppState> {
 /// POST /api/v1/memories/retrieve - Retrieve memories
 ///
 /// Retrieves memories based on query and filters:
-/// 1. Applies structured filters (scope, scene, layer, event_source_prefix)
-/// 2. Optionally enhances query with semantic synonyms (if enhance_query=true)
-/// 3. Performs vector similarity search
-/// 4. Computes composite scores
-/// 5. Returns top-K results sorted by score
-/// 6. Updates hit counts for returned memories
+/// 1. Applies structured filters (owner_id, scope_id + is_global, category_prefix)
+/// 2. Default: is_current_version = true, status NOT IN ('superseded', 'archived')
+/// 3. Optionally enhances query with semantic synonyms (if enhance_query=true)
+/// 4. Performs vector similarity search
+/// 5. Computes composite scores
+/// 6. Returns top-K results sorted by score
+/// 7. Updates hit counts for returned memories
+/// 8. Optionally loads evidence and history
 #[utoipa::path(
     post,
     path = "/api/v1/memories/retrieve",
@@ -206,12 +298,26 @@ pub async fn retrieve_memories(
     let memories: Vec<RetrievedMemoryResponse> = result
         .memories
         .into_iter()
-        .map(|rm| RetrievedMemoryResponse {
-            memory: rm.memory.into(),
-            score: rm.score,
-            similarity: rm.similarity,
-            text_match_score: rm.text_match_score,
-            highlights: rm.highlights,
+        .map(|rm| {
+            let evidence = rm.evidence.map(|e| EvidenceResponse {
+                events: e.events.into_iter().map(Into::into).collect(),
+                total_count: e.total_count,
+            });
+
+            let history = rm.history.map(|h| HistoryResponse {
+                versions: h.versions.into_iter().map(Into::into).collect(),
+                current_version_id: h.current_version.map(|m| m.id.to_string()),
+            });
+
+            RetrievedMemoryResponse {
+                memory: rm.memory.into(),
+                score: rm.score,
+                similarity: rm.similarity,
+                text_match_score: rm.text_match_score,
+                highlights: rm.highlights,
+                evidence,
+                history,
+            }
         })
         .collect();
 
@@ -247,20 +353,19 @@ pub async fn auto_retrieve_memories(
     // Build retrieve request with query enhancement enabled
     let retrieve_request = RetrieveRequest {
         query: request.query.clone(),
-        owner_id: Some(request.owner_id.clone()),
-        scope_type: request.scope_type,
+        owner_id: request.owner_id.clone(),
         scope_id: request.scope_id,
-        layers: None,
-        scenes: None,
-        categories: None,
+        category_prefix: request.category_prefix,
         tags: None,
-        event_source_prefix: None,
         top_k: request.top_k,
         min_score: request.min_score,
+        min_confidence: None,
         use_fulltext: Some(true),
         use_vector: Some(true),
         fulltext_weight: None,
         highlight: Some(true),
+        include_evidence: None,
+        include_history: None,
     };
 
     // Use retrieve_with_enhancement for better query understanding
@@ -275,20 +380,14 @@ pub async fn auto_retrieve_memories(
         .iter()
         .enumerate()
         .map(|(idx, rm)| {
-            let event = rm
-                .memory
-                .event_source
-                .clone()
-                .unwrap_or_else(|| rm.memory.scene.clone());
-            let time = rm.memory.event_time.unwrap_or(rm.memory.created_at);
+            let time = rm.memory.created_at;
 
             AutoRetrieveRecord {
                 record: idx + 1,
                 time,
-                event,
+                category: rm.memory.category.clone(),
                 infer: rm.memory.content.clone(),
                 score: rm.score,
-                category: rm.memory.category.clone(),
                 tags: rm.memory.tags.clone(),
             }
         })
@@ -327,12 +426,11 @@ fn format_records_as_markdown(records: &[AutoRetrieveRecord]) -> String {
             "time: {}\n",
             record.time.format("%Y-%m-%d %H:%M:%S")
         ));
-        output.push_str(&format!("event: {}\n", record.event));
+        if let Some(category) = &record.category {
+            output.push_str(&format!("category: {}\n", category));
+        }
         output.push_str(&format!("infer: {}\n", record.infer));
         output.push_str(&format!("score: {:.2}\n", record.score));
-        if let Some(category) = &record.category {
-            output.push_str(&format!("category: {:?}\n", category));
-        }
         if let Some(tags) = &record.tags {
             if !tags.is_empty() {
                 output.push_str(&format!("tags: {}\n", tags.join(", ")));
@@ -351,23 +449,19 @@ mod tests {
     fn test_retrieve_request_conversion() {
         let api_request = RetrieveApiRequest {
             query: "test query".to_string(),
-            owner_id: Some("owner123".to_string()),
-            scope_type: Some(ScopeType::User),
-            scope_id: Some("user123".to_string()),
-            layers: Some(vec![Layer::Session, Layer::Task]),
-            scenes: Some(vec!["work.review".to_string()]),
-            categories: Some(vec![
-                MemoryCategory::UserPreference,
-                MemoryCategory::BehaviorPattern,
-            ]),
+            owner_id: "owner123".to_string(),
+            scope_id: Some("scope456".to_string()),
+            category_prefix: Some("work.code".to_string()),
             tags: Some(vec!["important".to_string(), "work".to_string()]),
-            event_source_prefix: Some("button_click".to_string()),
             top_k: Some(20),
             min_score: Some(0.5),
+            min_confidence: Some(0.7),
             use_fulltext: Some(true),
             use_vector: Some(true),
             fulltext_weight: Some(0.2),
             highlight: Some(true),
+            include_evidence: Some(true),
+            include_history: Some(false),
             enhance_query: false,
         };
 
@@ -375,18 +469,15 @@ mod tests {
 
         assert_eq!(retrieve_request.query, api_request.query);
         assert_eq!(retrieve_request.owner_id, api_request.owner_id);
-        assert_eq!(retrieve_request.scope_type, api_request.scope_type);
         assert_eq!(retrieve_request.scope_id, api_request.scope_id);
-        assert_eq!(retrieve_request.layers, api_request.layers);
-        assert_eq!(retrieve_request.scenes, api_request.scenes);
-        assert_eq!(retrieve_request.categories, api_request.categories);
-        assert_eq!(retrieve_request.tags, api_request.tags);
         assert_eq!(
-            retrieve_request.event_source_prefix,
-            api_request.event_source_prefix
+            retrieve_request.category_prefix,
+            api_request.category_prefix
         );
+        assert_eq!(retrieve_request.tags, api_request.tags);
         assert_eq!(retrieve_request.top_k, api_request.top_k);
         assert_eq!(retrieve_request.min_score, api_request.min_score);
+        assert_eq!(retrieve_request.min_confidence, api_request.min_confidence);
         assert_eq!(retrieve_request.use_fulltext, api_request.use_fulltext);
         assert_eq!(retrieve_request.use_vector, api_request.use_vector);
         assert_eq!(
@@ -394,51 +485,59 @@ mod tests {
             api_request.fulltext_weight
         );
         assert_eq!(retrieve_request.highlight, api_request.highlight);
+        assert_eq!(
+            retrieve_request.include_evidence,
+            api_request.include_evidence
+        );
+        assert_eq!(
+            retrieve_request.include_history,
+            api_request.include_history
+        );
     }
 
     #[test]
     fn test_retrieve_request_minimal() {
         let api_request = RetrieveApiRequest {
             query: "simple query".to_string(),
-            owner_id: None,
-            scope_type: None,
+            owner_id: "owner123".to_string(),
             scope_id: None,
-            layers: None,
-            scenes: None,
-            categories: None,
+            category_prefix: None,
             tags: None,
-            event_source_prefix: None,
             top_k: None,
             min_score: None,
+            min_confidence: None,
             use_fulltext: None,
             use_vector: None,
             fulltext_weight: None,
             highlight: None,
+            include_evidence: None,
+            include_history: None,
             enhance_query: false,
         };
 
         let retrieve_request: RetrieveRequest = api_request.into();
 
         assert_eq!(retrieve_request.query, "simple query");
-        assert!(retrieve_request.scope_type.is_none());
+        assert_eq!(retrieve_request.owner_id, "owner123");
         assert!(retrieve_request.scope_id.is_none());
-        assert!(retrieve_request.layers.is_none());
-        assert!(retrieve_request.scenes.is_none());
-        assert!(retrieve_request.categories.is_none());
+        assert!(retrieve_request.category_prefix.is_none());
         assert!(retrieve_request.tags.is_none());
-        assert!(retrieve_request.event_source_prefix.is_none());
         assert!(retrieve_request.top_k.is_none());
         assert!(retrieve_request.min_score.is_none());
+        assert!(retrieve_request.min_confidence.is_none());
         assert!(retrieve_request.use_fulltext.is_none());
         assert!(retrieve_request.use_vector.is_none());
         assert!(retrieve_request.fulltext_weight.is_none());
         assert!(retrieve_request.highlight.is_none());
+        assert!(retrieve_request.include_evidence.is_none());
+        assert!(retrieve_request.include_history.is_none());
     }
 
     #[test]
     fn test_retrieve_request_with_enhance_query() {
         let json = r#"{
             "query": "test query",
+            "owner_id": "owner123",
             "enhance_query": true
         }"#;
 
@@ -449,7 +548,8 @@ mod tests {
     #[test]
     fn test_retrieve_request_enhance_query_default() {
         let json = r#"{
-            "query": "test query"
+            "query": "test query",
+            "owner_id": "owner123"
         }"#;
 
         let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
@@ -461,16 +561,16 @@ mod tests {
         let json = r#"{
             "query": "用户喜欢什么颜色",
             "owner_id": "owner123",
-            "scope_type": "user",
             "scope_id": "user123",
+            "category_prefix": "preference",
             "top_k": 5
         }"#;
 
         let api_request: AutoRetrieveApiRequest = serde_json::from_str(json).unwrap();
         assert_eq!(api_request.query, "用户喜欢什么颜色");
         assert_eq!(api_request.owner_id, "owner123");
-        assert_eq!(api_request.scope_type, Some(ScopeType::User));
         assert_eq!(api_request.scope_id, Some("user123".to_string()));
+        assert_eq!(api_request.category_prefix, Some("preference".to_string()));
         assert_eq!(api_request.top_k, Some(5));
         assert!(api_request.context.is_none());
     }
@@ -485,8 +585,8 @@ mod tests {
         let api_request: AutoRetrieveApiRequest = serde_json::from_str(json).unwrap();
         assert_eq!(api_request.query, "test query");
         assert_eq!(api_request.owner_id, "owner456");
-        assert!(api_request.scope_type.is_none());
         assert!(api_request.scope_id.is_none());
+        assert!(api_request.category_prefix.is_none());
         assert!(api_request.top_k.is_none());
         assert!(api_request.min_score.is_none());
     }
@@ -504,19 +604,17 @@ mod tests {
             AutoRetrieveRecord {
                 record: 1,
                 time: Utc::now(),
-                event: "button_click:like".to_string(),
+                category: Some("preference.ui".to_string()),
                 infer: "用户喜欢深色模式".to_string(),
                 score: 0.95,
-                category: Some(MemoryCategory::UserPreference),
                 tags: Some(vec!["dark_mode".to_string(), "ui".to_string()]),
             },
             AutoRetrieveRecord {
                 record: 2,
                 time: Utc::now(),
-                event: "settings.theme".to_string(),
+                category: None,
                 infer: "用户偏好简洁界面".to_string(),
                 score: 0.82,
-                category: None,
                 tags: None,
             },
         ];
@@ -524,7 +622,7 @@ mod tests {
         let markdown = format_records_as_markdown(&records);
         assert!(markdown.contains("record: 1"));
         assert!(markdown.contains("record: 2"));
-        assert!(markdown.contains("event: button_click:like"));
+        assert!(markdown.contains("category: preference.ui"));
         assert!(markdown.contains("infer: 用户喜欢深色模式"));
         assert!(markdown.contains("score: 0.95"));
         assert!(markdown.contains("tags: dark_mode, ui"));

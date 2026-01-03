@@ -8,15 +8,19 @@
 //! - HTTP server startup
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::header::HeaderName;
 use memory_server::api::{create_router, health::init_start_time, AppState};
 use memory_server::config::AppConfig;
 use memory_server::repository::{
-    AuditRepository, ConfigRepository, LlmProviderRepository, MemoryRepository, QdrantRepository,
+    AuditRepository, ConfigRepository, EventRepository, LlmProviderRepository, MemoryRepository,
+    QdrantRepository,
 };
-use memory_server::service::{ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine};
+use memory_server::service::{
+    AlwaysConsistentChecker, ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine,
+};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -98,19 +102,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Create repositories
     let memory_repo = MemoryRepository::new(pool.clone());
+    let event_repo = EventRepository::new(pool.clone());
     let audit_repo = AuditRepository::new(pool.clone());
     let config_repo = ConfigRepository::new(pool.clone());
     let llm_repo = LlmProviderRepository::new(pool.clone());
 
     // Create services
-    let memory_guard = MemoryGuard::new(
+    let memory_guard: MemoryGuard<AlwaysConsistentChecker> = MemoryGuard::new(
         memory_repo.clone(),
+        event_repo.clone(),
         audit_repo.clone(),
         config.audit.enabled,
     );
 
     let retrieval_engine = RetrievalEngine::new(
         memory_repo.clone(),
+        event_repo.clone(),
         audit_repo.clone(),
         config.retrieval.clone(),
         config.audit.enabled,
@@ -132,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create application state
     let app_state = AppState {
-        memory_guard,
+        memory_guard: Arc::new(memory_guard),
         retrieval_engine,
         config_center,
         lifecycle_manager,

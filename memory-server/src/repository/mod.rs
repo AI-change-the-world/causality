@@ -16,9 +16,7 @@ pub use event_repo::EventRepository;
 pub use llm_provider_repo::{
     LlmPromptConfig, LlmProviderRecord, LlmProviderRepository, UpdateLlmProviderInput,
 };
-pub use memory_repo::{
-    FullTextSearchOptions, FullTextSearchResult, MemoryRepository, UpdateMemoryInput,
-};
+pub use memory_repo::{FullTextSearchOptions, FullTextSearchResult, MemoryRepository};
 pub use qdrant_repo::{
     MultiCollectionSearch, QdrantRepository, VectorFilter, VectorPayload, VectorSearchResult,
 };

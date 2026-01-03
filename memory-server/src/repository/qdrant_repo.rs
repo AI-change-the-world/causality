@@ -22,10 +22,9 @@ const COLLECTION_PREFIX: &str = "memories_";
 
 /// Payload field names
 const FIELD_MEMORY_ID: &str = "memory_id";
-const FIELD_SCOPE_TYPE: &str = "scope_type";
 const FIELD_SCOPE_ID: &str = "scope_id";
-const FIELD_SCENE: &str = "scene";
-const FIELD_LAYER: &str = "layer";
+const FIELD_CATEGORY: &str = "category";
+const FIELD_IS_GLOBAL: &str = "is_global";
 const FIELD_STATUS: &str = "status";
 
 /// Vector search result
@@ -397,10 +396,9 @@ impl QdrantRepository {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorPayload {
     pub memory_id: Uuid,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub scene: String,
-    pub layer: String,
+    pub scope_id: Option<String>,
+    pub category: Option<String>,
+    pub is_global: bool,
     pub status: String,
 }
 
@@ -416,28 +414,26 @@ impl VectorPayload {
                 kind: Some(Kind::StringValue(self.memory_id.to_string())),
             },
         );
+        if let Some(ref scope_id) = self.scope_id {
+            payload.insert(
+                FIELD_SCOPE_ID.to_string(),
+                Value {
+                    kind: Some(Kind::StringValue(scope_id.clone())),
+                },
+            );
+        }
+        if let Some(ref category) = self.category {
+            payload.insert(
+                FIELD_CATEGORY.to_string(),
+                Value {
+                    kind: Some(Kind::StringValue(category.clone())),
+                },
+            );
+        }
         payload.insert(
-            FIELD_SCOPE_TYPE.to_string(),
+            FIELD_IS_GLOBAL.to_string(),
             Value {
-                kind: Some(Kind::StringValue(self.scope_type.clone())),
-            },
-        );
-        payload.insert(
-            FIELD_SCOPE_ID.to_string(),
-            Value {
-                kind: Some(Kind::StringValue(self.scope_id.clone())),
-            },
-        );
-        payload.insert(
-            FIELD_SCENE.to_string(),
-            Value {
-                kind: Some(Kind::StringValue(self.scene.clone())),
-            },
-        );
-        payload.insert(
-            FIELD_LAYER.to_string(),
-            Value {
-                kind: Some(Kind::StringValue(self.layer.clone())),
+                kind: Some(Kind::BoolValue(self.is_global)),
             },
         );
         payload.insert(
@@ -454,10 +450,9 @@ impl VectorPayload {
 /// Filter for vector search
 #[derive(Debug, Clone, Default)]
 pub struct VectorFilter {
-    pub scope_type: Option<String>,
     pub scope_id: Option<String>,
-    pub scene: Option<String>,
-    pub layer: Option<String>,
+    pub category_prefix: Option<String>,
+    pub is_global: Option<bool>,
     pub statuses: Option<Vec<String>>,
 }
 
@@ -466,20 +461,20 @@ impl VectorFilter {
     fn to_qdrant_filter(&self) -> Filter {
         let mut must: Vec<Condition> = Vec::new();
 
-        if let Some(ref scope_type) = self.scope_type {
-            must.push(Condition::matches(FIELD_SCOPE_TYPE, scope_type.clone()));
-        }
-
         if let Some(ref scope_id) = self.scope_id {
             must.push(Condition::matches(FIELD_SCOPE_ID, scope_id.clone()));
         }
 
-        if let Some(ref scene) = self.scene {
-            must.push(Condition::matches(FIELD_SCENE, scene.clone()));
+        if let Some(ref category_prefix) = self.category_prefix {
+            // Use prefix match for category
+            must.push(Condition::matches(
+                FIELD_CATEGORY,
+                format!("{}*", category_prefix),
+            ));
         }
 
-        if let Some(ref layer) = self.layer {
-            must.push(Condition::matches(FIELD_LAYER, layer.clone()));
+        if let Some(is_global) = self.is_global {
+            must.push(Condition::matches(FIELD_IS_GLOBAL, is_global));
         }
 
         // Status filter - should match any of the provided statuses (OR condition)
@@ -532,10 +527,9 @@ mod tests {
     fn test_vector_payload_creation() {
         let payload = VectorPayload {
             memory_id: Uuid::new_v4(),
-            scope_type: "user".to_string(),
-            scope_id: "user123".to_string(),
-            scene: "work.review".to_string(),
-            layer: "session".to_string(),
+            scope_id: Some("scope123".to_string()),
+            category: Some("work.code".to_string()),
+            is_global: false,
             status: "active".to_string(),
         };
 
@@ -553,8 +547,8 @@ mod tests {
     #[test]
     fn test_vector_filter_with_scope() {
         let filter = VectorFilter {
-            scope_type: Some("user".to_string()),
-            scope_id: Some("user123".to_string()),
+            scope_id: Some("scope123".to_string()),
+            category_prefix: Some("work".to_string()),
             ..Default::default()
         };
         let qdrant_filter = filter.to_qdrant_filter();

@@ -31,14 +31,19 @@ llm:
 
 lifecycle:
   cooldown_check_interval_seconds: 3600
-  cooldown_thresholds:
-    session: 86400      # 1 day
-    task: 604800        # 7 days
-    long_term: 2592000  # 30 days
-  default_ttl:
-    session: 3600       # 1 hour
-    task: 604800        # 7 days
-    long_term: null     # no expiry
+  decay_config:
+    base_decay_rate: 0.05
+    hit_count_weight: 0.1
+    recency_weight: 0.3
+    importance_weight: 0.2
+    min_decay_score: 0.01
+  eviction_config:
+    cooldown_threshold_days: 7
+    candidate_threshold_days: 14
+    archive_threshold_days: 30
+    max_memories_per_scope: 1000
+    max_global_memories: 10000
+    batch_size: 100
 
 retrieval:
   default_top_k: 10

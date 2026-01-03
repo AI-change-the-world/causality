@@ -1,33 +1,20 @@
 //! Memory Repository implementation
 //!
 //! Provides CRUD operations for Memory entities with PostgreSQL.
-//! Includes full-text search support using PostgreSQL tsvector/tsquery.
+//! Includes full-text search support and version chain queries.
+//!
+//! In the new architecture:
+//! - Memory content is immutable (conflicts create new versions)
+//! - Version chain uses materialized path for O(1) queries
+//! - LFU eviction replaces TTL-based expiration
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Row};
 use uuid::Uuid;
 
-use crate::domain::{
-    EmbeddingStatus, InferenceType, Layer, Memory, MemoryCategory, ProcessingStatus, ScopeType,
-    Status, UpdateMode,
-};
+use crate::domain::{EmbeddingStatus, InferenceType, Memory, ProcessingStatus, Status};
 use crate::error::{AppError, AppResult};
-
-/// Input for updating a memory
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateMemoryInput {
-    /// Update mode (append, merge, supersede)
-    pub mode: UpdateMode,
-    /// New content (optional)
-    pub content: Option<String>,
-    /// New importance value (optional)
-    pub importance: Option<f32>,
-    /// New confidence value (optional)
-    pub confidence: Option<f32>,
-    /// New TTL in seconds (optional)
-    pub ttl_seconds: Option<i64>,
-}
 
 /// Result of a full-text search query
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +42,16 @@ pub struct MemoryRepository {
     pool: PgPool,
 }
 
+// SQL column list for Memory (used in multiple queries)
+const MEMORY_COLUMNS: &str = r#"
+    id, owner_id, scope_id, content, category, tags, importance, confidence,
+    root_memory_id, version_number, is_current_version, supersedes, superseded_by,
+    is_global, hit_count, last_hit_at, decay_score, source_event_id,
+    status, embedding_status, embedding_provider, processing_status, llm_provider,
+    inference_type, inference_confidence, inference_reasoning,
+    promoted_at, promotion_reason, created_at, updated_at
+"#;
+
 impl MemoryRepository {
     /// Create a new MemoryRepository
     pub fn new(pool: PgPool) -> Self {
@@ -63,51 +60,49 @@ impl MemoryRepository {
 
     /// Create a new memory in the database
     pub async fn create(&self, memory: &Memory) -> AppResult<Memory> {
+        let inference_type_str = memory.inference_type.as_ref().map(|t| t.to_string());
+
         let row = sqlx::query_as::<_, MemoryRow>(
-            r#"
-            INSERT INTO memories (
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
+            &format!(
+                r#"
+                INSERT INTO memories (
+                    id, owner_id, scope_id, content, category, tags, importance, confidence,
+                    root_memory_id, version_number, is_current_version, supersedes, superseded_by,
+                    is_global, hit_count, last_hit_at, decay_score, source_event_id,
+                    status, embedding_status, embedding_provider, processing_status, llm_provider,
+                    inference_type, inference_confidence, inference_reasoning,
+                    promoted_at, promotion_reason, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+                RETURNING {}
+                "#,
+                MEMORY_COLUMNS
+            ),
         )
         .bind(memory.id)
         .bind(&memory.owner_id)
-        .bind(&memory.layer)
-        .bind(&memory.scope_type)
         .bind(&memory.scope_id)
-        .bind(&memory.scene)
-        .bind(&memory.status)
         .bind(&memory.content)
         .bind(&memory.category)
         .bind(&memory.tags)
         .bind(memory.importance)
         .bind(memory.confidence)
+        .bind(memory.root_memory_id)
+        .bind(memory.version_number)
+        .bind(memory.is_current_version)
+        .bind(memory.supersedes)
+        .bind(memory.superseded_by)
+        .bind(memory.is_global)
         .bind(memory.hit_count)
         .bind(memory.last_hit_at)
-        .bind(memory.ttl_seconds)
-        .bind(memory.expires_at)
-        .bind(&memory.event_source)
-        .bind(memory.event_time)
+        .bind(memory.decay_score)
+        .bind(memory.source_event_id)
+        .bind(&memory.status)
         .bind(&memory.embedding_status)
         .bind(&memory.embedding_provider)
         .bind(&memory.processing_status)
         .bind(&memory.llm_provider)
-        .bind(&memory.inference_type)
+        .bind(&inference_type_str)
         .bind(memory.inference_confidence)
         .bind(&memory.inference_reasoning)
         .bind(memory.promoted_at)
@@ -122,20 +117,10 @@ impl MemoryRepository {
 
     /// Get a memory by ID
     pub async fn get_by_id(&self, id: Uuid) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
-            r#"
-            SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            FROM memories
-            WHERE id = $1
-            "#,
-        )
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"SELECT {} FROM memories WHERE id = $1"#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -144,94 +129,45 @@ impl MemoryRepository {
         Ok(row.into())
     }
 
-    /// Update a memory with the specified mode
-    pub async fn update(&self, id: Uuid, input: &UpdateMemoryInput) -> AppResult<Memory> {
-        // First get the existing memory
-        let existing = self.get_by_id(id).await?;
-
-        // Calculate new content based on update mode
-        let new_content = match (&input.content, input.mode) {
-            (Some(new), UpdateMode::Append) => {
-                format!("{}\n\n{}", existing.content, new)
-            }
-            (Some(new), UpdateMode::Merge) => {
-                format!("{}\n\n---\n\n{}", existing.content, new)
-            }
-            (Some(new), UpdateMode::Supersede) => new.clone(),
-            (None, _) => existing.content.clone(),
-        };
-
-        // Calculate new importance and confidence
-        let new_importance = input.importance.unwrap_or(existing.importance);
-        let new_confidence = input.confidence.unwrap_or(existing.confidence);
-
-        // Calculate new TTL and expires_at
-        let (new_ttl, new_expires_at) = if let Some(ttl) = input.ttl_seconds {
-            let expires = Utc::now() + chrono::Duration::seconds(ttl);
-            (Some(ttl), Some(expires))
-        } else {
-            (existing.ttl_seconds, existing.expires_at)
-        };
-
-        // Determine if content changed (need to re-embed)
-        let content_changed = input.content.is_some();
-        let new_embedding_status = if content_changed {
-            EmbeddingStatus::Pending
-        } else {
-            existing.embedding_status
-        };
-
-        let row = sqlx::query_as::<_, MemoryRow>(
+    /// Update mutable metadata fields of a memory
+    pub async fn update_metadata(
+        &self,
+        id: Uuid,
+        confidence: Option<f32>,
+        decay_score: Option<f32>,
+    ) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            UPDATE memories
-            SET content = $2,
-                importance = $3,
-                confidence = $4,
-                ttl_seconds = $5,
-                expires_at = $6,
-                embedding_status = $7,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
-        )
+                UPDATE memories
+                SET confidence = COALESCE($2, confidence),
+                    decay_score = COALESCE($3, decay_score),
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
-        .bind(&new_content)
-        .bind(new_importance)
-        .bind(new_confidence)
-        .bind(new_ttl)
-        .bind(new_expires_at)
-        .bind(&new_embedding_status)
-        .fetch_one(&self.pool)
-        .await?;
+        .bind(confidence)
+        .bind(decay_score)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
 
         Ok(row.into())
     }
 
     /// Delete (archive) a memory by ID
     pub async fn delete(&self, id: Uuid) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            UPDATE memories
-            SET status = 'archived', updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
-        )
+                UPDATE memories
+                SET status = 'archived', updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -242,24 +178,18 @@ impl MemoryRepository {
 
     /// Update hit count and last_hit_at for a memory
     pub async fn record_hit(&self, id: Uuid) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            UPDATE memories
-            SET hit_count = hit_count + 1,
-                last_hit_at = NOW(),
-                status = CASE WHEN status = 'cooldown' THEN 'active'::status ELSE status END,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
-        )
+                UPDATE memories
+                SET hit_count = hit_count + 1,
+                    last_hit_at = NOW(),
+                    status = CASE WHEN status = 'cooldown' THEN 'active'::status ELSE status END,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -270,21 +200,15 @@ impl MemoryRepository {
 
     /// Update the status of a memory
     pub async fn update_status(&self, id: Uuid, status: Status) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            UPDATE memories
-            SET status = $2, updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
-        )
+                UPDATE memories
+                SET status = $2, updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
         .bind(&status)
         .fetch_optional(&self.pool)
@@ -300,21 +224,15 @@ impl MemoryRepository {
         id: Uuid,
         embedding_status: EmbeddingStatus,
     ) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            UPDATE memories
-            SET embedding_status = $2, updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
-        )
+                UPDATE memories
+                SET embedding_status = $2, updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
         .bind(&embedding_status)
         .fetch_optional(&self.pool)
@@ -324,59 +242,75 @@ impl MemoryRepository {
         Ok(row.into())
     }
 
-    /// Find memories that have expired
-    pub async fn find_expired(&self) -> AppResult<Vec<Memory>> {
-        let rows = sqlx::query_as::<_, MemoryRow>(
+    /// Mark a memory as superseded by a new version
+    pub async fn update_superseded(&self, id: Uuid, superseded_by_id: Uuid) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            FROM memories
-            WHERE expires_at IS NOT NULL
-              AND expires_at < NOW()
-              AND status NOT IN ('archived', 'ignored')
-            "#,
-        )
+                UPDATE memories
+                SET superseded_by = $2,
+                    is_current_version = false,
+                    status = 'superseded',
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .bind(superseded_by_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
+    }
+
+    /// Find memories by root_memory_id (version chain query)
+    pub async fn find_by_root_memory_id(&self, root_id: Uuid) -> AppResult<Vec<Memory>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"SELECT {} FROM memories WHERE root_memory_id = $1 ORDER BY version_number ASC"#,
+            MEMORY_COLUMNS
+        ))
+        .bind(root_id)
         .fetch_all(&self.pool)
         .await?;
 
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Find memories that should transition to cooldown
-    pub async fn find_cooldown_candidates(
-        &self,
-        session_threshold_secs: i64,
-        task_threshold_secs: i64,
-        longterm_threshold_secs: i64,
-    ) -> AppResult<Vec<Memory>> {
-        let rows = sqlx::query_as::<_, MemoryRow>(
+    /// Get version history for a memory
+    pub async fn get_version_history(&self, memory_id: Uuid) -> AppResult<Vec<Memory>> {
+        let memory = self.get_by_id(memory_id).await?;
+        let root_id = memory.root_memory_id.unwrap_or(memory.id);
+        self.find_by_root_memory_id(root_id).await
+    }
+
+    /// Find the current version of a memory chain
+    pub async fn find_current_version(&self, root_id: Uuid) -> AppResult<Option<Memory>> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"SELECT {} FROM memories WHERE root_memory_id = $1 AND is_current_version = true"#,
+            MEMORY_COLUMNS
+        ))
+        .bind(root_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// Find memories that should transition to cooldown (LFU eviction)
+    pub async fn find_cooldown_candidates(&self, threshold_days: i64) -> AppResult<Vec<Memory>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            FROM memories
-            WHERE status IN ('active', 'stable', 'candidate')
-              AND (
-                (layer = 'session' AND COALESCE(last_hit_at, created_at) < NOW() - INTERVAL '1 second' * $1)
-                OR (layer = 'task' AND COALESCE(last_hit_at, created_at) < NOW() - INTERVAL '1 second' * $2)
-                OR (layer = 'long_term' AND COALESCE(last_hit_at, created_at) < NOW() - INTERVAL '1 second' * $3)
-              )
-            "#,
-        )
-        .bind(session_threshold_secs as f64)
-        .bind(task_threshold_secs as f64)
-        .bind(longterm_threshold_secs as f64)
+                SELECT {}
+                FROM memories
+                WHERE status = 'active'
+                  AND is_current_version = true
+                  AND COALESCE(last_hit_at, created_at) < NOW() - INTERVAL '1 day' * $1
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(threshold_days as f64)
         .fetch_all(&self.pool)
         .await?;
 
@@ -384,85 +318,42 @@ impl MemoryRepository {
     }
 
     /// Find memories with structured filters for retrieval
-    ///
-    /// Supports filtering by:
-    /// - owner_id (required for proper isolation)
-    /// - scope_type and scope_id
-    /// - layers (multiple)
-    /// - scenes (multiple)
-    /// - event_source prefix
-    /// - categories (multiple, LLM-classified)
-    /// - tags (multiple, extracted keywords)
-    /// - excludes ignored and archived statuses
     pub async fn find_for_retrieval(
         &self,
-        owner_id: Option<&str>,
-        scope_type: Option<&ScopeType>,
+        owner_id: &str,
         scope_id: Option<&str>,
-        layers: Option<&[Layer]>,
-        scenes: Option<&[String]>,
-        event_source_prefix: Option<&str>,
-        categories: Option<&[MemoryCategory]>,
+        category_prefix: Option<&str>,
         tags: Option<&[String]>,
+        include_global: bool,
     ) -> AppResult<Vec<Memory>> {
-        // Build the query dynamically
-        // Note: Using a simpler approach with optional filters
-        let rows = sqlx::query_as::<_, MemoryRow>(
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            FROM memories
-            WHERE status NOT IN ('ignored', 'archived')
-              AND ($1::text IS NULL OR owner_id = $1)
-              AND ($2::scope_type IS NULL OR scope_type = $2)
-              AND ($3::text IS NULL OR scope_id = $3)
-              AND ($4::text IS NULL OR event_source LIKE $4 || '%')
-            ORDER BY updated_at DESC
-            LIMIT 1000
-            "#,
-        )
+                SELECT {}
+                FROM memories
+                WHERE owner_id = $1
+                  AND is_current_version = true
+                  AND status NOT IN ('superseded', 'archived')
+                  AND (
+                    ($2::text IS NULL AND is_global = true)
+                    OR scope_id = $2
+                    OR ($3 = true AND is_global = true)
+                  )
+                  AND ($4::text IS NULL OR category LIKE $4 || '%')
+                ORDER BY decay_score DESC, updated_at DESC
+                LIMIT 1000
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(owner_id)
-        .bind(scope_type)
         .bind(scope_id)
-        .bind(event_source_prefix)
+        .bind(include_global)
+        .bind(category_prefix)
         .fetch_all(&self.pool)
         .await?;
 
         let mut memories: Vec<Memory> = rows.into_iter().map(Into::into).collect();
 
-        // Apply layer filter in memory (sqlx doesn't support array parameters easily)
-        if let Some(layer_filter) = layers {
-            if !layer_filter.is_empty() {
-                memories.retain(|m| layer_filter.contains(&m.layer));
-            }
-        }
-
-        // Apply scene filter in memory
-        if let Some(scene_filter) = scenes {
-            if !scene_filter.is_empty() {
-                memories.retain(|m| scene_filter.contains(&m.scene));
-            }
-        }
-
-        // Apply category filter in memory
-        if let Some(category_filter) = categories {
-            if !category_filter.is_empty() {
-                memories.retain(|m| {
-                    m.category
-                        .as_ref()
-                        .map(|c| category_filter.contains(c))
-                        .unwrap_or(false)
-                });
-            }
-        }
-
-        // Apply tags filter in memory (match if any tag matches)
+        // Apply tags filter in memory
         if let Some(tag_filter) = tags {
             if !tag_filter.is_empty() {
                 memories.retain(|m| {
@@ -483,20 +374,10 @@ impl MemoryRepository {
             return Ok(vec![]);
         }
 
-        let rows = sqlx::query_as::<_, MemoryRow>(
-            r#"
-            SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            FROM memories
-            WHERE id = ANY($1)
-            "#,
-        )
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"SELECT {} FROM memories WHERE id = ANY($1)"#,
+            MEMORY_COLUMNS
+        ))
         .bind(ids)
         .fetch_all(&self.pool)
         .await?;
@@ -504,24 +385,13 @@ impl MemoryRepository {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Perform full-text search on memory content using PostgreSQL tsquery
-    ///
-    /// Supports:
-    /// - Basic word matching
-    /// - Phrase matching (words in sequence)
-    /// - Ranking by relevance using ts_rank
-    /// - Optional highlighting of matched terms
-    ///
-    /// The query is converted to a tsquery using plainto_tsquery for simple queries
-    /// or to_tsquery for advanced queries with operators.
+    /// Perform full-text search on memory content
     pub async fn fulltext_search(
         &self,
         query: &str,
-        scope_type: Option<&ScopeType>,
+        owner_id: &str,
         scope_id: Option<&str>,
-        layers: Option<&[Layer]>,
-        scenes: Option<&[String]>,
-        event_source_prefix: Option<&str>,
+        include_global: bool,
         options: &FullTextSearchOptions,
     ) -> AppResult<Vec<FullTextSearchResult>> {
         if query.trim().is_empty() {
@@ -530,39 +400,40 @@ impl MemoryRepository {
 
         let limit = options.limit.unwrap_or(100).min(1000) as i64;
 
-        // Use plainto_tsquery for simple word-based search
-        // This handles user input safely without requiring special syntax
         let rows = sqlx::query(
             r#"
             SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, last_hit_at, ttl_seconds,
-                expires_at, event_source, event_time, embedding_status,
-                embedding_provider, processing_status, llm_provider,
+                id, owner_id, scope_id, content, category, tags, importance, confidence,
+                root_memory_id, version_number, is_current_version, supersedes, superseded_by,
+                is_global, hit_count, last_hit_at, decay_score, source_event_id,
+                status, embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at,
+                promoted_at, promotion_reason, created_at, updated_at,
                 ts_rank(content_tsv, plainto_tsquery('simple', $1)) as rank,
-                CASE WHEN $6 THEN
+                CASE WHEN $5 THEN
                     ts_headline('simple', content, plainto_tsquery('simple', $1),
                         'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15, MaxFragments=3')
                 ELSE NULL END as headline
             FROM memories
             WHERE content_tsv @@ plainto_tsquery('simple', $1)
-              AND status NOT IN ('ignored', 'archived')
-              AND ($2::scope_type IS NULL OR scope_type = $2)
-              AND ($3::text IS NULL OR scope_id = $3)
-              AND ($4::text IS NULL OR event_source LIKE $4 || '%')
+              AND owner_id = $2
+              AND is_current_version = true
+              AND status NOT IN ('superseded', 'archived')
+              AND (
+                ($3::text IS NULL AND is_global = true)
+                OR scope_id = $3
+                OR ($6 = true AND is_global = true)
+              )
             ORDER BY rank DESC
-            LIMIT $5
+            LIMIT $4
             "#,
         )
         .bind(query)
-        .bind(scope_type)
+        .bind(owner_id)
         .bind(scope_id)
-        .bind(event_source_prefix)
         .bind(limit)
         .bind(options.highlight)
+        .bind(include_global)
         .fetch_all(&self.pool)
         .await?;
 
@@ -572,59 +443,45 @@ impl MemoryRepository {
             let memory = Memory {
                 id: row.get("id"),
                 owner_id: row.get("owner_id"),
-                layer: row.get("layer"),
-                scope_type: row.get("scope_type"),
                 scope_id: row.get("scope_id"),
-                scene: row.get("scene"),
-                status: row.get("status"),
                 content: row.get("content"),
                 category: row.get("category"),
                 tags: row.get("tags"),
                 importance: row.get("importance"),
                 confidence: row.get("confidence"),
+                root_memory_id: row.get("root_memory_id"),
+                version_number: row.get("version_number"),
+                is_current_version: row.get("is_current_version"),
+                supersedes: row.get("supersedes"),
+                superseded_by: row.get("superseded_by"),
+                is_global: row.get("is_global"),
                 hit_count: row.get("hit_count"),
                 last_hit_at: row.get("last_hit_at"),
-                ttl_seconds: row.get("ttl_seconds"),
-                expires_at: row.get("expires_at"),
-                event_source: row.get("event_source"),
-                event_time: row.get("event_time"),
+                decay_score: row.get("decay_score"),
+                source_event_id: row.get("source_event_id"),
+                status: row.get("status"),
                 embedding_status: row.get("embedding_status"),
                 embedding_provider: row.get("embedding_provider"),
                 processing_status: row.get("processing_status"),
                 llm_provider: row.get("llm_provider"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
                 inference_type: row.get("inference_type"),
                 inference_confidence: row.get("inference_confidence"),
                 inference_reasoning: row.get("inference_reasoning"),
-                promoted_at: row.try_get("promoted_at").ok().flatten(),
-                promotion_reason: row.try_get("promotion_reason").ok().flatten(),
+                promoted_at: row.get("promoted_at"),
+                promotion_reason: row.get("promotion_reason"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
             };
 
             let rank: f32 = row.get("rank");
             let headline: Option<String> = row.get("headline");
 
-            // Parse highlights from headline (split by fragment separator)
             let highlights = headline.map(|h| {
                 h.split(" ... ")
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             });
-
-            // Apply layer filter in memory
-            if let Some(layer_filter) = layers {
-                if !layer_filter.is_empty() && !layer_filter.contains(&memory.layer) {
-                    continue;
-                }
-            }
-
-            // Apply scene filter in memory
-            if let Some(scene_filter) = scenes {
-                if !scene_filter.is_empty() && !scene_filter.contains(&memory.scene) {
-                    continue;
-                }
-            }
 
             results.push(FullTextSearchResult {
                 memory,
@@ -637,9 +494,6 @@ impl MemoryRepository {
     }
 
     /// Get full-text search score for a specific memory and query
-    ///
-    /// Returns the ts_rank score for the given memory ID and query.
-    /// Returns 0.0 if the memory doesn't match the query.
     pub async fn get_fulltext_score(&self, memory_id: Uuid, query: &str) -> AppResult<f32> {
         if query.trim().is_empty() {
             return Ok(0.0);
@@ -661,8 +515,6 @@ impl MemoryRepository {
     }
 
     /// Get full-text search scores for multiple memories
-    ///
-    /// Returns a map of memory_id -> ts_rank score for the given query.
     pub async fn get_fulltext_scores(
         &self,
         memory_ids: &[Uuid],
@@ -696,8 +548,6 @@ impl MemoryRepository {
     }
 
     /// Get highlighted snippets for a memory matching a query
-    ///
-    /// Returns highlighted text snippets showing where the query matches.
     pub async fn get_highlights(
         &self,
         memory_id: Uuid,
@@ -729,41 +579,21 @@ impl MemoryRepository {
         }))
     }
 
-    /// Promote a memory to long-term layer
-    pub async fn promote_to_long_term(&self, id: Uuid, reason: &str) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
+    /// Promote a memory to global status
+    pub async fn promote_to_global(&self, id: Uuid, reason: &str) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            UPDATE memories
-            SET layer = 'long_term',
-                promoted_at = NOW(),
-                promotion_reason = $2,
-                ttl_seconds = NULL,
-                expires_at = NULL,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-    /// Promote a memory to long-term layer
-    pub async fn promote_to_long_term(&self, id: Uuid, reason: &str) -> AppResult<Memory> {
-        let row = sqlx::query_as::<_, MemoryRow>(
-            r#"
-            UPDATE memories
-            SET layer = 'long_term',
-                promoted_at = NOW(),
-                promotion_reason = $2,
-                ttl_seconds = NULL,
-                expires_at = NULL,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
-                inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at
-            "#,
-        )
+                UPDATE memories
+                SET is_global = true,
+                    scope_id = NULL,
+                    promoted_at = NOW(),
+                    promotion_reason = $2,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
         .bind(id)
         .bind(reason)
         .fetch_optional(&self.pool)
@@ -773,41 +603,43 @@ impl MemoryRepository {
         Ok(row.into())
     }
 
-    /// Find memories eligible for promotion to long-term
-    /// Note: evidence_count is computed from event_memory_relations table
-    pub async fn find_promotion_candidates(
+    /// Find memories eligible for promotion to global
+    pub async fn find_global_promotion_candidates(
         &self,
-        min_evidence_count: i32,
+        min_scope_diversity: i32,
+        min_reinforcements: i32,
         min_confidence: f32,
         min_age_hours: i64,
     ) -> AppResult<Vec<Memory>> {
-        let rows = sqlx::query_as::<_, MemoryRow>(
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
-            SELECT
-                m.id, m.owner_id, m.layer, m.scope_type, m.scope_id, m.scene, m.status, m.content,
-                m.category, m.tags, m.importance, m.confidence, m.hit_count, 
-                m.last_hit_at, m.ttl_seconds, m.expires_at, m.event_source, m.event_time, 
-                m.embedding_status, m.embedding_provider, m.processing_status, m.llm_provider,
-                m.inference_type, m.inference_confidence, m.inference_reasoning,
-                m.promoted_at, m.promotion_reason,
-                m.created_at, m.updated_at
-            FROM memories m
-            LEFT JOIN (
-                SELECT memory_id, COUNT(*) as evidence_count
-                FROM event_memory_relations
-                WHERE relation_type IN ('created_from', 'reinforced_by')
-                GROUP BY memory_id
-            ) r ON m.id = r.memory_id
-            WHERE m.layer != 'long_term'
-              AND m.promoted_at IS NULL
-              AND m.status NOT IN ('ignored', 'archived')
-              AND COALESCE(r.evidence_count, 0) >= $1
-              AND m.confidence >= $2
-              AND m.created_at < NOW() - INTERVAL '1 hour' * $3
-            ORDER BY COALESCE(r.evidence_count, 0) DESC, m.confidence DESC
-            "#,
-        )
-        .bind(min_evidence_count as i64)
+                SELECT {}
+                FROM memories m
+                WHERE m.is_global = false
+                  AND m.is_current_version = true
+                  AND m.promoted_at IS NULL
+                  AND m.status = 'active'
+                  AND m.confidence >= $3
+                  AND m.created_at < NOW() - INTERVAL '1 hour' * $4
+                  AND (
+                    SELECT COUNT(DISTINCT e.scope_id)
+                    FROM event_memory_relations emr
+                    JOIN events e ON emr.event_id = e.id
+                    WHERE emr.memory_id = m.id
+                      AND emr.relation_type = 'reinforced_by'
+                  ) >= $1
+                  AND (
+                    SELECT COUNT(*)
+                    FROM event_memory_relations emr
+                    WHERE emr.memory_id = m.id
+                      AND emr.relation_type = 'reinforced_by'
+                  ) >= $2
+                ORDER BY m.confidence DESC, m.hit_count DESC
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(min_scope_diversity as i64)
+        .bind(min_reinforcements as i64)
         .bind(min_confidence)
         .bind(min_age_hours as f64)
         .fetch_all(&self.pool)
@@ -817,12 +649,12 @@ impl MemoryRepository {
     }
 
     /// Find similar memories by content for deduplication/reinforcement
-    /// Uses full-text search to find potentially matching memories
     pub async fn find_similar_by_content(
         &self,
         owner_id: &str,
+        scope_id: Option<&str>,
         content: &str,
-        scope_type: &ScopeType,
+        include_global: bool,
         limit: i64,
     ) -> AppResult<Vec<(Memory, f32)>> {
         if content.trim().is_empty() {
@@ -832,26 +664,31 @@ impl MemoryRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                category, tags, importance, confidence, hit_count, 
-                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
-                embedding_status, embedding_provider, processing_status, llm_provider,
+                id, owner_id, scope_id, content, category, tags, importance, confidence,
+                root_memory_id, version_number, is_current_version, supersedes, superseded_by,
+                is_global, hit_count, last_hit_at, decay_score, source_event_id,
+                status, embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
-                promoted_at, promotion_reason,
-                created_at, updated_at,
+                promoted_at, promotion_reason, created_at, updated_at,
                 ts_rank(content_tsv, plainto_tsquery('simple', $2)) as rank
             FROM memories
             WHERE owner_id = $1
-              AND scope_type = $3
-              AND status NOT IN ('ignored', 'archived')
+              AND is_current_version = true
+              AND status NOT IN ('superseded', 'archived')
               AND content_tsv @@ plainto_tsquery('simple', $2)
+              AND (
+                ($3::text IS NULL AND is_global = true)
+                OR scope_id = $3
+                OR ($4 = true AND is_global = true)
+              )
             ORDER BY rank DESC
-            LIMIT $4
+            LIMIT $5
             "#,
         )
         .bind(owner_id)
         .bind(content)
-        .bind(scope_type)
+        .bind(scope_id)
+        .bind(include_global)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -861,39 +698,123 @@ impl MemoryRepository {
             let memory = Memory {
                 id: row.get("id"),
                 owner_id: row.get("owner_id"),
-                layer: row.get("layer"),
-                scope_type: row.get("scope_type"),
                 scope_id: row.get("scope_id"),
-                scene: row.get("scene"),
-                status: row.get("status"),
                 content: row.get("content"),
                 category: row.get("category"),
                 tags: row.get("tags"),
                 importance: row.get("importance"),
                 confidence: row.get("confidence"),
+                root_memory_id: row.get("root_memory_id"),
+                version_number: row.get("version_number"),
+                is_current_version: row.get("is_current_version"),
+                supersedes: row.get("supersedes"),
+                superseded_by: row.get("superseded_by"),
+                is_global: row.get("is_global"),
                 hit_count: row.get("hit_count"),
                 last_hit_at: row.get("last_hit_at"),
-                ttl_seconds: row.get("ttl_seconds"),
-                expires_at: row.get("expires_at"),
-                event_source: row.get("event_source"),
-                event_time: row.get("event_time"),
+                decay_score: row.get("decay_score"),
+                source_event_id: row.get("source_event_id"),
+                status: row.get("status"),
                 embedding_status: row.get("embedding_status"),
                 embedding_provider: row.get("embedding_provider"),
                 processing_status: row.get("processing_status"),
                 llm_provider: row.get("llm_provider"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
                 inference_type: row.get("inference_type"),
                 inference_confidence: row.get("inference_confidence"),
                 inference_reasoning: row.get("inference_reasoning"),
                 promoted_at: row.get("promoted_at"),
                 promotion_reason: row.get("promotion_reason"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
             };
             let rank: f32 = row.get("rank");
             results.push((memory, rank));
         }
 
         Ok(results)
+    }
+
+    /// Update decay scores for memories belonging to an owner
+    pub async fn update_decay_scores(
+        &self,
+        owner_id: &str,
+        decay_half_life_days: f32,
+        hit_boost_factor: f32,
+        global_boost: f32,
+    ) -> AppResult<usize> {
+        let result = sqlx::query(
+            r#"
+            UPDATE memories
+            SET decay_score = (1.0 + ln(hit_count + 1) * $2)
+                            * exp(-EXTRACT(EPOCH FROM (NOW() - COALESCE(last_hit_at, created_at))) / 86400.0 / $3)
+                            * CASE WHEN is_global THEN $4 ELSE 1.0 END,
+                updated_at = NOW()
+            WHERE owner_id = $1
+              AND is_current_version = true
+              AND status NOT IN ('superseded', 'archived')
+            "#,
+        )
+        .bind(owner_id)
+        .bind(hit_boost_factor)
+        .bind(decay_half_life_days)
+        .bind(global_boost)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Find memories with low decay scores (eviction candidates)
+    pub async fn find_eviction_candidates(
+        &self,
+        owner_id: &str,
+        decay_threshold: f32,
+        limit: i64,
+    ) -> AppResult<Vec<Memory>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                SELECT {}
+                FROM memories
+                WHERE owner_id = $1
+                  AND is_current_version = true
+                  AND status IN ('active', 'cooldown', 'candidate')
+                  AND decay_score < $2
+                ORDER BY decay_score ASC
+                LIMIT $3
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(owner_id)
+        .bind(decay_threshold)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Reinforce a memory (increase confidence and hit count)
+    pub async fn reinforce(&self, id: Uuid, confidence_delta: f32) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                UPDATE memories
+                SET confidence = LEAST(confidence + $2, 1.0),
+                    hit_count = hit_count + 1,
+                    last_hit_at = NOW(),
+                    status = CASE WHEN status = 'cooldown' THEN 'active'::status ELSE status END,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .bind(confidence_delta)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
     }
 }
 
@@ -902,33 +823,42 @@ impl MemoryRepository {
 struct MemoryRow {
     id: Uuid,
     owner_id: String,
-    layer: Layer,
-    scope_type: ScopeType,
-    scope_id: String,
-    scene: String,
-    status: Status,
+    scope_id: Option<String>,
     content: String,
-    category: Option<MemoryCategory>,
+    category: Option<String>,
     tags: Option<Vec<String>>,
     importance: f32,
     confidence: f32,
+    // Version chain
+    root_memory_id: Option<Uuid>,
+    version_number: i32,
+    is_current_version: bool,
+    supersedes: Option<Uuid>,
+    superseded_by: Option<Uuid>,
+    // Lifecycle
+    is_global: bool,
     hit_count: i64,
     last_hit_at: Option<DateTime<Utc>>,
-    ttl_seconds: Option<i64>,
-    expires_at: Option<DateTime<Utc>>,
-    event_source: Option<String>,
-    event_time: Option<DateTime<Utc>>,
+    decay_score: f32,
+    // Source
+    source_event_id: Option<Uuid>,
+    // Status
+    status: Status,
+    // Processing
     embedding_status: EmbeddingStatus,
     embedding_provider: Option<String>,
     processing_status: ProcessingStatus,
     llm_provider: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    // Inference
     inference_type: Option<InferenceType>,
     inference_confidence: Option<f32>,
     inference_reasoning: Option<String>,
+    // Promotion
     promoted_at: Option<DateTime<Utc>>,
     promotion_reason: Option<String>,
+    // Timestamps
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 impl From<MemoryRow> for Memory {
@@ -936,33 +866,34 @@ impl From<MemoryRow> for Memory {
         Memory {
             id: row.id,
             owner_id: row.owner_id,
-            layer: row.layer,
-            scope_type: row.scope_type,
             scope_id: row.scope_id,
-            scene: row.scene,
-            status: row.status,
             content: row.content,
             category: row.category,
             tags: row.tags,
             importance: row.importance,
             confidence: row.confidence,
+            root_memory_id: row.root_memory_id,
+            version_number: row.version_number,
+            is_current_version: row.is_current_version,
+            supersedes: row.supersedes,
+            superseded_by: row.superseded_by,
+            is_global: row.is_global,
             hit_count: row.hit_count,
             last_hit_at: row.last_hit_at,
-            ttl_seconds: row.ttl_seconds,
-            expires_at: row.expires_at,
-            event_source: row.event_source,
-            event_time: row.event_time,
+            decay_score: row.decay_score,
+            source_event_id: row.source_event_id,
+            status: row.status,
             embedding_status: row.embedding_status,
             embedding_provider: row.embedding_provider,
             processing_status: row.processing_status,
             llm_provider: row.llm_provider,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
             inference_type: row.inference_type,
             inference_confidence: row.inference_confidence,
             inference_reasoning: row.inference_reasoning,
             promoted_at: row.promoted_at,
             promotion_reason: row.promotion_reason,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
         }
     }
 }

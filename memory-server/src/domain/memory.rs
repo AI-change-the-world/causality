@@ -1,55 +1,74 @@
 //! Memory entity and validation logic
 //!
 //! The Memory struct represents a structured context/conclusion/rule stored in the system.
+//! In the new architecture:
+//! - Memory content is immutable after creation
+//! - Conflicts create new versions (version chain)
+//! - LFU eviction replaces TTL-based expiration
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{
-    EmbeddingStatus, InferenceType, Layer, MemoryCategory, ProcessingStatus, ScopeType, Status,
-};
+use super::{EmbeddingStatus, InferenceType, ProcessingStatus, Status};
 use crate::error::AppError;
 
 /// Memory entity representing a structured context/conclusion/rule
+///
+/// Content is immutable after creation. When content conflicts occur,
+/// a new version is created with supersedes/superseded_by links.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     /// Unique identifier
     pub id: Uuid,
-    /// Owner ID - the unique identifier of the memory owner
+    /// Owner ID - user-defined, not validated semantically
     pub owner_id: String,
-    /// Memory layer (session, task, long_term)
-    pub layer: Layer,
-    /// Scope type (user, org, project, task, session)
-    pub scope_type: ScopeType,
-    /// Scope identifier
-    pub scope_id: String,
-    /// Usage scene (e.g., "work.contract_review")
-    pub scene: String,
-    /// Memory lifecycle status
-    pub status: Status,
-    /// Memory content (processed content if LLM processing was enabled)
+    /// Scope identifier - user-defined, null = global memory
+    pub scope_id: Option<String>,
+
+    // === Content fields (immutable after creation) ===
+    /// Memory content
     pub content: String,
-    /// Memory category (auto-classified by LLM if processing was enabled)
-    pub category: Option<MemoryCategory>,
+    /// Hierarchical category (e.g., "work.code.eslint")
+    pub category: Option<String>,
     /// Tags/keywords extracted from content
     pub tags: Option<Vec<String>>,
     /// Importance score (0.0 - 1.0)
     pub importance: f32,
     /// Confidence score (0.0 - 1.0)
     pub confidence: f32,
+
+    // === Version chain (materialized path for O(1) queries) ===
+    /// Root of the version chain (null or self.id for first version)
+    pub root_memory_id: Option<Uuid>,
+    /// Version number in the chain (starts at 1)
+    pub version_number: i32,
+    /// Whether this is the current (latest) version
+    pub is_current_version: bool,
+    /// ID of the memory this one supersedes (previous version)
+    pub supersedes: Option<Uuid>,
+    /// ID of the memory that superseded this one (next version)
+    pub superseded_by: Option<Uuid>,
+
+    // === Lifecycle management (LFU eviction) ===
+    /// Whether this is a global (cross-scope) memory
+    pub is_global: bool,
     /// Number of times this memory was retrieved
     pub hit_count: i64,
     /// Last time this memory was retrieved
     pub last_hit_at: Option<DateTime<Utc>>,
-    /// Time-to-live in seconds
-    pub ttl_seconds: Option<i64>,
-    /// Expiration timestamp
-    pub expires_at: Option<DateTime<Utc>>,
-    /// Event source that triggered memory creation (e.g., "button_click:like")
-    pub event_source: Option<String>,
-    /// Timestamp when the triggering event occurred
-    pub event_time: Option<DateTime<Utc>>,
+    /// Decay score for LFU eviction (higher = more valuable)
+    pub decay_score: f32,
+
+    // === Source tracking ===
+    /// Source event that created this memory
+    pub source_event_id: Option<Uuid>,
+
+    // === Status ===
+    /// Memory lifecycle status
+    pub status: Status,
+
+    // === Processing status ===
     /// Embedding generation status
     pub embedding_status: EmbeddingStatus,
     /// Embedding provider used
@@ -58,90 +77,77 @@ pub struct Memory {
     pub processing_status: ProcessingStatus,
     /// LLM provider used for processing
     pub llm_provider: Option<String>,
+
+    // === Inference fields (for memories extracted from events) ===
+    /// Inference type (fact, preference, pattern, rule)
+    pub inference_type: Option<InferenceType>,
+    /// Inference confidence score (0.0 - 1.0)
+    pub inference_confidence: Option<f32>,
+    /// Reasoning for the inference
+    pub inference_reasoning: Option<String>,
+
+    // === Promotion tracking ===
+    /// When the memory was promoted to global
+    pub promoted_at: Option<DateTime<Utc>>,
+    /// Reason for promotion
+    pub promotion_reason: Option<String>,
+
+    // === Timestamps ===
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
-    /// Last update timestamp
+    /// Last update timestamp (for mutable metadata only)
     pub updated_at: DateTime<Utc>,
-    /// Inference type (if memory was extracted from an event)
-    pub inference_type: Option<InferenceType>,
-    /// Inference confidence score (0.0 - 1.0, if memory was extracted from an event)
-    pub inference_confidence: Option<f32>,
-    /// Reasoning for the inference (if memory was extracted from an event)
-    pub inference_reasoning: Option<String>,
-    /// When the memory was promoted to long-term
-    pub promoted_at: Option<DateTime<Utc>>,
-    /// Reason for promotion to long-term
-    pub promotion_reason: Option<String>,
 }
 
-/// Input for creating a new memory
+/// Input for creating a new memory directly (not from event)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMemoryInput {
-    /// Owner ID - the unique identifier of the memory owner
+    /// Owner ID - user-defined, not validated semantically
     pub owner_id: String,
-    /// Memory layer (session or task only - long_term is rejected)
-    pub layer: Layer,
-    /// Scope type
-    pub scope_type: ScopeType,
-    /// Scope identifier
-    pub scope_id: String,
-    /// Usage scene
-    pub scene: String,
+    /// Scope identifier - user-defined, null = global memory
+    pub scope_id: Option<String>,
     /// Memory content
     pub content: String,
+    /// Hierarchical category (e.g., "work.code.eslint")
+    pub category: Option<String>,
+    /// Tags/keywords
+    pub tags: Option<Vec<String>>,
     /// Importance score (0.0 - 1.0), defaults to 0.5
     pub importance: Option<f32>,
     /// Confidence score (0.0 - 1.0), defaults to 1.0
     pub confidence: Option<f32>,
-    /// Time-to-live in seconds
-    pub ttl_seconds: Option<i64>,
-    /// Event source that triggered memory creation
-    pub event_source: Option<String>,
-    /// Timestamp when the triggering event occurred
-    pub event_time: Option<DateTime<Utc>>,
+    /// Whether this is a global memory
+    #[serde(default)]
+    pub is_global: bool,
     /// Embedding provider to use (uses default if not specified)
     pub embedding_provider: Option<String>,
-    /// Whether to process content with LLM (compression, classification, tag extraction)
+    /// Whether to process content with LLM
     #[serde(default)]
     pub process_with_llm: bool,
-    /// LLM provider to use for processing (uses default if not specified)
+    /// LLM provider to use for processing
     pub llm_provider: Option<String>,
 }
 
 /// Input for creating a memory from an event extraction
-///
-/// This struct contains all fields needed to create a memory from an event
-/// that has been processed by the LLM. It includes inference-related fields
-/// that track the origin and confidence of the extracted memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMemoryFromEventInput {
-    /// Owner ID - the unique identifier of the memory owner
+    /// Owner ID
     pub owner_id: String,
-    /// Memory layer (session or task only - long_term is rejected)
-    pub layer: Layer,
-    /// Scope type
-    pub scope_type: ScopeType,
-    /// Scope identifier
-    pub scope_id: String,
-    /// Usage scene
-    pub scene: String,
+    /// Scope identifier (from the source event)
+    pub scope_id: Option<String>,
     /// Memory content (extracted by LLM)
     pub content: String,
-    /// Memory category (auto-classified by LLM)
-    pub category: Option<MemoryCategory>,
+    /// Hierarchical category
+    pub category: Option<String>,
     /// Tags/keywords extracted from content
     pub tags: Option<Vec<String>>,
-    /// Importance score (0.0 - 1.0), auto-evaluated by LLM
+    /// Importance score (0.0 - 1.0)
     pub importance: f32,
-    /// Confidence score (0.0 - 1.0), auto-evaluated by LLM
+    /// Confidence score (0.0 - 1.0)
     pub confidence: f32,
-    /// Time-to-live in seconds
-    pub ttl_seconds: Option<i64>,
-    /// Event source that triggered memory creation
-    pub event_source: Option<String>,
-    /// Timestamp when the triggering event occurred
-    pub event_time: Option<DateTime<Utc>>,
-    /// Embedding provider to use (uses default if not specified)
+    /// Source event ID
+    pub source_event_id: Uuid,
+    /// Embedding provider to use
     pub embedding_provider: Option<String>,
     /// LLM provider used for extraction
     pub llm_provider: Option<String>,
@@ -150,6 +156,45 @@ pub struct CreateMemoryFromEventInput {
     /// Inference confidence score (0.0 - 1.0)
     pub inference_confidence: f32,
     /// Reasoning for the inference
+    pub inference_reasoning: String,
+}
+
+/// Input for creating a superseding memory (new version)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSupersedingMemoryInput {
+    /// The memory being superseded
+    pub old_memory_id: Uuid,
+    /// Root memory ID of the version chain
+    pub root_memory_id: Uuid,
+    /// New version number
+    pub version_number: i32,
+    /// Owner ID (inherited from old memory)
+    pub owner_id: String,
+    /// Scope ID (inherited from old memory)
+    pub scope_id: Option<String>,
+    /// New content
+    pub content: String,
+    /// Category
+    pub category: Option<String>,
+    /// Tags
+    pub tags: Option<Vec<String>>,
+    /// Importance
+    pub importance: f32,
+    /// Confidence
+    pub confidence: f32,
+    /// Whether this is a global memory (inherited)
+    pub is_global: bool,
+    /// Source event ID
+    pub source_event_id: Uuid,
+    /// Embedding provider
+    pub embedding_provider: Option<String>,
+    /// LLM provider
+    pub llm_provider: Option<String>,
+    /// Inference type
+    pub inference_type: InferenceType,
+    /// Inference confidence
+    pub inference_confidence: f32,
+    /// Inference reasoning
     pub inference_reasoning: String,
 }
 
@@ -163,32 +208,14 @@ impl CreateMemoryValidation {
     /// Returns Ok(()) if valid, or an AppError if validation fails.
     ///
     /// Validation rules:
-    /// - Layer cannot be LongTerm (requires manual confirmation)
     /// - owner_id cannot be empty
-    /// - scope_id cannot be empty
-    /// - scene cannot be empty
     /// - content cannot be empty
     /// - importance must be between 0.0 and 1.0
     /// - confidence must be between 0.0 and 1.0
     pub fn validate(input: &CreateMemoryInput) -> Result<(), AppError> {
-        // Rule: Long-term memories cannot be created directly
-        if !input.layer.allows_direct_creation() {
-            return Err(AppError::InvalidLayer);
-        }
-
         // Validate owner_id is not empty
         if input.owner_id.trim().is_empty() {
             return Err(AppError::Validation("owner_id cannot be empty".to_string()));
-        }
-
-        // Validate scope_id is not empty
-        if input.scope_id.trim().is_empty() {
-            return Err(AppError::Validation("scope_id cannot be empty".to_string()));
-        }
-
-        // Validate scene is not empty
-        if input.scene.trim().is_empty() {
-            return Err(AppError::Validation("scene cannot be empty".to_string()));
         }
 
         // Validate content is not empty
@@ -214,30 +241,17 @@ impl CreateMemoryValidation {
             }
         }
 
-        // Validate TTL is positive if provided
-        if let Some(ttl) = input.ttl_seconds {
-            if ttl <= 0 {
-                return Err(AppError::Validation(
-                    "ttl_seconds must be positive".to_string(),
-                ));
-            }
-        }
-
         Ok(())
     }
 }
 
 impl Memory {
-    /// Create a new Memory from validated input
+    /// Create a new Memory from validated input (first version)
     ///
     /// This should only be called after validation passes.
-    /// Note: LLM processing should be done separately after creation.
     pub fn new(input: CreateMemoryInput) -> Self {
         let now = Utc::now();
-        let ttl_seconds = input
-            .ttl_seconds
-            .or_else(|| input.layer.default_ttl_seconds());
-        let expires_at = ttl_seconds.map(|ttl| now + chrono::Duration::seconds(ttl));
+        let id = Uuid::new_v4();
 
         // Determine initial processing status based on process_with_llm flag
         let processing_status = if input.process_with_llm {
@@ -247,124 +261,153 @@ impl Memory {
         };
 
         Memory {
-            id: Uuid::new_v4(),
+            id,
             owner_id: input.owner_id,
-            layer: input.layer,
-            scope_type: input.scope_type,
             scope_id: input.scope_id,
-            scene: input.scene,
-            status: Status::Active,
             content: input.content,
-            category: None,
-            tags: None,
+            category: input.category,
+            tags: input.tags,
             importance: input.importance.unwrap_or(0.5),
             confidence: input.confidence.unwrap_or(1.0),
+            // Version chain - first version
+            root_memory_id: Some(id), // Points to self for first version
+            version_number: 1,
+            is_current_version: true,
+            supersedes: None,
+            superseded_by: None,
+            // Lifecycle
+            is_global: input.is_global,
             hit_count: 0,
             last_hit_at: None,
-            ttl_seconds,
-            expires_at,
-            event_source: input.event_source,
-            event_time: input.event_time,
+            decay_score: 1.0,
+            // Source
+            source_event_id: None,
+            // Status
+            status: Status::Active,
+            // Processing
             embedding_status: EmbeddingStatus::Pending,
             embedding_provider: input.embedding_provider,
             processing_status,
             llm_provider: input.llm_provider,
-            created_at: now,
-            updated_at: now,
+            // Inference (not applicable for direct creation)
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            // Promotion
             promoted_at: None,
             promotion_reason: None,
+            // Timestamps
+            created_at: now,
+            updated_at: now,
         }
     }
 
-    /// Create a new Memory from an event extraction
+    /// Create a new Memory from an event extraction (first version)
     ///
     /// This creates a memory with all inference-related fields populated,
     /// indicating that this memory was extracted from an event by LLM processing.
     pub fn new_from_event(input: CreateMemoryFromEventInput) -> Self {
         let now = Utc::now();
-        let ttl_seconds = input
-            .ttl_seconds
-            .or_else(|| input.layer.default_ttl_seconds());
-        let expires_at = ttl_seconds.map(|ttl| now + chrono::Duration::seconds(ttl));
+        let id = Uuid::new_v4();
 
         Memory {
-            id: Uuid::new_v4(),
+            id,
             owner_id: input.owner_id,
-            layer: input.layer,
-            scope_type: input.scope_type,
             scope_id: input.scope_id,
-            scene: input.scene,
-            status: Status::Active,
             content: input.content,
             category: input.category,
             tags: input.tags,
             importance: input.importance,
             confidence: input.confidence,
+            // Version chain - first version
+            root_memory_id: Some(id),
+            version_number: 1,
+            is_current_version: true,
+            supersedes: None,
+            superseded_by: None,
+            // Lifecycle
+            is_global: false, // Can be promoted later
             hit_count: 0,
             last_hit_at: None,
-            ttl_seconds,
-            expires_at,
-            event_source: input.event_source,
-            event_time: input.event_time,
+            decay_score: 1.0,
+            // Source
+            source_event_id: Some(input.source_event_id),
+            // Status
+            status: Status::Active,
+            // Processing - already processed by LLM
             embedding_status: EmbeddingStatus::Pending,
             embedding_provider: input.embedding_provider,
-            processing_status: ProcessingStatus::Completed, // Already processed by LLM
+            processing_status: ProcessingStatus::Completed,
             llm_provider: input.llm_provider,
-            created_at: now,
-            updated_at: now,
+            // Inference
             inference_type: Some(input.inference_type),
             inference_confidence: Some(input.inference_confidence),
             inference_reasoning: Some(input.inference_reasoning),
+            // Promotion
             promoted_at: None,
             promotion_reason: None,
+            // Timestamps
+            created_at: now,
+            updated_at: now,
         }
     }
 
-    /// Apply LLM processing result to this memory
-    pub fn apply_processing_result(
-        &mut self,
-        processed_content: String,
-        category: MemoryCategory,
-        tags: Vec<String>,
-    ) {
-        self.content = processed_content;
-        self.category = Some(category);
-        self.tags = Some(tags);
-        self.processing_status = ProcessingStatus::Completed;
+    /// Create a new superseding Memory (new version in chain)
+    pub fn new_superseding(input: CreateSupersedingMemoryInput) -> Self {
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+
+        Memory {
+            id,
+            owner_id: input.owner_id,
+            scope_id: input.scope_id,
+            content: input.content,
+            category: input.category,
+            tags: input.tags,
+            importance: input.importance,
+            confidence: input.confidence,
+            // Version chain - new version
+            root_memory_id: Some(input.root_memory_id),
+            version_number: input.version_number,
+            is_current_version: true,
+            supersedes: Some(input.old_memory_id),
+            superseded_by: None,
+            // Lifecycle - inherit global status
+            is_global: input.is_global,
+            hit_count: 0,
+            last_hit_at: None,
+            decay_score: 1.0,
+            // Source
+            source_event_id: Some(input.source_event_id),
+            // Status
+            status: Status::Active,
+            // Processing
+            embedding_status: EmbeddingStatus::Pending,
+            embedding_provider: input.embedding_provider,
+            processing_status: ProcessingStatus::Completed,
+            llm_provider: input.llm_provider,
+            // Inference
+            inference_type: Some(input.inference_type),
+            inference_confidence: Some(input.inference_confidence),
+            inference_reasoning: Some(input.inference_reasoning),
+            // Promotion
+            promoted_at: None,
+            promotion_reason: None,
+            // Timestamps
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Mark this memory as superseded by a new version
+    pub fn mark_superseded(&mut self, superseded_by_id: Uuid) {
+        self.superseded_by = Some(superseded_by_id);
+        self.is_current_version = false;
+        self.status = Status::Superseded;
         self.updated_at = Utc::now();
     }
 
-    /// Mark LLM processing as failed (fallback to raw content)
-    pub fn mark_processing_failed(&mut self) {
-        self.processing_status = ProcessingStatus::Failed;
-        self.updated_at = Utc::now();
-    }
-
-    /// Check if this memory is expired
-    pub fn is_expired(&self) -> bool {
-        if let Some(expires_at) = self.expires_at {
-            Utc::now() > expires_at
-        } else {
-            false
-        }
-    }
-
-    /// Check if this memory should transition to cooldown
-    pub fn should_cooldown(&self, threshold_seconds: i64) -> bool {
-        if let Some(last_hit) = self.last_hit_at {
-            let elapsed = (Utc::now() - last_hit).num_seconds();
-            elapsed > threshold_seconds
-        } else {
-            // If never hit, check against creation time
-            let elapsed = (Utc::now() - self.created_at).num_seconds();
-            elapsed > threshold_seconds
-        }
-    }
-
-    /// Record a hit on this memory
+    /// Record a hit on this memory (for LFU tracking)
     pub fn record_hit(&mut self) {
         self.hit_count += 1;
         self.last_hit_at = Some(Utc::now());
@@ -376,10 +419,78 @@ impl Memory {
         }
     }
 
+    /// Reinforce this memory (increase confidence)
+    pub fn reinforce(&mut self, confidence_delta: f32) {
+        // Weighted average to increase confidence
+        self.confidence = (self.confidence + confidence_delta).min(1.0);
+        self.record_hit();
+    }
+
+    /// Promote this memory to global
+    pub fn promote_to_global(&mut self, reason: &str) {
+        self.is_global = true;
+        self.scope_id = None;
+        self.promoted_at = Some(Utc::now());
+        self.promotion_reason = Some(reason.to_string());
+        self.updated_at = Utc::now();
+    }
+
+    /// Transition to cooldown status
+    pub fn transition_to_cooldown(&mut self) {
+        if self.status == Status::Active {
+            self.status = Status::Cooldown;
+            self.updated_at = Utc::now();
+        }
+    }
+
+    /// Transition to candidate status
+    pub fn transition_to_candidate(&mut self) {
+        if self.status == Status::Cooldown {
+            self.status = Status::Candidate;
+            self.updated_at = Utc::now();
+        }
+    }
+
     /// Archive this memory (soft delete)
     pub fn archive(&mut self) {
         self.status = Status::Archived;
         self.updated_at = Utc::now();
+    }
+
+    /// Update decay score
+    pub fn update_decay_score(&mut self, new_score: f32) {
+        self.decay_score = new_score;
+        self.updated_at = Utc::now();
+    }
+
+    /// Check if this memory should transition to cooldown
+    pub fn should_cooldown(&self, threshold_days: i64) -> bool {
+        if self.status != Status::Active {
+            return false;
+        }
+        let last_activity = self.last_hit_at.unwrap_or(self.created_at);
+        let days_since = (Utc::now() - last_activity).num_days();
+        days_since > threshold_days
+    }
+
+    /// Check if this memory should transition to candidate
+    pub fn should_become_candidate(&self, threshold_days: i64) -> bool {
+        if self.status != Status::Cooldown {
+            return false;
+        }
+        let last_activity = self.last_hit_at.unwrap_or(self.created_at);
+        let days_since = (Utc::now() - last_activity).num_days();
+        days_since > threshold_days
+    }
+
+    /// Check if this memory should be archived
+    pub fn should_archive(&self, threshold_days: i64) -> bool {
+        if self.status != Status::Candidate {
+            return false;
+        }
+        let last_activity = self.last_hit_at.unwrap_or(self.created_at);
+        let days_since = (Utc::now() - last_activity).num_days();
+        days_since > threshold_days
     }
 }
 
@@ -390,65 +501,56 @@ mod tests {
     fn valid_input() -> CreateMemoryInput {
         CreateMemoryInput {
             owner_id: "owner123".to_string(),
-            layer: Layer::Session,
-            scope_type: ScopeType::User,
-            scope_id: "user123".to_string(),
-            scene: "work.contract_review".to_string(),
+            scope_id: Some("scope456".to_string()),
             content: "Test memory content".to_string(),
+            category: Some("work.code".to_string()),
+            tags: Some(vec!["test".to_string()]),
             importance: Some(0.7),
             confidence: Some(0.9),
-            ttl_seconds: Some(3600),
-            event_source: Some("button_click:like".to_string()),
-            event_time: Some(Utc::now()),
+            is_global: false,
             embedding_provider: None,
             process_with_llm: false,
             llm_provider: None,
         }
     }
 
+    fn valid_event_input() -> CreateMemoryFromEventInput {
+        CreateMemoryFromEventInput {
+            owner_id: "owner123".to_string(),
+            scope_id: Some("scope456".to_string()),
+            content: "User prefers dark mode".to_string(),
+            category: Some("preference.ui".to_string()),
+            tags: Some(vec!["preference".to_string(), "ui".to_string()]),
+            importance: 0.8,
+            confidence: 0.95,
+            source_event_id: Uuid::new_v4(),
+            embedding_provider: Some("openai".to_string()),
+            llm_provider: Some("openai".to_string()),
+            inference_type: InferenceType::Preference,
+            inference_confidence: 0.9,
+            inference_reasoning: "User explicitly stated preference".to_string(),
+        }
+    }
+
     #[test]
-    fn test_valid_session_memory_creation() {
+    fn test_valid_memory_creation() {
         let input = valid_input();
         let result = CreateMemoryValidation::validate(&input);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_valid_task_memory_creation() {
+    fn test_empty_owner_id_rejection() {
         let mut input = valid_input();
-        input.layer = Layer::Task;
-        let result = CreateMemoryValidation::validate(&input);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_longterm_layer_rejection() {
-        let mut input = valid_input();
-        input.layer = Layer::LongTerm;
-        let result = CreateMemoryValidation::validate(&input);
-        assert!(matches!(result, Err(AppError::InvalidLayer)));
-    }
-
-    #[test]
-    fn test_empty_scope_id_rejection() {
-        let mut input = valid_input();
-        input.scope_id = "".to_string();
+        input.owner_id = "".to_string();
         let result = CreateMemoryValidation::validate(&input);
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
     #[test]
-    fn test_whitespace_scope_id_rejection() {
+    fn test_whitespace_owner_id_rejection() {
         let mut input = valid_input();
-        input.scope_id = "   ".to_string();
-        let result = CreateMemoryValidation::validate(&input);
-        assert!(matches!(result, Err(AppError::Validation(_))));
-    }
-
-    #[test]
-    fn test_empty_scene_rejection() {
-        let mut input = valid_input();
-        input.scene = "".to_string();
+        input.owner_id = "   ".to_string();
         let result = CreateMemoryValidation::validate(&input);
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
@@ -482,27 +584,16 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_ttl_rejection() {
-        let mut input = valid_input();
-        input.ttl_seconds = Some(-100);
-        let result = CreateMemoryValidation::validate(&input);
-        assert!(matches!(result, Err(AppError::Validation(_))));
-    }
-
-    #[test]
     fn test_memory_creation_with_defaults() {
         let input = CreateMemoryInput {
             owner_id: "owner123".to_string(),
-            layer: Layer::Session,
-            scope_type: ScopeType::User,
-            scope_id: "user123".to_string(),
-            scene: "test.scene".to_string(),
+            scope_id: None,
             content: "Test content".to_string(),
+            category: None,
+            tags: None,
             importance: None,
             confidence: None,
-            ttl_seconds: None,
-            event_source: None,
-            event_time: None,
+            is_global: false,
             embedding_provider: None,
             process_with_llm: false,
             llm_provider: None,
@@ -516,47 +607,81 @@ mod tests {
         assert!(memory.last_hit_at.is_none());
         assert_eq!(memory.embedding_status, EmbeddingStatus::Pending);
         assert_eq!(memory.processing_status, ProcessingStatus::Skipped);
-        assert!(memory.category.is_none());
-        assert!(memory.tags.is_none());
-        // Session layer has default TTL of 3600 seconds
-        assert_eq!(memory.ttl_seconds, Some(3600));
-        assert!(memory.expires_at.is_some());
+        // Version chain
+        assert_eq!(memory.root_memory_id, Some(memory.id));
+        assert_eq!(memory.version_number, 1);
+        assert!(memory.is_current_version);
+        assert!(memory.supersedes.is_none());
+        assert!(memory.superseded_by.is_none());
         // Inference fields should be None for directly created memories
         assert!(memory.inference_type.is_none());
         assert!(memory.inference_confidence.is_none());
         assert!(memory.inference_reasoning.is_none());
-        // Promotion fields
-        assert!(memory.promoted_at.is_none());
-        assert!(memory.promotion_reason.is_none());
     }
 
     #[test]
-    fn test_memory_with_event_source() {
-        let event_time = Utc::now();
-        let input = CreateMemoryInput {
-            owner_id: "owner123".to_string(),
-            layer: Layer::Task,
-            scope_type: ScopeType::Project,
-            scope_id: "project456".to_string(),
-            scene: "work.review".to_string(),
-            content: "User prefers dark mode".to_string(),
-            importance: Some(0.8),
-            confidence: Some(0.95),
-            ttl_seconds: None,
-            event_source: Some("conversation:preference".to_string()),
-            event_time: Some(event_time),
-            embedding_provider: Some("openai".to_string()),
-            process_with_llm: false,
+    fn test_memory_from_event() {
+        let input = valid_event_input();
+        let source_event_id = input.source_event_id;
+
+        let memory = Memory::new_from_event(input);
+        assert_eq!(memory.source_event_id, Some(source_event_id));
+        assert_eq!(memory.inference_type, Some(InferenceType::Preference));
+        assert_eq!(memory.inference_confidence, Some(0.9));
+        assert!(memory.inference_reasoning.is_some());
+        assert_eq!(memory.processing_status, ProcessingStatus::Completed);
+        // Version chain
+        assert_eq!(memory.root_memory_id, Some(memory.id));
+        assert_eq!(memory.version_number, 1);
+        assert!(memory.is_current_version);
+    }
+
+    #[test]
+    fn test_memory_superseding() {
+        let first_input = valid_event_input();
+        let first_memory = Memory::new_from_event(first_input);
+        let first_id = first_memory.id;
+        let root_id = first_memory.root_memory_id.unwrap();
+
+        let superseding_input = CreateSupersedingMemoryInput {
+            old_memory_id: first_id,
+            root_memory_id: root_id,
+            version_number: 2,
+            owner_id: first_memory.owner_id.clone(),
+            scope_id: first_memory.scope_id.clone(),
+            content: "User now prefers light mode".to_string(),
+            category: Some("preference.ui".to_string()),
+            tags: Some(vec!["preference".to_string()]),
+            importance: 0.8,
+            confidence: 0.95,
+            is_global: false,
+            source_event_id: Uuid::new_v4(),
+            embedding_provider: None,
             llm_provider: None,
+            inference_type: InferenceType::Preference,
+            inference_confidence: 0.9,
+            inference_reasoning: "User changed preference".to_string(),
         };
 
-        let memory = Memory::new(input);
-        assert_eq!(
-            memory.event_source,
-            Some("conversation:preference".to_string())
-        );
-        assert_eq!(memory.event_time, Some(event_time));
-        assert_eq!(memory.embedding_provider, Some("openai".to_string()));
+        let new_memory = Memory::new_superseding(superseding_input);
+        assert_eq!(new_memory.root_memory_id, Some(root_id));
+        assert_eq!(new_memory.version_number, 2);
+        assert!(new_memory.is_current_version);
+        assert_eq!(new_memory.supersedes, Some(first_id));
+        assert!(new_memory.superseded_by.is_none());
+    }
+
+    #[test]
+    fn test_mark_superseded() {
+        let input = valid_event_input();
+        let mut memory = Memory::new_from_event(input);
+        let new_version_id = Uuid::new_v4();
+
+        memory.mark_superseded(new_version_id);
+
+        assert_eq!(memory.superseded_by, Some(new_version_id));
+        assert!(!memory.is_current_version);
+        assert_eq!(memory.status, Status::Superseded);
     }
 
     #[test]
@@ -585,12 +710,69 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_reinforce() {
+        let input = valid_input();
+        let mut memory = Memory::new(input);
+        let initial_confidence = memory.confidence;
+
+        memory.reinforce(0.05);
+
+        assert!(memory.confidence > initial_confidence);
+        assert_eq!(memory.hit_count, 1);
+    }
+
+    #[test]
+    fn test_memory_reinforce_caps_at_one() {
+        let input = valid_input();
+        let mut memory = Memory::new(input);
+        memory.confidence = 0.98;
+
+        memory.reinforce(0.1);
+
+        assert_eq!(memory.confidence, 1.0);
+    }
+
+    #[test]
+    fn test_memory_promote_to_global() {
+        let input = valid_input();
+        let mut memory = Memory::new(input);
+        assert!(!memory.is_global);
+        assert!(memory.scope_id.is_some());
+
+        memory.promote_to_global("Cross-scope reinforcement");
+
+        assert!(memory.is_global);
+        assert!(memory.scope_id.is_none());
+        assert!(memory.promoted_at.is_some());
+        assert_eq!(
+            memory.promotion_reason,
+            Some("Cross-scope reinforcement".to_string())
+        );
+    }
+
+    #[test]
     fn test_memory_archive() {
         let input = valid_input();
         let mut memory = Memory::new(input);
 
         memory.archive();
 
+        assert_eq!(memory.status, Status::Archived);
+    }
+
+    #[test]
+    fn test_memory_status_transitions() {
+        let input = valid_input();
+        let mut memory = Memory::new(input);
+        assert_eq!(memory.status, Status::Active);
+
+        memory.transition_to_cooldown();
+        assert_eq!(memory.status, Status::Cooldown);
+
+        memory.transition_to_candidate();
+        assert_eq!(memory.status, Status::Candidate);
+
+        memory.archive();
         assert_eq!(memory.status, Status::Archived);
     }
 
@@ -606,36 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_apply_processing_result() {
+    fn test_global_memory_creation() {
         let mut input = valid_input();
-        input.process_with_llm = true;
+        input.is_global = true;
+        input.scope_id = None;
 
-        let mut memory = Memory::new(input);
-        assert_eq!(memory.processing_status, ProcessingStatus::Pending);
-
-        memory.apply_processing_result(
-            "Processed content".to_string(),
-            MemoryCategory::UserPreference,
-            vec!["tag1".to_string(), "tag2".to_string()],
-        );
-
-        assert_eq!(memory.content, "Processed content");
-        assert_eq!(memory.category, Some(MemoryCategory::UserPreference));
-        assert_eq!(
-            memory.tags,
-            Some(vec!["tag1".to_string(), "tag2".to_string()])
-        );
-        assert_eq!(memory.processing_status, ProcessingStatus::Completed);
-    }
-
-    #[test]
-    fn test_memory_mark_processing_failed() {
-        let mut input = valid_input();
-        input.process_with_llm = true;
-
-        let mut memory = Memory::new(input);
-        memory.mark_processing_failed();
-
-        assert_eq!(memory.processing_status, ProcessingStatus::Failed);
+        let memory = Memory::new(input);
+        assert!(memory.is_global);
+        assert!(memory.scope_id.is_none());
     }
 }

@@ -18,10 +18,6 @@ use uuid::Uuid;
 pub enum ErrorCode {
     /// Request parameter validation failed
     ValidationError,
-    /// Attempted to directly create long-term memory
-    InvalidLayer,
-    /// Invalid scope_type value
-    InvalidScopeType,
     /// Invalid update mode
     InvalidUpdateMode,
     /// Memory ID not found
@@ -59,8 +55,6 @@ impl ErrorCode {
     pub fn status_code(&self) -> StatusCode {
         match self {
             ErrorCode::ValidationError
-            | ErrorCode::InvalidLayer
-            | ErrorCode::InvalidScopeType
             | ErrorCode::InvalidUpdateMode
             | ErrorCode::ProviderDisabled
             | ErrorCode::EventContentTooShort => StatusCode::BAD_REQUEST,
@@ -136,12 +130,6 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    #[error("Invalid layer: long-term memories cannot be created directly")]
-    InvalidLayer,
-
-    #[error("Invalid scope type: {0}")]
-    InvalidScopeType(String),
-
     #[error("Invalid update mode: {0}")]
     InvalidUpdateMode(String),
 
@@ -193,8 +181,6 @@ impl AppError {
     pub fn error_code(&self) -> ErrorCode {
         match self {
             AppError::Validation(_) => ErrorCode::ValidationError,
-            AppError::InvalidLayer => ErrorCode::InvalidLayer,
-            AppError::InvalidScopeType(_) => ErrorCode::InvalidScopeType,
             AppError::InvalidUpdateMode(_) => ErrorCode::InvalidUpdateMode,
             AppError::MemoryNotFound(_) => ErrorCode::MemoryNotFound,
             AppError::EventNotFound(_) => ErrorCode::EventNotFound,
@@ -250,10 +236,6 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            ErrorCode::InvalidLayer.status_code(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
             ErrorCode::MemoryNotFound.status_code(),
             StatusCode::NOT_FOUND
         );
@@ -297,26 +279,29 @@ mod tests {
 
     #[test]
     fn test_error_response_with_details() {
-        let details = serde_json::json!({"field": "scope_type", "value": "invalid"});
+        let details = serde_json::json!({"field": "category", "value": "invalid"});
         let response = ErrorResponse::with_details(
-            ErrorCode::InvalidScopeType,
-            "Invalid scope type",
+            ErrorCode::ValidationError,
+            "Invalid category format",
             details.clone(),
         );
-        assert_eq!(response.code, ErrorCode::InvalidScopeType);
+        assert_eq!(response.code, ErrorCode::ValidationError);
         assert_eq!(response.details, Some(details));
     }
 
     #[test]
     fn test_app_error_to_error_code() {
-        assert_eq!(AppError::InvalidLayer.error_code(), ErrorCode::InvalidLayer);
+        assert_eq!(
+            AppError::Validation("test".to_string()).error_code(),
+            ErrorCode::ValidationError
+        );
         assert_eq!(
             AppError::MemoryNotFound(Uuid::new_v4()).error_code(),
             ErrorCode::MemoryNotFound
         );
         assert_eq!(
-            AppError::InvalidScopeType("test".to_string()).error_code(),
-            ErrorCode::InvalidScopeType
+            AppError::InvalidUpdateMode("test".to_string()).error_code(),
+            ErrorCode::InvalidUpdateMode
         );
     }
 

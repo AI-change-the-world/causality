@@ -186,7 +186,7 @@ const EXTRACT_FROM_EVENT_PROMPT: &str = r#"你是一个记忆提取助手。请�
 4. **规则(rule)**：提取的业务规则，置信度在 0.7-0.9 之间
 
 对于每条记忆，请：
-- 自动分类到：user_preference, behavior_pattern, business_rule, factual_knowledge, other
+- 生成层级式分类路径（如 "work.code.eslint", "personal.food.chinese", "preference.ui.theme"）
 - 提取3-5个关键词标签
 - 评估重要性(0.0-1.0)
 - 提供推断理由
@@ -200,7 +200,7 @@ const EXTRACT_FROM_EVENT_PROMPT: &str = r#"你是一个记忆提取助手。请�
       "content": "提取的记忆内容",
       "inference_type": "fact|preference|pattern|rule",
       "confidence": 0.9,
-      "category": "user_preference|behavior_pattern|business_rule|factual_knowledge|other",
+      "category": "层级式分类路径（如 work.code.eslint）",
       "tags": ["标签1", "标签2"],
       "importance": 0.7,
       "reasoning": "为什么提取这条记忆"
@@ -214,7 +214,8 @@ const EXTRACT_FROM_EVENT_PROMPT: &str = r#"你是一个记忆提取助手。请�
 - 如果事件中包含多个独立的见解，请提取多条记忆
 - 如果无法提取有价值的记忆，返回空的 extracted_memories 数组
 - 事实类型的置信度必须 >= 0.9
-- 偏好和模式类型的置信度应在 0.6-0.8 之间"#;
+- 偏好和模式类型的置信度应在 0.6-0.8 之间
+- category 必须是层级式路径，用点号分隔（如 work.code.eslint）"#;
 
 /// Prompt template for query enhancement
 const ENHANCE_QUERY_PROMPT: &str = r#"你是一个查询增强助手。请对以下查询进行语义扩展，添加同义词和相关术语以提高检索效果。
@@ -599,7 +600,11 @@ impl MemoryProcessor {
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(0.5);
 
-            let category = Self::parse_category(item["category"].as_str().unwrap_or("other"));
+            // Use hierarchical category string directly (e.g., "work.code.eslint")
+            let category = item["category"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
             let tags: Vec<String> = item["tags"]
                 .as_array()
@@ -625,7 +630,7 @@ impl MemoryProcessor {
                 inference_type,
                 confidence,
                 category,
-                tags,
+                tags: Some(tags),
                 importance,
                 reasoning,
             });
@@ -990,8 +995,11 @@ mod tests {
         assert_eq!(memory.content, "用户喜欢深色主题");
         assert_eq!(memory.inference_type, InferenceType::Preference);
         assert!((memory.confidence - 0.8).abs() < 0.01);
-        assert_eq!(memory.category, MemoryCategory::UserPreference);
-        assert_eq!(memory.tags, vec!["主题", "偏好"]);
+        assert_eq!(memory.category, Some("user_preference".to_string()));
+        assert_eq!(
+            memory.tags,
+            Some(vec!["主题".to_string(), "偏好".to_string()])
+        );
         assert!((memory.importance - 0.7).abs() < 0.01);
         assert_eq!(memory.reasoning, "用户明确表示喜欢深色主题");
     }

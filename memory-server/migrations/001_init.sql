@@ -1,19 +1,13 @@
 -- Memory Server Database Schema
 -- Migration: 001_init.sql
--- Description: Complete schema setup with all tables, enums, indexes, full-text search, and LLM providers
+-- Description: Simplified schema with Event-driven Memory architecture, version chains, and LFU eviction
 
 -- ============================================================================
 -- ENUM TYPES
 -- ============================================================================
 
--- Memory layer determining lifecycle and TTL behavior
-CREATE TYPE layer AS ENUM ('session', 'task', 'long_term');
-
--- Memory scope type determining ownership
-CREATE TYPE scope_type AS ENUM ('user', 'org', 'project', 'task', 'session');
-
--- Memory lifecycle status
-CREATE TYPE status AS ENUM ('candidate', 'active', 'stable', 'cooldown', 'ignored', 'archived');
+-- Memory lifecycle status (simplified)
+CREATE TYPE status AS ENUM ('active', 'cooldown', 'candidate', 'superseded', 'archived');
 
 -- Embedding generation status
 CREATE TYPE embedding_status AS ENUM ('pending', 'completed', 'failed');
@@ -21,58 +15,114 @@ CREATE TYPE embedding_status AS ENUM ('pending', 'completed', 'failed');
 -- Processing status for LLM memory processing
 CREATE TYPE processing_status AS ENUM ('pending', 'completed', 'failed', 'skipped');
 
--- Memory content update mode
-CREATE TYPE update_mode AS ENUM ('append', 'merge', 'supersede');
-
 -- Provider type (for both embedding and LLM providers)
 CREATE TYPE provider_type AS ENUM ('openai', 'azure', 'local');
 
 -- Memory category for LLM classification
 CREATE TYPE memory_category AS ENUM ('user_preference', 'behavior_pattern', 'business_rule', 'factual_knowledge', 'other');
 
+-- Relation type between events and memories
+CREATE TYPE event_memory_relation_type AS ENUM ('created_from', 'reinforced_by');
+
 -- ============================================================================
--- TABLES
+-- EVENTS TABLE (Immutable)
 -- ============================================================================
 
--- Memory main table
+CREATE TABLE events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id VARCHAR(255) NOT NULL,
+    scope_id VARCHAR(255),  -- nullable, user-defined
+    -- Event content and metadata
+    content TEXT NOT NULL,
+    context TEXT,
+    summary TEXT,
+    source VARCHAR(50),  -- 'user_created' | 'api' | etc.
+    -- Processing status
+    processed BOOLEAN NOT NULL DEFAULT false,
+    -- Timestamps
+    event_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================================
+-- MEMORIES TABLE (Content Immutable, Metadata Mutable)
+-- ============================================================================
+
 CREATE TABLE memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     owner_id VARCHAR(255) NOT NULL,
-    layer layer NOT NULL,
-    scope_type scope_type NOT NULL,
-    scope_id VARCHAR(255) NOT NULL,
-    scene VARCHAR(255) NOT NULL,
-    status status NOT NULL DEFAULT 'active',
-    -- Content fields
+    scope_id VARCHAR(255),  -- nullable, null = global memory
+    
+    -- Content fields (immutable after creation)
     content TEXT NOT NULL,
-    -- Category and tags
-    category memory_category,
+    category VARCHAR(500),  -- hierarchical: work.code.eslint
     tags TEXT[],
-    -- Full-text search
-    content_tsv TSVECTOR,
-    -- Metadata
     importance REAL NOT NULL DEFAULT 0.5,
     confidence REAL NOT NULL DEFAULT 1.0,
+    
+    -- Version chain (materialized path for O(1) queries)
+    root_memory_id UUID,  -- points to the root of version chain
+    version_number INTEGER NOT NULL DEFAULT 1,
+    is_current_version BOOLEAN NOT NULL DEFAULT true,
+    supersedes UUID REFERENCES memories(id),
+    superseded_by UUID REFERENCES memories(id),
+    
+    -- Lifecycle management (LFU eviction)
+    is_global BOOLEAN NOT NULL DEFAULT false,
     hit_count BIGINT NOT NULL DEFAULT 0,
     last_hit_at TIMESTAMPTZ,
-    ttl_seconds BIGINT,
-    expires_at TIMESTAMPTZ,
-    event_source VARCHAR(255),
-    event_time TIMESTAMPTZ,
+    decay_score REAL NOT NULL DEFAULT 1.0,
+    
+    -- Source tracking
+    source_event_id UUID,  -- will add FK after events table exists
+    
+    -- Status
+    status status NOT NULL DEFAULT 'active',
+    
+    -- Full-text search
+    content_tsv TSVECTOR,
+    
     -- Processing status
     embedding_status embedding_status NOT NULL DEFAULT 'pending',
     embedding_provider VARCHAR(100),
     processing_status processing_status NOT NULL DEFAULT 'skipped',
     llm_provider VARCHAR(100),
+    
     -- Inference fields (for memories extracted from events)
     inference_type VARCHAR(50),
     inference_confidence REAL,
     inference_reasoning TEXT,
+    
+    -- Promotion tracking
+    promoted_at TIMESTAMPTZ,
+    promotion_reason TEXT,
+    
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Add foreign key for source_event_id
+ALTER TABLE memories ADD CONSTRAINT fk_memories_source_event 
+    FOREIGN KEY (source_event_id) REFERENCES events(id);
+
+-- ============================================================================
+-- EVENT-MEMORY RELATIONS TABLE (Immutable)
+-- ============================================================================
+
+CREATE TABLE event_memory_relations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation_type event_memory_relation_type NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Ensure unique event-memory combination
+    UNIQUE(event_id, memory_id)
+);
+
+-- ============================================================================
+-- PROVIDER CONFIGURATION TABLES
+-- ============================================================================
 
 -- Embedding provider configuration table
 CREATE TABLE embedding_providers (
@@ -107,7 +157,10 @@ CREATE TABLE llm_providers (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Audit log table
+-- ============================================================================
+-- AUDIT LOG TABLE
+-- ============================================================================
+
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -119,7 +172,10 @@ CREATE TABLE audit_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Lifecycle configuration table
+-- ============================================================================
+-- LIFECYCLE CONFIGURATION TABLE
+-- ============================================================================
+
 CREATE TABLE lifecycle_config (
     key VARCHAR(100) PRIMARY KEY,
     value JSONB NOT NULL,
@@ -127,31 +183,63 @@ CREATE TABLE lifecycle_config (
 );
 
 -- ============================================================================
--- INDEXES
+-- INDEXES FOR EVENTS
 -- ============================================================================
 
--- Memory table indexes
+CREATE INDEX idx_events_owner ON events(owner_id);
+CREATE INDEX idx_events_owner_scope ON events(owner_id, scope_id);
+CREATE INDEX idx_events_processed ON events(processed) WHERE processed = false;
+CREATE INDEX idx_events_event_time ON events(event_time);
+CREATE INDEX idx_events_created_at ON events(created_at);
+
+-- ============================================================================
+-- INDEXES FOR MEMORIES
+-- ============================================================================
+
+-- Version chain indexes (core optimization for O(1) queries)
+CREATE INDEX idx_memories_root ON memories(root_memory_id);
+CREATE INDEX idx_memories_current ON memories(root_memory_id, is_current_version) 
+    WHERE is_current_version = true;
+
+-- Basic query indexes
 CREATE INDEX idx_memories_owner ON memories(owner_id);
-CREATE INDEX idx_memories_owner_scope ON memories(owner_id, scope_type, scope_id);
-CREATE INDEX idx_memories_scope ON memories(scope_type, scope_id);
-CREATE INDEX idx_memories_scene ON memories(scene);
-CREATE INDEX idx_memories_layer ON memories(layer);
+CREATE INDEX idx_memories_owner_scope ON memories(owner_id, scope_id);
 CREATE INDEX idx_memories_status ON memories(status);
-CREATE INDEX idx_memories_category ON memories(category) WHERE category IS NOT NULL;
-CREATE INDEX idx_memories_tags ON memories USING GIN(tags) WHERE tags IS NOT NULL;
-CREATE INDEX idx_memories_expires_at ON memories(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_memories_global ON memories(owner_id, is_global) WHERE is_global = true;
+
+-- Category index for prefix queries
+CREATE INDEX idx_memories_category ON memories(category);
+
+-- Lifecycle indexes
+CREATE INDEX idx_memories_decay_score ON memories(decay_score);
 CREATE INDEX idx_memories_last_hit_at ON memories(last_hit_at);
-CREATE INDEX idx_memories_event_source ON memories(event_source) WHERE event_source IS NOT NULL;
+CREATE INDEX idx_memories_promoted_at ON memories(promoted_at) WHERE promoted_at IS NOT NULL;
+
+-- Processing indexes
 CREATE INDEX idx_memories_embedding_status ON memories(embedding_status);
 CREATE INDEX idx_memories_created_at ON memories(created_at);
+
 -- Full-text search index
 CREATE INDEX idx_memories_content_tsv ON memories USING GIN(content_tsv);
 
--- Audit log indexes
+-- Tags index
+CREATE INDEX idx_memories_tags ON memories USING GIN(tags) WHERE tags IS NOT NULL;
+
+-- ============================================================================
+-- INDEXES FOR EVENT-MEMORY RELATIONS
+-- ============================================================================
+
+CREATE INDEX idx_emr_event ON event_memory_relations(event_id);
+CREATE INDEX idx_emr_memory ON event_memory_relations(memory_id);
+CREATE INDEX idx_emr_type ON event_memory_relations(relation_type);
+
+-- ============================================================================
+-- INDEXES FOR AUDIT LOGS
+-- ============================================================================
+
 CREATE INDEX idx_audit_logs_memory_id ON audit_logs(memory_id);
 CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX idx_audit_logs_operation ON audit_logs(operation);
-
 
 -- ============================================================================
 -- FUNCTIONS
@@ -215,7 +303,23 @@ CREATE TRIGGER memories_tsv_trigger
 
 -- Default lifecycle configuration
 INSERT INTO lifecycle_config (key, value) VALUES
-    ('cooldown_threshold_days', '{"session": 1, "task": 7, "long_term": 30}'),
-    ('default_ttl_seconds', '{"session": 3600, "task": 604800, "long_term": null}'),
+    ('decay_config', '{
+        "decay_half_life_days": 7,
+        "hit_boost_factor": 0.1,
+        "global_boost": 2.0
+    }'),
+    ('eviction_config', '{
+        "cooldown_threshold_days": 14,
+        "candidate_threshold_days": 30,
+        "archive_threshold_days": 90,
+        "max_memories_per_owner": 10000,
+        "decay_score_threshold": 0.1
+    }'),
+    ('promotion_criteria', '{
+        "min_scope_diversity": 2,
+        "min_reinforcements": 3,
+        "min_confidence": 0.7,
+        "min_age_hours": 24
+    }'),
     ('compression_prompt', '"你是一个记忆压缩助手。请从以下对话/操作记录中提取关键信息，生成简洁的结构化记忆。\n\n要求：\n1. 保留核心事实和用户偏好\n2. 去除冗余和无关信息\n3. 使用简洁的陈述句\n4. 保持原意不变\n\n原始内容：\n{content}\n\n压缩后的记忆："'),
     ('classification_prompt', '"请将以下记忆分类到最合适的类别：\n- user_preference: 用户偏好（如喜好、习惯设置）\n- behavior_pattern: 行为模式（如工作习惯、操作方式）\n- business_rule: 业务规则（如流程、规定）\n- factual_knowledge: 事实知识（如日期、数据）\n- other: 其他\n\n记忆内容：\n{content}\n\n请只返回类别名称："');

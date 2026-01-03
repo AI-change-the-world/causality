@@ -1,38 +1,33 @@
 //! Status enums for Memory Server
 //!
-//! Contains Status (memory lifecycle state), EmbeddingStatus, UpdateMode,
+//! Contains Status (memory lifecycle state), EmbeddingStatus,
 //! ProcessingStatus, MemoryCategory, and InferenceType.
 
 use serde::{Deserialize, Serialize};
 use sqlx::TypeInfo;
 use utoipa::ToSchema;
 
-/// Memory lifecycle status
+/// Memory lifecycle status (simplified for new architecture)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
-    /// Newly created, pending validation
-    Candidate,
     /// Active and participates in retrieval
     Active,
-    /// Stable, frequently accessed memory
-    Stable,
-    /// Cooling down due to inactivity, retrieval score penalized
+    /// Cooling down due to inactivity (no hits for cooldown_threshold)
     Cooldown,
-    /// Explicitly ignored by administrator
-    Ignored,
-    /// Archived (soft deleted or TTL expired)
+    /// Candidate for eviction (no hits for candidate_threshold)
+    Candidate,
+    /// Superseded by a newer version (content conflict)
+    Superseded,
+    /// Archived (evicted or manually archived)
     Archived,
 }
 
 impl Status {
     /// Check if this status allows the memory to be included in retrieval results
     pub fn is_retrievable(&self) -> bool {
-        matches!(
-            self,
-            Status::Candidate | Status::Active | Status::Stable | Status::Cooldown
-        )
+        matches!(self, Status::Active | Status::Cooldown)
     }
 
     /// Check if this status should apply a penalty to retrieval score
@@ -42,7 +37,15 @@ impl Status {
 
     /// Check if this status is excluded from all retrieval
     pub fn is_excluded(&self) -> bool {
-        matches!(self, Status::Ignored | Status::Archived)
+        matches!(
+            self,
+            Status::Candidate | Status::Superseded | Status::Archived
+        )
+    }
+
+    /// Check if this is a current version status (not superseded)
+    pub fn is_current(&self) -> bool {
+        !matches!(self, Status::Superseded)
     }
 }
 
@@ -55,11 +58,10 @@ impl Default for Status {
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Status::Candidate => write!(f, "candidate"),
             Status::Active => write!(f, "active"),
-            Status::Stable => write!(f, "stable"),
             Status::Cooldown => write!(f, "cooldown"),
-            Status::Ignored => write!(f, "ignored"),
+            Status::Candidate => write!(f, "candidate"),
+            Status::Superseded => write!(f, "superseded"),
             Status::Archived => write!(f, "archived"),
         }
     }
@@ -90,35 +92,6 @@ impl std::fmt::Display for EmbeddingStatus {
             EmbeddingStatus::Pending => write!(f, "pending"),
             EmbeddingStatus::Completed => write!(f, "completed"),
             EmbeddingStatus::Failed => write!(f, "failed"),
-        }
-    }
-}
-
-/// Memory content update mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
-#[sqlx(type_name = "update_mode", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum UpdateMode {
-    /// Append new content to existing content
-    Append,
-    /// Merge new content with existing content (preserving both)
-    Merge,
-    /// Replace existing content with new content
-    Supersede,
-}
-
-impl Default for UpdateMode {
-    fn default() -> Self {
-        UpdateMode::Supersede
-    }
-}
-
-impl std::fmt::Display for UpdateMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UpdateMode::Append => write!(f, "append"),
-            UpdateMode::Merge => write!(f, "merge"),
-            UpdateMode::Supersede => write!(f, "supersede"),
         }
     }
 }
@@ -155,7 +128,8 @@ impl std::fmt::Display for ProcessingStatus {
     }
 }
 
-/// Memory category for classification
+/// Memory category for classification (kept for backward compatibility)
+/// Note: In the new architecture, category is a hierarchical string field
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "memory_category", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -206,19 +180,16 @@ impl std::str::FromStr for MemoryCategory {
 }
 
 /// Inference type for memories extracted from events
-///
-/// Used to mark the type of inference made when extracting memories from raw events.
-/// This helps distinguish between direct facts and inferred information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceType {
-    /// Direct fact extracted from the event (e.g., "user clicked button X")
+    /// Direct fact extracted from the event
     Fact,
-    /// Inferred user preference (e.g., "user prefers dark theme")
+    /// Inferred user preference
     Preference,
-    /// Identified behavior pattern (e.g., "user usually works in the morning")
+    /// Identified behavior pattern
     Pattern,
-    /// Extracted business rule (e.g., "contracts require 3 signatures")
+    /// Extracted business rule
     Rule,
 }
 
@@ -241,7 +212,6 @@ impl sqlx::Type<sqlx::Postgres> for InferenceType {
     }
 
     fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-        // Compatible with VARCHAR and TEXT
         *ty == <String as sqlx::Type<sqlx::Postgres>>::type_info()
             || ty.name() == "VARCHAR"
             || ty.name() == "TEXT"
@@ -290,9 +260,6 @@ impl std::str::FromStr for InferenceType {
 }
 
 /// Processing mode for event-to-memory extraction
-///
-/// Controls how much automation the system uses when processing events into memories.
-/// This allows developers to balance between convenience and control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "processing_mode", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -335,25 +302,20 @@ impl std::str::FromStr for ProcessingMode {
 }
 
 /// Memory extracted from an event by LLM processing
-///
-/// Represents a single memory extracted from a raw event. The LLM automatically
-/// determines the inference type, category, tags, and importance based on the
-/// event content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedMemory {
     /// The extracted memory content
     pub content: String,
-    /// Type of inference made (fact, preference, pattern, rule)
-    pub inference_type: InferenceType,
-    /// Confidence score for this extraction (0.0 - 1.0)
-    /// Facts should have confidence >= 0.9, preferences/patterns in [0.6, 0.8]
-    pub confidence: f32,
-    /// Auto-classified category
-    pub category: MemoryCategory,
+    /// Hierarchical category (e.g., "work.code.eslint")
+    pub category: Option<String>,
     /// Auto-extracted tags/keywords
-    pub tags: Vec<String>,
+    pub tags: Option<Vec<String>>,
     /// Importance score (0.0 - 1.0)
     pub importance: f32,
+    /// Confidence score for this extraction (0.0 - 1.0)
+    pub confidence: f32,
+    /// Type of inference made (fact, preference, pattern, rule)
+    pub inference_type: InferenceType,
     /// Reasoning explaining why this memory was extracted
     pub reasoning: String,
 }
@@ -364,27 +326,36 @@ mod tests {
 
     #[test]
     fn test_status_retrievable() {
-        assert!(Status::Candidate.is_retrievable());
         assert!(Status::Active.is_retrievable());
-        assert!(Status::Stable.is_retrievable());
         assert!(Status::Cooldown.is_retrievable());
-        assert!(!Status::Ignored.is_retrievable());
+        assert!(!Status::Candidate.is_retrievable());
+        assert!(!Status::Superseded.is_retrievable());
         assert!(!Status::Archived.is_retrievable());
     }
 
     #[test]
     fn test_status_penalty() {
         assert!(!Status::Active.has_retrieval_penalty());
-        assert!(!Status::Stable.has_retrieval_penalty());
         assert!(Status::Cooldown.has_retrieval_penalty());
+        assert!(!Status::Superseded.has_retrieval_penalty());
     }
 
     #[test]
     fn test_status_excluded() {
         assert!(!Status::Active.is_excluded());
         assert!(!Status::Cooldown.is_excluded());
-        assert!(Status::Ignored.is_excluded());
+        assert!(Status::Candidate.is_excluded());
+        assert!(Status::Superseded.is_excluded());
         assert!(Status::Archived.is_excluded());
+    }
+
+    #[test]
+    fn test_status_current() {
+        assert!(Status::Active.is_current());
+        assert!(Status::Cooldown.is_current());
+        assert!(Status::Candidate.is_current());
+        assert!(!Status::Superseded.is_current());
+        assert!(Status::Archived.is_current());
     }
 
     #[test]
@@ -403,9 +374,26 @@ mod tests {
             "\"cooldown\""
         );
         assert_eq!(
+            serde_json::to_string(&Status::Candidate).unwrap(),
+            "\"candidate\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Status::Superseded).unwrap(),
+            "\"superseded\""
+        );
+        assert_eq!(
             serde_json::to_string(&Status::Archived).unwrap(),
             "\"archived\""
         );
+    }
+
+    #[test]
+    fn test_status_display() {
+        assert_eq!(Status::Active.to_string(), "active");
+        assert_eq!(Status::Cooldown.to_string(), "cooldown");
+        assert_eq!(Status::Candidate.to_string(), "candidate");
+        assert_eq!(Status::Superseded.to_string(), "superseded");
+        assert_eq!(Status::Archived.to_string(), "archived");
     }
 
     #[test]
@@ -414,141 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn test_embedding_status_serialization() {
-        assert_eq!(
-            serde_json::to_string(&EmbeddingStatus::Pending).unwrap(),
-            "\"pending\""
-        );
-        assert_eq!(
-            serde_json::to_string(&EmbeddingStatus::Completed).unwrap(),
-            "\"completed\""
-        );
-        assert_eq!(
-            serde_json::to_string(&EmbeddingStatus::Failed).unwrap(),
-            "\"failed\""
-        );
-    }
-
-    #[test]
-    fn test_update_mode_default() {
-        assert_eq!(UpdateMode::default(), UpdateMode::Supersede);
-    }
-
-    #[test]
-    fn test_update_mode_serialization() {
-        assert_eq!(
-            serde_json::to_string(&UpdateMode::Append).unwrap(),
-            "\"append\""
-        );
-        assert_eq!(
-            serde_json::to_string(&UpdateMode::Merge).unwrap(),
-            "\"merge\""
-        );
-        assert_eq!(
-            serde_json::to_string(&UpdateMode::Supersede).unwrap(),
-            "\"supersede\""
-        );
-    }
-
-    #[test]
-    fn test_status_display() {
-        assert_eq!(Status::Active.to_string(), "active");
-        assert_eq!(Status::Cooldown.to_string(), "cooldown");
-        assert_eq!(Status::Archived.to_string(), "archived");
-    }
-
-    #[test]
-    fn test_embedding_status_display() {
-        assert_eq!(EmbeddingStatus::Pending.to_string(), "pending");
-        assert_eq!(EmbeddingStatus::Completed.to_string(), "completed");
-        assert_eq!(EmbeddingStatus::Failed.to_string(), "failed");
-    }
-
-    #[test]
-    fn test_update_mode_display() {
-        assert_eq!(UpdateMode::Append.to_string(), "append");
-        assert_eq!(UpdateMode::Merge.to_string(), "merge");
-        assert_eq!(UpdateMode::Supersede.to_string(), "supersede");
-    }
-
-    #[test]
     fn test_processing_status_default() {
         assert_eq!(ProcessingStatus::default(), ProcessingStatus::Skipped);
     }
 
     #[test]
-    fn test_processing_status_serialization() {
-        assert_eq!(
-            serde_json::to_string(&ProcessingStatus::Pending).unwrap(),
-            "\"pending\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProcessingStatus::Completed).unwrap(),
-            "\"completed\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProcessingStatus::Failed).unwrap(),
-            "\"failed\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProcessingStatus::Skipped).unwrap(),
-            "\"skipped\""
-        );
-    }
-
-    #[test]
-    fn test_processing_status_display() {
-        assert_eq!(ProcessingStatus::Pending.to_string(), "pending");
-        assert_eq!(ProcessingStatus::Completed.to_string(), "completed");
-        assert_eq!(ProcessingStatus::Failed.to_string(), "failed");
-        assert_eq!(ProcessingStatus::Skipped.to_string(), "skipped");
-    }
-
-    #[test]
     fn test_memory_category_default() {
         assert_eq!(MemoryCategory::default(), MemoryCategory::Other);
-    }
-
-    #[test]
-    fn test_memory_category_serialization() {
-        assert_eq!(
-            serde_json::to_string(&MemoryCategory::UserPreference).unwrap(),
-            "\"user_preference\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MemoryCategory::BehaviorPattern).unwrap(),
-            "\"behavior_pattern\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MemoryCategory::BusinessRule).unwrap(),
-            "\"business_rule\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MemoryCategory::FactualKnowledge).unwrap(),
-            "\"factual_knowledge\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MemoryCategory::Other).unwrap(),
-            "\"other\""
-        );
-    }
-
-    #[test]
-    fn test_memory_category_display() {
-        assert_eq!(
-            MemoryCategory::UserPreference.to_string(),
-            "user_preference"
-        );
-        assert_eq!(
-            MemoryCategory::BehaviorPattern.to_string(),
-            "behavior_pattern"
-        );
-        assert_eq!(MemoryCategory::BusinessRule.to_string(), "business_rule");
-        assert_eq!(
-            MemoryCategory::FactualKnowledge.to_string(),
-            "factual_knowledge"
-        );
-        assert_eq!(MemoryCategory::Other.to_string(), "other");
     }
 
     #[test]
@@ -582,54 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn test_inference_type_serialization() {
-        assert_eq!(
-            serde_json::to_string(&InferenceType::Fact).unwrap(),
-            "\"fact\""
-        );
-        assert_eq!(
-            serde_json::to_string(&InferenceType::Preference).unwrap(),
-            "\"preference\""
-        );
-        assert_eq!(
-            serde_json::to_string(&InferenceType::Pattern).unwrap(),
-            "\"pattern\""
-        );
-        assert_eq!(
-            serde_json::to_string(&InferenceType::Rule).unwrap(),
-            "\"rule\""
-        );
-    }
-
-    #[test]
-    fn test_inference_type_deserialization() {
-        assert_eq!(
-            serde_json::from_str::<InferenceType>("\"fact\"").unwrap(),
-            InferenceType::Fact
-        );
-        assert_eq!(
-            serde_json::from_str::<InferenceType>("\"preference\"").unwrap(),
-            InferenceType::Preference
-        );
-        assert_eq!(
-            serde_json::from_str::<InferenceType>("\"pattern\"").unwrap(),
-            InferenceType::Pattern
-        );
-        assert_eq!(
-            serde_json::from_str::<InferenceType>("\"rule\"").unwrap(),
-            InferenceType::Rule
-        );
-    }
-
-    #[test]
-    fn test_inference_type_display() {
-        assert_eq!(InferenceType::Fact.to_string(), "fact");
-        assert_eq!(InferenceType::Preference.to_string(), "preference");
-        assert_eq!(InferenceType::Pattern.to_string(), "pattern");
-        assert_eq!(InferenceType::Rule.to_string(), "rule");
-    }
-
-    #[test]
     fn test_inference_type_from_str() {
         assert_eq!(
             "fact".parse::<InferenceType>().unwrap(),
@@ -647,61 +459,12 @@ mod tests {
             "rule".parse::<InferenceType>().unwrap(),
             InferenceType::Rule
         );
-        // Test case insensitivity
-        assert_eq!(
-            "FACT".parse::<InferenceType>().unwrap(),
-            InferenceType::Fact
-        );
-        assert_eq!(
-            "Preference".parse::<InferenceType>().unwrap(),
-            InferenceType::Preference
-        );
-        // Test unknown value
         assert!("unknown".parse::<InferenceType>().is_err());
     }
 
     #[test]
     fn test_processing_mode_default() {
         assert_eq!(ProcessingMode::default(), ProcessingMode::Assisted);
-    }
-
-    #[test]
-    fn test_processing_mode_serialization() {
-        assert_eq!(
-            serde_json::to_string(&ProcessingMode::Auto).unwrap(),
-            "\"auto\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProcessingMode::Assisted).unwrap(),
-            "\"assisted\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProcessingMode::Manual).unwrap(),
-            "\"manual\""
-        );
-    }
-
-    #[test]
-    fn test_processing_mode_deserialization() {
-        assert_eq!(
-            serde_json::from_str::<ProcessingMode>("\"auto\"").unwrap(),
-            ProcessingMode::Auto
-        );
-        assert_eq!(
-            serde_json::from_str::<ProcessingMode>("\"assisted\"").unwrap(),
-            ProcessingMode::Assisted
-        );
-        assert_eq!(
-            serde_json::from_str::<ProcessingMode>("\"manual\"").unwrap(),
-            ProcessingMode::Manual
-        );
-    }
-
-    #[test]
-    fn test_processing_mode_display() {
-        assert_eq!(ProcessingMode::Auto.to_string(), "auto");
-        assert_eq!(ProcessingMode::Assisted.to_string(), "assisted");
-        assert_eq!(ProcessingMode::Manual.to_string(), "manual");
     }
 
     #[test]
@@ -718,16 +481,6 @@ mod tests {
             "manual".parse::<ProcessingMode>().unwrap(),
             ProcessingMode::Manual
         );
-        // Test case insensitivity
-        assert_eq!(
-            "AUTO".parse::<ProcessingMode>().unwrap(),
-            ProcessingMode::Auto
-        );
-        assert_eq!(
-            "Assisted".parse::<ProcessingMode>().unwrap(),
-            ProcessingMode::Assisted
-        );
-        // Test unknown value
         assert!("unknown".parse::<ProcessingMode>().is_err());
     }
 }

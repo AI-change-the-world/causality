@@ -1,9 +1,11 @@
 //! LifecycleManager service
 //!
 //! Responsible for memory lifecycle management:
-//! - TTL expiration handling
-//! - Cooldown state transitions
+//! - LFU-based cooldown state transitions
 //! - Status change auditing
+//!
+//! Note: TTL-based expiration has been removed in the new architecture.
+//! Eviction is now handled by EvictionManager using LFU algorithm.
 
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -38,59 +40,20 @@ impl LifecycleManager {
         }
     }
 
-    /// Process expired memories
-    ///
-    /// Finds all memories that have exceeded their TTL and transitions them to archived status.
-    /// Returns the number of memories archived.
-    pub async fn process_expired(&self) -> AppResult<usize> {
-        debug!("Processing expired memories");
-
-        let expired = self.memory_repo.find_expired().await?;
-        let count = expired.len();
-
-        if count == 0 {
-            debug!("No expired memories found");
-            return Ok(0);
-        }
-
-        info!(count = count, "Found expired memories to archive");
-
-        for memory in expired {
-            if let Err(e) = self
-                .transition_status(
-                    memory.id,
-                    Status::Archived,
-                    Some("TTL expired".to_string()),
-                    None,
-                )
-                .await
-            {
-                warn!(
-                    memory_id = %memory.id,
-                    error = %e,
-                    "Failed to archive expired memory"
-                );
-            }
-        }
-
-        Ok(count)
-    }
-
     /// Process cooldown candidates
     ///
-    /// Finds all memories that haven't been hit within their layer's cooldown threshold
+    /// Finds all memories that haven't been hit within the cooldown threshold
     /// and transitions them to cooldown status.
     /// Returns the number of memories transitioned to cooldown.
     pub async fn process_cooldown(&self) -> AppResult<usize> {
         debug!("Processing cooldown candidates");
 
-        let session_threshold = self.config.cooldown_thresholds.session as i64;
-        let task_threshold = self.config.cooldown_thresholds.task as i64;
-        let longterm_threshold = self.config.cooldown_thresholds.long_term as i64;
+        // Use the eviction config threshold
+        let threshold_days = self.config.eviction_config.cooldown_threshold_days;
 
         let candidates = self
             .memory_repo
-            .find_cooldown_candidates(session_threshold, task_threshold, longterm_threshold)
+            .find_cooldown_candidates(threshold_days)
             .await?;
 
         let count = candidates.len();
@@ -185,16 +148,16 @@ impl LifecycleManager {
         Ok(updated)
     }
 
-    /// Mark a memory as ignored
+    /// Archive a memory
     ///
-    /// Used by administrators to explicitly ignore a memory.
-    pub async fn ignore_memory(
+    /// Used by administrators to explicitly archive a memory.
+    pub async fn archive_memory(
         &self,
         memory_id: Uuid,
         reason: String,
         actor_id: Option<String>,
     ) -> AppResult<Memory> {
-        self.transition_status(memory_id, Status::Ignored, Some(reason), actor_id)
+        self.transition_status(memory_id, Status::Archived, Some(reason), actor_id)
             .await
     }
 
@@ -230,21 +193,16 @@ impl LifecycleManager {
 
     /// Run a full lifecycle check
     ///
-    /// Processes both expired memories and cooldown candidates.
-    /// Returns (expired_count, cooldown_count).
-    pub async fn run_lifecycle_check(&self) -> AppResult<(usize, usize)> {
+    /// Processes cooldown candidates.
+    /// Returns the number of memories transitioned to cooldown.
+    pub async fn run_lifecycle_check(&self) -> AppResult<usize> {
         info!("Running lifecycle check");
 
-        let expired_count = self.process_expired().await?;
         let cooldown_count = self.process_cooldown().await?;
 
-        info!(
-            expired = expired_count,
-            cooldown = cooldown_count,
-            "Lifecycle check complete"
-        );
+        info!(cooldown = cooldown_count, "Lifecycle check complete");
 
-        Ok((expired_count, cooldown_count))
+        Ok(cooldown_count)
     }
 
     /// Get the cooldown check interval in seconds
@@ -270,30 +228,213 @@ impl LifecycleManager {
 
     /// Check database health by performing a simple query
     pub async fn check_database_health(&self) -> AppResult<()> {
-        // Try to get a non-existent memory - this will verify DB connectivity
-        // without returning an error for "not found"
-        let _ = self.memory_repo.find_expired().await?;
+        // Try to find cooldown candidates - this will verify DB connectivity
+        let _ = self.memory_repo.find_cooldown_candidates(0).await?;
         Ok(())
+    }
+
+    /// Promote a memory to global status
+    ///
+    /// Sets is_global = true and scope_id = null for the memory.
+    /// Creates an audit log entry for the promotion.
+    pub async fn promote_memory(&self, memory_id: Uuid, reason: &str) -> AppResult<Memory> {
+        debug!(
+            memory_id = %memory_id,
+            reason = %reason,
+            "Promoting memory to global status"
+        );
+
+        // Get current memory for audit
+        let old_memory = self.memory_repo.get_by_id(memory_id).await?;
+
+        // Skip if already global
+        if old_memory.is_global {
+            debug!(
+                memory_id = %memory_id,
+                "Memory already global, skipping promotion"
+            );
+            return Ok(old_memory);
+        }
+
+        // Perform promotion
+        let promoted = self
+            .memory_repo
+            .promote_to_global(memory_id, reason)
+            .await?;
+
+        // Create audit log entry
+        if self.audit_enabled {
+            self.audit_repo
+                .create(
+                    memory_id,
+                    AuditOperation::StatusChange,
+                    None,
+                    Some(serde_json::json!({
+                        "is_global": false,
+                        "scope_id": old_memory.scope_id
+                    })),
+                    Some(serde_json::json!({
+                        "is_global": true,
+                        "scope_id": serde_json::Value::Null,
+                        "promotion_reason": reason
+                    })),
+                    Some(format!("Promoted to global: {}", reason)),
+                )
+                .await?;
+        }
+
+        info!(
+            memory_id = %memory_id,
+            reason = %reason,
+            "Memory promoted to global status"
+        );
+
+        Ok(promoted)
+    }
+
+    /// Get eviction candidates for preview/dry-run
+    pub async fn get_eviction_candidates(
+        &self,
+        owner_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<Memory>> {
+        // Get memories with low decay scores
+        let candidates = self
+            .memory_repo
+            .find_eviction_candidates(owner_id, 0.5, limit as i64)
+            .await?;
+        Ok(candidates)
+    }
+
+    /// Run the eviction process for an owner
+    pub async fn run_eviction(&self, owner_id: &str) -> AppResult<crate::service::EvictionResult> {
+        use crate::service::EvictionResult;
+
+        let mut result = EvictionResult::empty();
+
+        // Step 1: Find and transition Active → Cooldown
+        let cooldown_threshold_days = self.config.eviction_config.cooldown_threshold_days;
+        let cooldown_candidates = self
+            .memory_repo
+            .find_cooldown_candidates(cooldown_threshold_days)
+            .await?;
+
+        for memory in cooldown_candidates
+            .into_iter()
+            .filter(|m| m.owner_id == owner_id && m.status == Status::Active)
+        {
+            if let Ok(_) = self
+                .transition_status(
+                    memory.id,
+                    Status::Cooldown,
+                    Some("Eviction: inactivity threshold exceeded".to_string()),
+                    None,
+                )
+                .await
+            {
+                result.cooldown_count += 1;
+            }
+        }
+
+        // Step 2: Find and transition Cooldown → Candidate (based on decay score)
+        let candidates = self
+            .memory_repo
+            .find_eviction_candidates(owner_id, 0.1, 1000)
+            .await?;
+
+        for memory in candidates
+            .into_iter()
+            .filter(|m| m.status == Status::Cooldown)
+        {
+            if let Ok(_) = self
+                .transition_status(
+                    memory.id,
+                    Status::Candidate,
+                    Some("Eviction: low decay score".to_string()),
+                    None,
+                )
+                .await
+            {
+                result.candidate_count += 1;
+            }
+        }
+
+        // Step 3: Archive Candidate memories
+        let archive_candidates = self
+            .memory_repo
+            .find_eviction_candidates(owner_id, 0.05, 1000)
+            .await?;
+
+        for memory in archive_candidates
+            .into_iter()
+            .filter(|m| m.status == Status::Candidate)
+        {
+            if let Ok(_) = self
+                .transition_status(
+                    memory.id,
+                    Status::Archived,
+                    Some("Eviction: archived due to low activity".to_string()),
+                    None,
+                )
+                .await
+            {
+                result.archived_count += 1;
+            }
+        }
+
+        info!(
+            owner_id = %owner_id,
+            cooldown = result.cooldown_count,
+            candidate = result.candidate_count,
+            archived = result.archived_count,
+            "Eviction completed"
+        );
+
+        Ok(result)
+    }
+
+    /// Update decay scores for an owner
+    pub async fn update_decay_scores(
+        &self,
+        owner_id: &str,
+        config: &crate::service::DecayConfig,
+    ) -> AppResult<usize> {
+        let updated = self
+            .memory_repo
+            .update_decay_scores(
+                owner_id,
+                config.decay_half_life_days,
+                config.hit_boost_factor,
+                config.global_boost,
+            )
+            .await?;
+
+        info!(
+            owner_id = %owner_id,
+            updated_count = updated,
+            "Decay scores updated"
+        );
+
+        Ok(updated)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CooldownThresholds, DefaultTtl};
+    use crate::config::{DecayConfig, EvictionConfig};
 
     fn test_config() -> LifecycleConfig {
         LifecycleConfig {
             cooldown_check_interval_seconds: 3600,
-            cooldown_thresholds: CooldownThresholds {
-                session: 86400,     // 1 day
-                task: 604800,       // 7 days
-                long_term: 2592000, // 30 days
-            },
-            default_ttl: DefaultTtl {
-                session: Some(3600),
-                task: Some(604800),
-                long_term: None,
+            decay_config: DecayConfig::default(),
+            eviction_config: EvictionConfig {
+                cooldown_threshold_days: 7,
+                candidate_threshold_days: 14,
+                archive_threshold_days: 30,
+                max_memories_per_scope: 1000,
+                max_global_memories: 10000,
+                batch_size: 100,
             },
         }
     }
@@ -304,8 +445,8 @@ mod tests {
         // We can't create a full LifecycleManager without repos,
         // but we can test the config values
         assert_eq!(config.cooldown_check_interval_seconds, 3600);
-        assert_eq!(config.cooldown_thresholds.session, 86400);
-        assert_eq!(config.cooldown_thresholds.task, 604800);
-        assert_eq!(config.cooldown_thresholds.long_term, 2592000);
+        assert_eq!(config.eviction_config.cooldown_threshold_days, 7);
+        assert_eq!(config.eviction_config.candidate_threshold_days, 14);
+        assert_eq!(config.eviction_config.archive_threshold_days, 30);
     }
 }

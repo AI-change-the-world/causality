@@ -1,20 +1,25 @@
 //! Domain layer for Memory Server
 //!
 //! Contains core domain types, entities, and validation logic.
+//!
+//! Architecture changes:
+//! - Removed Layer and ScopeType (simplified to user-defined strings)
+//! - Added version chain support for Memory
+//! - Added LFU eviction support
 
 mod event;
-mod layer;
 mod memory;
-mod scope;
 mod status;
 
 pub use event::{
-    CreateEventInput, Event, EventMemoryRelation, EventMemoryRelationType, PromotionCriteria,
+    CreateEventInput, CreateEventValidation, Event, EventMemoryRelation, EventMemoryRelationType,
+    PromotionCriteria,
 };
-pub use layer::Layer;
-pub use memory::{CreateMemoryFromEventInput, CreateMemoryInput, CreateMemoryValidation, Memory};
-pub use scope::ScopeType;
+pub use memory::{
+    CreateMemoryFromEventInput, CreateMemoryInput, CreateMemoryValidation,
+    CreateSupersedingMemoryInput, Memory,
+};
 pub use status::{
     EmbeddingStatus, ExtractedMemory, InferenceType, MemoryCategory, ProcessingMode,
-    ProcessingStatus, Status, UpdateMode,
+    ProcessingStatus, Status,
 };

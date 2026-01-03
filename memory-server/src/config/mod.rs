@@ -109,55 +109,121 @@ pub struct LifecycleConfig {
     #[serde(default = "default_cooldown_check_interval")]
     pub cooldown_check_interval_seconds: u64,
     #[serde(default)]
-    pub cooldown_thresholds: CooldownThresholds,
+    pub decay_config: DecayConfig,
     #[serde(default)]
-    pub default_ttl: DefaultTtl,
+    pub eviction_config: EvictionConfig,
 }
 
 fn default_cooldown_check_interval() -> u64 {
     3600
 }
 
-/// Cooldown thresholds per layer (in seconds)
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct CooldownThresholds {
-    #[serde(default = "default_session_cooldown")]
-    pub session: u64,
-    #[serde(default = "default_task_cooldown")]
-    pub task: u64,
-    #[serde(default = "default_long_term_cooldown")]
-    pub long_term: u64,
+/// Decay score calculation configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecayConfig {
+    /// Base decay rate per day (0.0 - 1.0)
+    #[serde(default = "default_base_decay_rate")]
+    pub base_decay_rate: f32,
+    /// Weight for hit count in decay calculation
+    #[serde(default = "default_hit_count_weight")]
+    pub hit_count_weight: f32,
+    /// Weight for recency in decay calculation
+    #[serde(default = "default_recency_weight_decay")]
+    pub recency_weight: f32,
+    /// Weight for importance in decay calculation
+    #[serde(default = "default_importance_weight_decay")]
+    pub importance_weight: f32,
+    /// Minimum decay score (floor)
+    #[serde(default = "default_min_decay_score")]
+    pub min_decay_score: f32,
 }
 
-fn default_session_cooldown() -> u64 {
-    86400 // 1 day
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            base_decay_rate: default_base_decay_rate(),
+            hit_count_weight: default_hit_count_weight(),
+            recency_weight: default_recency_weight_decay(),
+            importance_weight: default_importance_weight_decay(),
+            min_decay_score: default_min_decay_score(),
+        }
+    }
 }
 
-fn default_task_cooldown() -> u64 {
-    604800 // 7 days
+fn default_base_decay_rate() -> f32 {
+    0.05
 }
 
-fn default_long_term_cooldown() -> u64 {
-    2592000 // 30 days
+fn default_recency_weight_decay() -> f32 {
+    0.3
 }
 
-/// Default TTL per layer (in seconds)
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct DefaultTtl {
-    #[serde(default = "default_session_ttl")]
-    pub session: Option<u64>,
-    #[serde(default = "default_task_ttl")]
-    pub task: Option<u64>,
-    #[serde(default)]
-    pub long_term: Option<u64>,
+fn default_importance_weight_decay() -> f32 {
+    0.2
 }
 
-fn default_session_ttl() -> Option<u64> {
-    Some(3600) // 1 hour
+fn default_min_decay_score() -> f32 {
+    0.01
 }
 
-fn default_task_ttl() -> Option<u64> {
-    Some(604800) // 7 days
+/// Eviction configuration for LFU-based memory management
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvictionConfig {
+    /// Days of inactivity before transitioning to cooldown
+    #[serde(default = "default_cooldown_threshold_days")]
+    pub cooldown_threshold_days: i64,
+    /// Days in cooldown before becoming candidate
+    #[serde(default = "default_candidate_threshold_days")]
+    pub candidate_threshold_days: i64,
+    /// Days as candidate before archiving
+    #[serde(default = "default_archive_threshold_days")]
+    pub archive_threshold_days: i64,
+    /// Maximum number of active memories per scope (0 = unlimited)
+    #[serde(default = "default_max_memories_per_scope")]
+    pub max_memories_per_scope: usize,
+    /// Maximum number of global memories (0 = unlimited)
+    #[serde(default = "default_max_global_memories")]
+    pub max_global_memories: usize,
+    /// Batch size for eviction processing
+    #[serde(default = "default_eviction_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for EvictionConfig {
+    fn default() -> Self {
+        Self {
+            cooldown_threshold_days: default_cooldown_threshold_days(),
+            candidate_threshold_days: default_candidate_threshold_days(),
+            archive_threshold_days: default_archive_threshold_days(),
+            max_memories_per_scope: default_max_memories_per_scope(),
+            max_global_memories: default_max_global_memories(),
+            batch_size: default_eviction_batch_size(),
+        }
+    }
+}
+
+fn default_cooldown_threshold_days() -> i64 {
+    7
+}
+
+fn default_candidate_threshold_days() -> i64 {
+    14
+}
+
+fn default_archive_threshold_days() -> i64 {
+    30
+}
+
+fn default_max_memories_per_scope() -> usize {
+    1000
+}
+
+fn default_max_global_memories() -> usize {
+    10000
+}
+
+fn default_eviction_batch_size() -> usize {
+    100
 }
 
 /// Retrieval engine configuration
