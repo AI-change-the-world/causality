@@ -1,4 +1,4 @@
-# Memory Framework
+# Causality 因果律(Memory Framework)
 
 > **一个事件驱动的大模型/智能体应用记忆治理框架**  
 > An Event-Driven Memory Governance Framework for LLM/Agent Applications

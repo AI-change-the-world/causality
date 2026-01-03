@@ -438,7 +438,6 @@ mod tests {
             scene: "test.scene".to_string(),
             status,
             content: "Test content".to_string(),
-            raw_content: None,
             category: None,
             tags: None,
             importance: 0.5,
@@ -458,6 +457,8 @@ mod tests {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            promoted_at: None,
+            promotion_reason: None,
         }
     }
 

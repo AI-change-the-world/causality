@@ -45,7 +45,6 @@ CREATE TABLE memories (
     status status NOT NULL DEFAULT 'active',
     -- Content fields
     content TEXT NOT NULL,
-    raw_content TEXT,
     -- Category and tags
     category memory_category,
     tags TEXT[],

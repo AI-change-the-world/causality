@@ -110,7 +110,6 @@ pub struct GetMemoryResponse {
     pub scene: String,
     pub status: Status,
     pub content: String,
-    pub raw_content: Option<String>,
     pub category: Option<MemoryCategory>,
     pub tags: Option<Vec<String>>,
     pub importance: f32,
@@ -140,7 +139,6 @@ impl From<Memory> for GetMemoryResponse {
             scene: m.scene,
             status: m.status,
             content: m.content,
-            raw_content: m.raw_content,
             category: m.category,
             tags: m.tags,
             importance: m.importance,
@@ -441,7 +439,6 @@ mod tests {
             scene: "work.review".to_string(),
             status: Status::Active,
             content: "Test memory content".to_string(),
-            raw_content: None,
             category: Some(MemoryCategory::UserPreference),
             tags: Some(vec!["tag1".to_string(), "tag2".to_string()]),
             importance: 0.75,
@@ -461,6 +458,8 @@ mod tests {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            promoted_at: None,
+            promotion_reason: None,
         };
 
         let response: GetMemoryResponse = memory.clone().into();
@@ -473,7 +472,6 @@ mod tests {
         assert_eq!(response.scene, memory.scene);
         assert_eq!(response.status, memory.status);
         assert_eq!(response.content, memory.content);
-        assert_eq!(response.raw_content, memory.raw_content);
         assert_eq!(response.category, memory.category);
         assert_eq!(response.tags, memory.tags);
         assert_eq!(response.importance, memory.importance);

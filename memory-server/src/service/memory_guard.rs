@@ -523,7 +523,6 @@ impl MemoryGuard {
                 scope_id: request.scope_id.clone(),
                 scene: request.scene.clone(),
                 content: extracted.content.clone(),
-                raw_content: Some(request.content.clone()),
                 category: Some(extracted.category),
                 tags: Some(extracted.tags.clone()),
                 importance: extracted.importance,

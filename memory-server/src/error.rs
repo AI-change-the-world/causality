@@ -26,6 +26,8 @@ pub enum ErrorCode {
     InvalidUpdateMode,
     /// Memory ID not found
     MemoryNotFound,
+    /// Event ID not found
+    EventNotFound,
     /// Embedding provider not found
     ProviderNotFound,
     /// Specified provider is disabled
@@ -63,7 +65,9 @@ impl ErrorCode {
             | ErrorCode::ProviderDisabled
             | ErrorCode::EventContentTooShort => StatusCode::BAD_REQUEST,
 
-            ErrorCode::MemoryNotFound | ErrorCode::ProviderNotFound => StatusCode::NOT_FOUND,
+            ErrorCode::MemoryNotFound | ErrorCode::ProviderNotFound | ErrorCode::EventNotFound => {
+                StatusCode::NOT_FOUND
+            }
 
             ErrorCode::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
 
@@ -144,6 +148,9 @@ pub enum AppError {
     #[error("Memory not found: {0}")]
     MemoryNotFound(Uuid),
 
+    #[error("Event not found: {0}")]
+    EventNotFound(Uuid),
+
     #[error("Provider not found: {0}")]
     ProviderNotFound(String),
 
@@ -190,6 +197,7 @@ impl AppError {
             AppError::InvalidScopeType(_) => ErrorCode::InvalidScopeType,
             AppError::InvalidUpdateMode(_) => ErrorCode::InvalidUpdateMode,
             AppError::MemoryNotFound(_) => ErrorCode::MemoryNotFound,
+            AppError::EventNotFound(_) => ErrorCode::EventNotFound,
             AppError::ProviderNotFound(_) => ErrorCode::ProviderNotFound,
             AppError::ProviderDisabled(_) => ErrorCode::ProviderDisabled,
             AppError::NoDefaultProvider => ErrorCode::NoDefaultProvider,

@@ -67,19 +67,21 @@ impl MemoryRepository {
             r#"
             INSERT INTO memories (
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
             RETURNING
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             "#,
         )
@@ -91,7 +93,6 @@ impl MemoryRepository {
         .bind(&memory.scene)
         .bind(&memory.status)
         .bind(&memory.content)
-        .bind(&memory.raw_content)
         .bind(&memory.category)
         .bind(&memory.tags)
         .bind(memory.importance)
@@ -109,6 +110,8 @@ impl MemoryRepository {
         .bind(&memory.inference_type)
         .bind(memory.inference_confidence)
         .bind(&memory.inference_reasoning)
+        .bind(memory.promoted_at)
+        .bind(&memory.promotion_reason)
         .bind(memory.created_at)
         .bind(memory.updated_at)
         .fetch_one(&self.pool)
@@ -123,10 +126,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             FROM memories
             WHERE id = $1
@@ -190,10 +194,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             "#,
         )
@@ -219,10 +224,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             "#,
         )
@@ -246,10 +252,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             "#,
         )
@@ -270,10 +277,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             "#,
         )
@@ -299,10 +307,11 @@ impl MemoryRepository {
             WHERE id = $1
             RETURNING
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             "#,
         )
@@ -321,10 +330,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             FROM memories
             WHERE expires_at IS NOT NULL
@@ -349,10 +359,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             FROM memories
             WHERE status IN ('active', 'stable', 'candidate')
@@ -400,10 +411,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             FROM memories
             WHERE status NOT IN ('ignored', 'archived')
@@ -475,10 +487,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, 
+                category, tags, importance, confidence, hit_count, 
                 last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
                 embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at
             FROM memories
             WHERE id = ANY($1)
@@ -523,10 +536,11 @@ impl MemoryRepository {
             r#"
             SELECT
                 id, owner_id, layer, scope_type, scope_id, scene, status, content,
-                raw_content, category, tags, importance, confidence, hit_count, last_hit_at, ttl_seconds,
+                category, tags, importance, confidence, hit_count, last_hit_at, ttl_seconds,
                 expires_at, event_source, event_time, embedding_status,
                 embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
                 created_at, updated_at,
                 ts_rank(content_tsv, plainto_tsquery('simple', $1)) as rank,
                 CASE WHEN $6 THEN
@@ -564,7 +578,6 @@ impl MemoryRepository {
                 scene: row.get("scene"),
                 status: row.get("status"),
                 content: row.get("content"),
-                raw_content: row.get("raw_content"),
                 category: row.get("category"),
                 tags: row.get("tags"),
                 importance: row.get("importance"),
@@ -584,6 +597,8 @@ impl MemoryRepository {
                 inference_type: row.get("inference_type"),
                 inference_confidence: row.get("inference_confidence"),
                 inference_reasoning: row.get("inference_reasoning"),
+                promoted_at: row.try_get("promoted_at").ok().flatten(),
+                promotion_reason: row.try_get("promotion_reason").ok().flatten(),
             };
 
             let rank: f32 = row.get("rank");
@@ -713,6 +728,173 @@ impl MemoryRepository {
                 .collect()
         }))
     }
+
+    /// Promote a memory to long-term layer
+    pub async fn promote_to_long_term(&self, id: Uuid, reason: &str) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(
+            r#"
+            UPDATE memories
+            SET layer = 'long_term',
+                promoted_at = NOW(),
+                promotion_reason = $2,
+                ttl_seconds = NULL,
+                expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING
+    /// Promote a memory to long-term layer
+    pub async fn promote_to_long_term(&self, id: Uuid, reason: &str) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(
+            r#"
+            UPDATE memories
+            SET layer = 'long_term',
+                promoted_at = NOW(),
+                promotion_reason = $2,
+                ttl_seconds = NULL,
+                expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
+                category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
+                created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
+    }
+
+    /// Find memories eligible for promotion to long-term
+    /// Note: evidence_count is computed from event_memory_relations table
+    pub async fn find_promotion_candidates(
+        &self,
+        min_evidence_count: i32,
+        min_confidence: f32,
+        min_age_hours: i64,
+    ) -> AppResult<Vec<Memory>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(
+            r#"
+            SELECT
+                m.id, m.owner_id, m.layer, m.scope_type, m.scope_id, m.scene, m.status, m.content,
+                m.category, m.tags, m.importance, m.confidence, m.hit_count, 
+                m.last_hit_at, m.ttl_seconds, m.expires_at, m.event_source, m.event_time, 
+                m.embedding_status, m.embedding_provider, m.processing_status, m.llm_provider,
+                m.inference_type, m.inference_confidence, m.inference_reasoning,
+                m.promoted_at, m.promotion_reason,
+                m.created_at, m.updated_at
+            FROM memories m
+            LEFT JOIN (
+                SELECT memory_id, COUNT(*) as evidence_count
+                FROM event_memory_relations
+                WHERE relation_type IN ('created_from', 'reinforced_by')
+                GROUP BY memory_id
+            ) r ON m.id = r.memory_id
+            WHERE m.layer != 'long_term'
+              AND m.promoted_at IS NULL
+              AND m.status NOT IN ('ignored', 'archived')
+              AND COALESCE(r.evidence_count, 0) >= $1
+              AND m.confidence >= $2
+              AND m.created_at < NOW() - INTERVAL '1 hour' * $3
+            ORDER BY COALESCE(r.evidence_count, 0) DESC, m.confidence DESC
+            "#,
+        )
+        .bind(min_evidence_count as i64)
+        .bind(min_confidence)
+        .bind(min_age_hours as f64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Find similar memories by content for deduplication/reinforcement
+    /// Uses full-text search to find potentially matching memories
+    pub async fn find_similar_by_content(
+        &self,
+        owner_id: &str,
+        content: &str,
+        scope_type: &ScopeType,
+        limit: i64,
+    ) -> AppResult<Vec<(Memory, f32)>> {
+        if content.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, owner_id, layer, scope_type, scope_id, scene, status, content,
+                category, tags, importance, confidence, hit_count, 
+                last_hit_at, ttl_seconds, expires_at, event_source, event_time, 
+                embedding_status, embedding_provider, processing_status, llm_provider,
+                inference_type, inference_confidence, inference_reasoning,
+                promoted_at, promotion_reason,
+                created_at, updated_at,
+                ts_rank(content_tsv, plainto_tsquery('simple', $2)) as rank
+            FROM memories
+            WHERE owner_id = $1
+              AND scope_type = $3
+              AND status NOT IN ('ignored', 'archived')
+              AND content_tsv @@ plainto_tsquery('simple', $2)
+            ORDER BY rank DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(owner_id)
+        .bind(content)
+        .bind(scope_type)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let memory = Memory {
+                id: row.get("id"),
+                owner_id: row.get("owner_id"),
+                layer: row.get("layer"),
+                scope_type: row.get("scope_type"),
+                scope_id: row.get("scope_id"),
+                scene: row.get("scene"),
+                status: row.get("status"),
+                content: row.get("content"),
+                category: row.get("category"),
+                tags: row.get("tags"),
+                importance: row.get("importance"),
+                confidence: row.get("confidence"),
+                hit_count: row.get("hit_count"),
+                last_hit_at: row.get("last_hit_at"),
+                ttl_seconds: row.get("ttl_seconds"),
+                expires_at: row.get("expires_at"),
+                event_source: row.get("event_source"),
+                event_time: row.get("event_time"),
+                embedding_status: row.get("embedding_status"),
+                embedding_provider: row.get("embedding_provider"),
+                processing_status: row.get("processing_status"),
+                llm_provider: row.get("llm_provider"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+                inference_type: row.get("inference_type"),
+                inference_confidence: row.get("inference_confidence"),
+                inference_reasoning: row.get("inference_reasoning"),
+                promoted_at: row.get("promoted_at"),
+                promotion_reason: row.get("promotion_reason"),
+            };
+            let rank: f32 = row.get("rank");
+            results.push((memory, rank));
+        }
+
+        Ok(results)
+    }
 }
 
 /// Internal row type for sqlx mapping
@@ -726,7 +908,6 @@ struct MemoryRow {
     scene: String,
     status: Status,
     content: String,
-    raw_content: Option<String>,
     category: Option<MemoryCategory>,
     tags: Option<Vec<String>>,
     importance: f32,
@@ -746,6 +927,8 @@ struct MemoryRow {
     inference_type: Option<InferenceType>,
     inference_confidence: Option<f32>,
     inference_reasoning: Option<String>,
+    promoted_at: Option<DateTime<Utc>>,
+    promotion_reason: Option<String>,
 }
 
 impl From<MemoryRow> for Memory {
@@ -759,7 +942,6 @@ impl From<MemoryRow> for Memory {
             scene: row.scene,
             status: row.status,
             content: row.content,
-            raw_content: row.raw_content,
             category: row.category,
             tags: row.tags,
             importance: row.importance,
@@ -779,6 +961,8 @@ impl From<MemoryRow> for Memory {
             inference_type: row.inference_type,
             inference_confidence: row.inference_confidence,
             inference_reasoning: row.inference_reasoning,
+            promoted_at: row.promoted_at,
+            promotion_reason: row.promotion_reason,
         }
     }
 }

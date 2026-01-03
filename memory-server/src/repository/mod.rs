@@ -5,12 +5,14 @@
 
 mod audit_repo;
 mod config_repo;
+mod event_repo;
 mod llm_provider_repo;
 mod memory_repo;
 mod qdrant_repo;
 
 pub use audit_repo::{AuditLogEntry, AuditOperation, AuditQueryParams, AuditRepository};
 pub use config_repo::{ConfigRepository, EmbeddingProviderRecord, UpdateProviderInput};
+pub use event_repo::EventRepository;
 pub use llm_provider_repo::{
     LlmPromptConfig, LlmProviderRecord, LlmProviderRepository, UpdateLlmProviderInput,
 };

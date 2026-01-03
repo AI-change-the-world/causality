@@ -30,8 +30,6 @@ pub struct Memory {
     pub status: Status,
     /// Memory content (processed content if LLM processing was enabled)
     pub content: String,
-    /// Raw content before LLM processing (if LLM processing was enabled)
-    pub raw_content: Option<String>,
     /// Memory category (auto-classified by LLM if processing was enabled)
     pub category: Option<MemoryCategory>,
     /// Tags/keywords extracted from content
@@ -70,6 +68,10 @@ pub struct Memory {
     pub inference_confidence: Option<f32>,
     /// Reasoning for the inference (if memory was extracted from an event)
     pub inference_reasoning: Option<String>,
+    /// When the memory was promoted to long-term
+    pub promoted_at: Option<DateTime<Utc>>,
+    /// Reason for promotion to long-term
+    pub promotion_reason: Option<String>,
 }
 
 /// Input for creating a new memory
@@ -125,8 +127,6 @@ pub struct CreateMemoryFromEventInput {
     pub scene: String,
     /// Memory content (extracted by LLM)
     pub content: String,
-    /// Raw content before LLM processing (original event content)
-    pub raw_content: Option<String>,
     /// Memory category (auto-classified by LLM)
     pub category: Option<MemoryCategory>,
     /// Tags/keywords extracted from content
@@ -255,7 +255,6 @@ impl Memory {
             scene: input.scene,
             status: Status::Active,
             content: input.content,
-            raw_content: None,
             category: None,
             tags: None,
             importance: input.importance.unwrap_or(0.5),
@@ -275,6 +274,8 @@ impl Memory {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            promoted_at: None,
+            promotion_reason: None,
         }
     }
 
@@ -298,7 +299,6 @@ impl Memory {
             scene: input.scene,
             status: Status::Active,
             content: input.content,
-            raw_content: input.raw_content,
             category: input.category,
             tags: input.tags,
             importance: input.importance,
@@ -318,6 +318,8 @@ impl Memory {
             inference_type: Some(input.inference_type),
             inference_confidence: Some(input.inference_confidence),
             inference_reasoning: Some(input.inference_reasoning),
+            promoted_at: None,
+            promotion_reason: None,
         }
     }
 
@@ -328,8 +330,7 @@ impl Memory {
         category: MemoryCategory,
         tags: Vec<String>,
     ) {
-        // Store original content as raw_content
-        self.raw_content = Some(std::mem::replace(&mut self.content, processed_content));
+        self.content = processed_content;
         self.category = Some(category);
         self.tags = Some(tags);
         self.processing_status = ProcessingStatus::Completed;
@@ -515,7 +516,6 @@ mod tests {
         assert!(memory.last_hit_at.is_none());
         assert_eq!(memory.embedding_status, EmbeddingStatus::Pending);
         assert_eq!(memory.processing_status, ProcessingStatus::Skipped);
-        assert!(memory.raw_content.is_none());
         assert!(memory.category.is_none());
         assert!(memory.tags.is_none());
         // Session layer has default TTL of 3600 seconds
@@ -525,6 +525,9 @@ mod tests {
         assert!(memory.inference_type.is_none());
         assert!(memory.inference_confidence.is_none());
         assert!(memory.inference_reasoning.is_none());
+        // Promotion fields
+        assert!(memory.promoted_at.is_none());
+        assert!(memory.promotion_reason.is_none());
     }
 
     #[test]
@@ -606,7 +609,6 @@ mod tests {
     fn test_memory_apply_processing_result() {
         let mut input = valid_input();
         input.process_with_llm = true;
-        let original_content = input.content.clone();
 
         let mut memory = Memory::new(input);
         assert_eq!(memory.processing_status, ProcessingStatus::Pending);
@@ -618,7 +620,6 @@ mod tests {
         );
 
         assert_eq!(memory.content, "Processed content");
-        assert_eq!(memory.raw_content, Some(original_content));
         assert_eq!(memory.category, Some(MemoryCategory::UserPreference));
         assert_eq!(
             memory.tags,
@@ -636,7 +637,5 @@ mod tests {
         memory.mark_processing_failed();
 
         assert_eq!(memory.processing_status, ProcessingStatus::Failed);
-        // Content should remain unchanged (fallback to raw)
-        assert!(memory.raw_content.is_none());
     }
 }
