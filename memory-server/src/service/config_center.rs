@@ -16,8 +16,8 @@ use crate::embedding::{ProviderConfig, ProviderType};
 use crate::error::{AppError, AppResult};
 use crate::llm::{LlmProviderConfig, LlmProviderType};
 use crate::repository::{
-    ConfigRepository, EmbeddingProviderRecord, LlmPromptConfig, LlmProviderRecord,
-    LlmProviderRepository, QdrantRepository, UpdateLlmProviderInput, UpdateProviderInput,
+    ConfigRepository, EmbeddingProviderRecord, LlmProviderRecord, LlmProviderRepository,
+    QdrantRepository, UpdateLlmProviderInput, UpdateProviderInput,
 };
 
 /// Provider information for API responses
@@ -63,16 +63,6 @@ pub struct LlmProviderInfo {
     pub model: String,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Maximum input tokens
-    pub max_input_tokens: u32,
-    /// Maximum output tokens
-    pub max_output_tokens: u32,
-    /// Temperature for generation
-    pub temperature: f32,
-    /// Whether compression prompt is configured
-    pub has_compression_prompt: bool,
-    /// Whether classification prompt is configured
-    pub has_classification_prompt: bool,
 }
 
 impl From<LlmProviderRecord> for LlmProviderInfo {
@@ -83,11 +73,6 @@ impl From<LlmProviderRecord> for LlmProviderInfo {
             enabled: record.enabled,
             model: record.model,
             is_default: record.is_default,
-            max_input_tokens: record.max_input_tokens as u32,
-            max_output_tokens: record.max_output_tokens as u32,
-            temperature: record.temperature,
-            has_compression_prompt: record.compression_prompt.is_some(),
-            has_classification_prompt: record.classification_prompt.is_some(),
         }
     }
 }
@@ -489,7 +474,6 @@ impl ConfigCenter {
     pub async fn create_llm_provider(
         &self,
         config: LlmProviderConfig,
-        prompts: Option<LlmPromptConfig>,
     ) -> AppResult<LlmProviderInfo> {
         let llm_repo = self.llm_repo.as_ref().ok_or_else(|| {
             AppError::Config("LLM provider repository not configured".to_string())
@@ -497,7 +481,7 @@ impl ConfigCenter {
 
         debug!(provider_name = %config.name, "Creating LLM provider");
 
-        let record = llm_repo.create_provider(&config, prompts.as_ref()).await?;
+        let record = llm_repo.create_provider(&config).await?;
 
         // Update cache
         {
@@ -633,28 +617,6 @@ impl ConfigCenter {
         Ok(default.to_provider_config())
     }
 
-    /// Update prompt templates for an LLM provider
-    pub async fn update_llm_prompts(
-        &self,
-        name: &str,
-        compression_prompt: Option<String>,
-        classification_prompt: Option<String>,
-    ) -> AppResult<LlmProviderInfo> {
-        let llm_repo = self.llm_repo.as_ref().ok_or_else(|| {
-            AppError::Config("LLM provider repository not configured".to_string())
-        })?;
-
-        debug!(provider_name = %name, "Updating LLM provider prompts");
-
-        let record = llm_repo
-            .update_prompts(name, compression_prompt, classification_prompt)
-            .await?;
-
-        info!(provider_name = %name, "LLM provider prompts updated");
-
-        Ok(record.into())
-    }
-
     /// Check if any enabled LLM provider exists
     pub async fn has_enabled_llm_provider(&self) -> AppResult<bool> {
         let llm_repo = match self.llm_repo.as_ref() {
@@ -663,16 +625,6 @@ impl ConfigCenter {
         };
 
         llm_repo.has_enabled_provider().await
-    }
-
-    /// Get prompt configuration for an LLM provider
-    pub async fn get_llm_prompts(&self, name: &str) -> AppResult<LlmPromptConfig> {
-        let llm_repo = self.llm_repo.as_ref().ok_or_else(|| {
-            AppError::Config("LLM provider repository not configured".to_string())
-        })?;
-
-        let record = llm_repo.get_provider(name).await?;
-        Ok(record.get_prompt_config())
     }
 
     // =========================================================================
@@ -709,10 +661,6 @@ impl ConfigCenter {
             content_len = content.len(),
             "Generating embedding"
         );
-
-        // Check rate limit
-        // Estimate tokens: ~4 chars per token for English, ~2 for Chinese
-        let estimated_tokens = (content.len() / 3) as u32;
 
         // Create embedding provider based on type
         let embedding = match config.provider_type {
@@ -806,11 +754,6 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             enabled: true,
             is_default: true,
-            compression_prompt: Some("Compress: {content}".to_string()),
-            classification_prompt: None,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -822,15 +765,10 @@ mod tests {
         assert!(info.enabled);
         assert!(info.is_default);
         assert_eq!(info.model, "gpt-4o-mini");
-        assert_eq!(info.max_input_tokens, 4000);
-        assert_eq!(info.max_output_tokens, 1000);
-        assert!((info.temperature - 0.3).abs() < f32::EPSILON);
-        assert!(info.has_compression_prompt);
-        assert!(!info.has_classification_prompt);
     }
 
     #[test]
-    fn test_llm_provider_info_no_prompts() {
+    fn test_llm_provider_info_no_api_key() {
         use chrono::Utc;
 
         let record = LlmProviderRecord {
@@ -841,11 +779,6 @@ mod tests {
             model: "llama2".to_string(),
             enabled: true,
             is_default: false,
-            compression_prompt: None,
-            classification_prompt: None,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -854,7 +787,5 @@ mod tests {
 
         assert_eq!(info.name, "local-llm");
         assert_eq!(info.provider_type, LlmProviderType::Local);
-        assert!(!info.has_compression_prompt);
-        assert!(!info.has_classification_prompt);
     }
 }

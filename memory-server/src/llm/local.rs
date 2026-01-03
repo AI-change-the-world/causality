@@ -121,8 +121,8 @@ impl LocalLlmProvider {
             endpoint: config.endpoint,
             api_key: config.api_key,
             model: config.model,
-            temperature: config.temperature,
-            max_tokens: config.max_output_tokens,
+            temperature: 0.7, // Default temperature for LLM processing
+            max_tokens: 1000, // Default max tokens for LLM processing
             enabled: AtomicBool::new(config.enabled),
             retry_config: LlmRetryConfig::default(),
         })
@@ -354,9 +354,6 @@ mod tests {
             api_key: None,
             model: "llama3.2".to_string(),
             enabled: true,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
         }
     }
 

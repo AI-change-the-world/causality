@@ -318,10 +318,14 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
     ///    b. Finds similar existing memories
     ///    c. Reconciles (create new, reinforce, or supersede)
     ///
+    /// The memory_processor parameter allows dynamic LLM provider selection.
+    /// If not provided, falls back to the configured processor.
+    ///
     /// Requirements: 2.1, 3.1, 3.2, 3.3, 3.4
     pub async fn process_event(
         &self,
         event: &Event,
+        memory_processor: Option<Arc<MemoryProcessor>>,
         actor_id: Option<String>,
     ) -> AppResult<ProcessEventResult> {
         debug!(
@@ -331,11 +335,12 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             "Processing event"
         );
 
-        // Ensure we have required components
-        let processor = self
-            .memory_processor
-            .as_ref()
-            .ok_or_else(|| AppError::Internal("No memory processor configured".to_string()))?;
+        // Use provided processor or fall back to configured one
+        let processor = memory_processor
+            .or_else(|| self.memory_processor.clone())
+            .ok_or_else(|| {
+                AppError::Internal("No memory processor provided or configured".to_string())
+            })?;
 
         let matcher = self
             .memory_matcher
@@ -541,9 +546,11 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
     /// Create memories from an event (convenience method)
     ///
     /// Creates an event from the request and processes it.
+    /// The memory_processor parameter allows dynamic LLM provider selection.
     pub async fn create_from_event(
         &self,
         request: CreateFromEventRequest,
+        memory_processor: Option<Arc<MemoryProcessor>>,
         actor_id: Option<String>,
     ) -> AppResult<CreateFromEventResult> {
         debug!(
@@ -568,8 +575,10 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         // Store the event
         let stored_event = self.event_repo.create(&event).await?;
 
-        // Process the event
-        let result = self.process_event(&stored_event, actor_id).await?;
+        // Process the event with the provided or configured processor
+        let result = self
+            .process_event(&stored_event, memory_processor, actor_id)
+            .await?;
 
         let event_summary = result.event.summary.clone().unwrap_or_default();
 

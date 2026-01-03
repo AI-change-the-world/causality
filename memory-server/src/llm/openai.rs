@@ -59,7 +59,7 @@ impl OpenAILlmProvider {
             name: config.name,
             client,
             model: config.model,
-            temperature: config.temperature,
+            temperature: 0.7, // Default temperature for LLM processing
             enabled: AtomicBool::new(config.enabled),
             retry_config: LlmRetryConfig::default(),
         })
@@ -315,9 +315,6 @@ mod tests {
             api_key: Some("sk-test-key".to_string()),
             model: "gpt-4o-mini".to_string(),
             enabled: true,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
         }
     }
 

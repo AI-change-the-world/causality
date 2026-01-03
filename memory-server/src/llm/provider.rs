@@ -90,6 +90,10 @@ impl std::str::FromStr for LlmProviderType {
 }
 
 /// Configuration for an LLM provider
+///
+/// This contains only the essential configuration for connecting to an LLM provider.
+/// Processing parameters (temperature, max_tokens, prompts) are handled internally
+/// by the service layer with sensible defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProviderConfig {
     /// Unique name for this provider
@@ -105,31 +109,10 @@ pub struct LlmProviderConfig {
     /// Whether this provider is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Maximum input tokens
-    #[serde(default = "default_max_input_tokens")]
-    pub max_input_tokens: u32,
-    /// Maximum output tokens
-    #[serde(default = "default_max_output_tokens")]
-    pub max_output_tokens: u32,
-    /// Temperature for generation
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
 }
 
 fn default_enabled() -> bool {
     true
-}
-
-fn default_max_input_tokens() -> u32 {
-    4000
-}
-
-fn default_max_output_tokens() -> u32 {
-    1000
-}
-
-fn default_temperature() -> f32 {
-    0.3
 }
 
 /// Retry configuration for LLM requests
@@ -469,9 +452,6 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             model: "gpt-4o-mini".to_string(),
             enabled: true,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
         };
 
         let json = serde_json::to_string(&config).unwrap();

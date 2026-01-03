@@ -23,7 +23,7 @@ use crate::api::AppState;
 use crate::embedding::{ProviderConfig, ProviderType};
 use crate::error::AppResult;
 use crate::llm::{LlmProviderConfig, LlmProviderType};
-use crate::repository::{LlmPromptConfig, UpdateLlmProviderInput};
+use crate::repository::UpdateLlmProviderInput;
 use crate::service::{LlmProviderInfo, ProviderInfo};
 
 // ============================================================================
@@ -153,16 +153,6 @@ pub struct LlmProviderInfoResponse {
     pub is_default: bool,
     /// Model name
     pub model: String,
-    /// Maximum input tokens
-    pub max_input_tokens: u32,
-    /// Maximum output tokens
-    pub max_output_tokens: u32,
-    /// Temperature for generation
-    pub temperature: f32,
-    /// Whether compression prompt is configured
-    pub has_compression_prompt: bool,
-    /// Whether classification prompt is configured
-    pub has_classification_prompt: bool,
 }
 
 impl From<LlmProviderInfo> for LlmProviderInfoResponse {
@@ -173,16 +163,15 @@ impl From<LlmProviderInfo> for LlmProviderInfoResponse {
             enabled: info.enabled,
             is_default: info.is_default,
             model: info.model,
-            max_input_tokens: info.max_input_tokens,
-            max_output_tokens: info.max_output_tokens,
-            temperature: info.temperature,
-            has_compression_prompt: info.has_compression_prompt,
-            has_classification_prompt: info.has_classification_prompt,
         }
     }
 }
 
 /// Request body for creating a new LLM provider
+///
+/// Only essential connection parameters are required.
+/// Processing parameters (temperature, max_tokens, prompts) are handled
+/// internally by the service layer with sensible defaults.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateLlmProviderRequest {
     /// Unique provider name
@@ -198,31 +187,6 @@ pub struct CreateLlmProviderRequest {
     /// Set as default provider
     #[serde(default)]
     pub is_default: bool,
-    /// Maximum input tokens (default: 4096)
-    #[serde(default = "default_max_input_tokens")]
-    pub max_input_tokens: u32,
-    /// Maximum output tokens (default: 1024)
-    #[serde(default = "default_max_output_tokens")]
-    pub max_output_tokens: u32,
-    /// Temperature for generation (default: 0.7)
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-    /// Compression prompt template
-    pub compression_prompt: Option<String>,
-    /// Classification prompt template
-    pub classification_prompt: Option<String>,
-}
-
-fn default_max_input_tokens() -> u32 {
-    4096
-}
-
-fn default_max_output_tokens() -> u32 {
-    1024
-}
-
-fn default_temperature() -> f32 {
-    0.7
 }
 
 /// Request body for updating an LLM provider
@@ -238,20 +202,6 @@ pub struct UpdateLlmProviderRequest {
     pub enabled: Option<bool>,
     /// Set as default provider
     pub is_default: Option<bool>,
-    /// Requests per minute limit
-    pub rpm_limit: Option<u32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<u32>,
-    /// Maximum input tokens
-    pub max_input_tokens: Option<u32>,
-    /// Maximum output tokens
-    pub max_output_tokens: Option<u32>,
-    /// Temperature for generation
-    pub temperature: Option<f32>,
-    /// Compression prompt template
-    pub compression_prompt: Option<String>,
-    /// Classification prompt template
-    pub classification_prompt: Option<String>,
 }
 
 // ============================================================================
@@ -444,25 +394,9 @@ pub async fn create_llm_provider(
         api_key: request.api_key,
         model: request.model,
         enabled: true,
-        max_input_tokens: request.max_input_tokens,
-        max_output_tokens: request.max_output_tokens,
-        temperature: request.temperature,
     };
 
-    let prompts = if request.compression_prompt.is_some() || request.classification_prompt.is_some()
-    {
-        Some(LlmPromptConfig {
-            compression_prompt: request.compression_prompt,
-            classification_prompt: request.classification_prompt,
-        })
-    } else {
-        None
-    };
-
-    let provider = state
-        .config_center
-        .create_llm_provider(config, prompts)
-        .await?;
+    let provider = state.config_center.create_llm_provider(config).await?;
 
     // Set as default if requested
     if is_default {
@@ -498,13 +432,6 @@ pub async fn update_llm_provider(
         api_key: request.api_key,
         model: request.model,
         enabled: request.enabled,
-        rpm_limit: request.rpm_limit,
-        tpm_limit: request.tpm_limit,
-        max_input_tokens: request.max_input_tokens,
-        max_output_tokens: request.max_output_tokens,
-        temperature: request.temperature,
-        compression_prompt: request.compression_prompt,
-        classification_prompt: request.classification_prompt,
     };
 
     let provider = state

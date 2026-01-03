@@ -139,6 +139,7 @@ CREATE TABLE embedding_providers (
 );
 
 -- LLM provider configuration table (for memory processing)
+-- Only stores essential connection parameters - processing parameters are internal
 CREATE TABLE llm_providers (
     name VARCHAR(100) PRIMARY KEY,
     provider_type provider_type NOT NULL,
@@ -147,12 +148,6 @@ CREATE TABLE llm_providers (
     model VARCHAR(200) NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT true,
     is_default BOOLEAN NOT NULL DEFAULT false,
-    -- Processing configuration
-    compression_prompt TEXT,
-    classification_prompt TEXT,
-    max_input_tokens INTEGER DEFAULT 4000,
-    max_output_tokens INTEGER DEFAULT 1000,
-    temperature REAL DEFAULT 0.3,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

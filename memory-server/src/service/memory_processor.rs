@@ -917,9 +917,6 @@ mod tests {
             api_key: None,
             model: "test".to_string(),
             enabled: true,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
         };
         let provider = Arc::new(LocalLlmProvider::new(config).unwrap());
         let processor = MemoryProcessor::new(provider);

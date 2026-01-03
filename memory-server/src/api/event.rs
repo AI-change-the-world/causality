@@ -35,6 +35,8 @@ pub struct CreateEventApiRequest {
     pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
     pub content: String,
+    /// LLM provider name to use for memory extraction (must be a configured provider)
+    pub llm_provider: String,
     /// Optional context to help LLM better understand the event
     #[serde(default)]
     pub context: Option<String>,
@@ -151,11 +153,47 @@ pub async fn create_event(
     State(state): State<AppState>,
     Json(request): Json<CreateEventApiRequest>,
 ) -> AppResult<(StatusCode, Json<CreateEventApiResponse>)> {
+    // Get the LLM provider config by name
+    let llm_config = state
+        .config_center
+        .get_cached_llm_provider(&request.llm_provider)
+        .await
+        .ok_or_else(|| crate::error::AppError::ProviderNotFound(request.llm_provider.clone()))?;
+
+    if !llm_config.enabled {
+        return Err(crate::error::AppError::ProviderDisabled(
+            request.llm_provider.clone(),
+        ));
+    }
+
+    // Create LLM provider instance based on type
+    let llm_provider: std::sync::Arc<dyn crate::llm::LlmProvider> = match llm_config.provider_type {
+        crate::llm::LlmProviderType::OpenAI | crate::llm::LlmProviderType::Azure => {
+            std::sync::Arc::new(crate::llm::OpenAILlmProvider::new(llm_config).map_err(|e| {
+                crate::error::AppError::Internal(format!(
+                    "Failed to create OpenAI LLM provider: {}",
+                    e
+                ))
+            })?)
+        }
+        crate::llm::LlmProviderType::Local => {
+            std::sync::Arc::new(crate::llm::LocalLlmProvider::new(llm_config).map_err(|e| {
+                crate::error::AppError::Internal(format!(
+                    "Failed to create local LLM provider: {}",
+                    e
+                ))
+            })?)
+        }
+    };
+
+    // Create MemoryProcessor with the LLM provider
+    let memory_processor = std::sync::Arc::new(crate::service::MemoryProcessor::new(llm_provider));
+
     let service_request: CreateFromEventRequest = request.into();
 
     let result = state
         .memory_guard
-        .create_from_event(service_request, None)
+        .create_from_event(service_request, Some(memory_processor), None)
         .await?;
 
     let response = CreateEventApiResponse {
@@ -243,6 +281,7 @@ mod tests {
         let api_request = CreateEventApiRequest {
             owner_id: "owner123".to_string(),
             content: "User clicked the dark mode button".to_string(),
+            llm_provider: "openai".to_string(),
             context: Some("Settings page".to_string()),
             scope_id: Some("user123".to_string()),
             source: Some("api".to_string()),
@@ -261,13 +300,15 @@ mod tests {
     fn test_create_event_request_defaults() {
         let json = r#"{
             "owner_id": "owner123",
-            "content": "Test event content"
+            "content": "Test event content",
+            "llm_provider": "my-llm"
         }"#;
 
         let api_request: CreateEventApiRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(api_request.owner_id, "owner123");
         assert_eq!(api_request.content, "Test event content");
+        assert_eq!(api_request.llm_provider, "my-llm");
         assert!(api_request.context.is_none());
         assert!(api_request.scope_id.is_none());
         assert!(api_request.source.is_none());

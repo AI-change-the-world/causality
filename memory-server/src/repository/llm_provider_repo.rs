@@ -1,7 +1,7 @@
 //! LLM Provider Repository implementation
 //!
 //! Provides CRUD operations for LLM provider configurations with PostgreSQL.
-//! Used for memory processing: compression, classification, and tag extraction.
+//! Only stores essential connection parameters - processing parameters are internal.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -26,7 +26,6 @@ impl LlmProviderRepository {
     pub async fn create_provider(
         &self,
         config: &LlmProviderConfig,
-        prompts: Option<&LlmPromptConfig>,
     ) -> AppResult<LlmProviderRecord> {
         debug!(
             provider_name = %config.name,
@@ -43,16 +42,12 @@ impl LlmProviderRepository {
             INSERT INTO llm_providers (
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, false, NOW(), NOW())
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             "#,
         )
@@ -62,11 +57,6 @@ impl LlmProviderRepository {
         .bind(&api_key_encrypted)
         .bind(&config.model)
         .bind(config.enabled)
-        .bind(prompts.and_then(|p| p.compression_prompt.as_ref()))
-        .bind(prompts.and_then(|p| p.classification_prompt.as_ref()))
-        .bind(config.max_input_tokens as i32)
-        .bind(config.max_output_tokens as i32)
-        .bind(config.temperature)
         .fetch_one(&self.pool)
         .await?;
 
@@ -81,8 +71,6 @@ impl LlmProviderRepository {
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             FROM llm_providers
             WHERE name = $1
@@ -103,8 +91,6 @@ impl LlmProviderRepository {
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             FROM llm_providers
             ORDER BY name
@@ -131,23 +117,6 @@ impl LlmProviderRepository {
         let endpoint = update.endpoint.as_ref().unwrap_or(&existing.endpoint);
         let model = update.model.as_ref().unwrap_or(&existing.model);
         let enabled = update.enabled.unwrap_or(existing.enabled);
-        let compression_prompt = update
-            .compression_prompt
-            .as_ref()
-            .or(existing.compression_prompt.as_ref());
-        let classification_prompt = update
-            .classification_prompt
-            .as_ref()
-            .or(existing.classification_prompt.as_ref());
-        let max_input_tokens = update
-            .max_input_tokens
-            .map(|v| v as i32)
-            .unwrap_or(existing.max_input_tokens);
-        let max_output_tokens = update
-            .max_output_tokens
-            .map(|v| v as i32)
-            .unwrap_or(existing.max_output_tokens);
-        let temperature = update.temperature.unwrap_or(existing.temperature);
 
         // Handle API key update
         let api_key_encrypted = if let Some(ref key) = update.api_key {
@@ -163,18 +132,11 @@ impl LlmProviderRepository {
                 api_key_encrypted = $3,
                 model = $4,
                 enabled = $5,
-                compression_prompt = $6,
-                classification_prompt = $7,
-                max_input_tokens = $8,
-                max_output_tokens = $9,
-                temperature = $10,
                 updated_at = NOW()
             WHERE name = $1
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             "#,
         )
@@ -183,11 +145,6 @@ impl LlmProviderRepository {
         .bind(&api_key_encrypted)
         .bind(model)
         .bind(enabled)
-        .bind(compression_prompt)
-        .bind(classification_prompt)
-        .bind(max_input_tokens)
-        .bind(max_output_tokens)
-        .bind(temperature)
         .fetch_one(&self.pool)
         .await?;
 
@@ -250,8 +207,6 @@ impl LlmProviderRepository {
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             "#,
         )
@@ -272,8 +227,6 @@ impl LlmProviderRepository {
             SELECT
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             FROM llm_providers
             WHERE is_default = true AND enabled = true
@@ -313,8 +266,6 @@ impl LlmProviderRepository {
             RETURNING
                 name, provider_type, endpoint, api_key_encrypted, model,
                 enabled, is_default,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
                 created_at, updated_at
             "#,
         )
@@ -340,45 +291,6 @@ impl LlmProviderRepository {
 
         Ok(count.0 > 0)
     }
-
-    /// Update prompt templates for a provider
-    pub async fn update_prompts(
-        &self,
-        name: &str,
-        compression_prompt: Option<String>,
-        classification_prompt: Option<String>,
-    ) -> AppResult<LlmProviderRecord> {
-        debug!(provider_name = %name, "Updating LLM provider prompts");
-
-        let existing = self.get_provider(name).await?;
-
-        let compression = compression_prompt.or(existing.compression_prompt);
-        let classification = classification_prompt.or(existing.classification_prompt);
-
-        let row = sqlx::query_as::<_, LlmProviderRow>(
-            r#"
-            UPDATE llm_providers
-            SET compression_prompt = $2,
-                classification_prompt = $3,
-                updated_at = NOW()
-            WHERE name = $1
-            RETURNING
-                name, provider_type, endpoint, api_key_encrypted, model,
-                enabled, is_default, rpm_limit, tpm_limit,
-                compression_prompt, classification_prompt,
-                max_input_tokens, max_output_tokens, temperature,
-                created_at, updated_at
-            "#,
-        )
-        .bind(name)
-        .bind(&compression)
-        .bind(&classification)
-        .fetch_one(&self.pool)
-        .await?;
-
-        info!(provider_name = %name, "LLM provider prompts updated");
-        Ok(row.into())
-    }
 }
 
 /// Input for updating an LLM provider
@@ -392,29 +304,6 @@ pub struct UpdateLlmProviderInput {
     pub model: Option<String>,
     /// Enable/disable the provider
     pub enabled: Option<bool>,
-    /// Requests per minute limit
-    pub rpm_limit: Option<u32>,
-    /// Tokens per minute limit
-    pub tpm_limit: Option<u32>,
-    /// Compression prompt template
-    pub compression_prompt: Option<String>,
-    /// Classification prompt template
-    pub classification_prompt: Option<String>,
-    /// Maximum input tokens
-    pub max_input_tokens: Option<u32>,
-    /// Maximum output tokens
-    pub max_output_tokens: Option<u32>,
-    /// Temperature for generation
-    pub temperature: Option<f32>,
-}
-
-/// Prompt configuration for LLM processing
-#[derive(Debug, Clone, Default)]
-pub struct LlmPromptConfig {
-    /// Prompt template for memory compression
-    pub compression_prompt: Option<String>,
-    /// Prompt template for memory classification
-    pub classification_prompt: Option<String>,
 }
 
 /// LLM provider record from database
@@ -434,16 +323,6 @@ pub struct LlmProviderRecord {
     pub enabled: bool,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Compression prompt template
-    pub compression_prompt: Option<String>,
-    /// Classification prompt template
-    pub classification_prompt: Option<String>,
-    /// Maximum input tokens
-    pub max_input_tokens: i32,
-    /// Maximum output tokens
-    pub max_output_tokens: i32,
-    /// Temperature for generation
-    pub temperature: f32,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
@@ -465,17 +344,6 @@ impl LlmProviderRecord {
             api_key,
             model: self.model.clone(),
             enabled: self.enabled,
-            max_input_tokens: self.max_input_tokens as u32,
-            max_output_tokens: self.max_output_tokens as u32,
-            temperature: self.temperature,
-        }
-    }
-
-    /// Get prompt configuration
-    pub fn get_prompt_config(&self) -> LlmPromptConfig {
-        LlmPromptConfig {
-            compression_prompt: self.compression_prompt.clone(),
-            classification_prompt: self.classification_prompt.clone(),
         }
     }
 }
@@ -490,11 +358,6 @@ struct LlmProviderRow {
     model: String,
     enabled: bool,
     is_default: bool,
-    compression_prompt: Option<String>,
-    classification_prompt: Option<String>,
-    max_input_tokens: i32,
-    max_output_tokens: i32,
-    temperature: f32,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -509,11 +372,6 @@ impl From<LlmProviderRow> for LlmProviderRecord {
             model: row.model,
             enabled: row.enabled,
             is_default: row.is_default,
-            compression_prompt: row.compression_prompt,
-            classification_prompt: row.classification_prompt,
-            max_input_tokens: row.max_input_tokens,
-            max_output_tokens: row.max_output_tokens,
-            temperature: row.temperature,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -534,11 +392,6 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             enabled: true,
             is_default: true,
-            compression_prompt: Some("Compress this: {content}".to_string()),
-            classification_prompt: Some("Classify this: {content}".to_string()),
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -551,9 +404,6 @@ mod tests {
         assert_eq!(config.api_key, Some("sk-test".to_string()));
         assert_eq!(config.model, "gpt-4o-mini");
         assert!(config.enabled);
-        assert_eq!(config.max_input_tokens, 4000);
-        assert_eq!(config.max_output_tokens, 1000);
-        assert!((config.temperature - 0.3).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -566,11 +416,6 @@ mod tests {
             model: "llama2".to_string(),
             enabled: true,
             is_default: false,
-            compression_prompt: None,
-            classification_prompt: None,
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -583,37 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_provider_record_get_prompt_config() {
-        let record = LlmProviderRecord {
-            name: "test-llm".to_string(),
-            provider_type: LlmProviderType::OpenAI,
-            endpoint: "https://api.openai.com/v1".to_string(),
-            api_key_encrypted: None,
-            model: "gpt-4o-mini".to_string(),
-            enabled: true,
-            is_default: false,
-            compression_prompt: Some("Compress: {content}".to_string()),
-            classification_prompt: Some("Classify: {content}".to_string()),
-            max_input_tokens: 4000,
-            max_output_tokens: 1000,
-            temperature: 0.3,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        let prompts = record.get_prompt_config();
-
-        assert_eq!(
-            prompts.compression_prompt,
-            Some("Compress: {content}".to_string())
-        );
-        assert_eq!(
-            prompts.classification_prompt,
-            Some("Classify: {content}".to_string())
-        );
-    }
-
-    #[test]
     fn test_update_llm_provider_input_default() {
         let input = UpdateLlmProviderInput::default();
 
@@ -621,20 +435,5 @@ mod tests {
         assert!(input.api_key.is_none());
         assert!(input.model.is_none());
         assert!(input.enabled.is_none());
-        assert!(input.rpm_limit.is_none());
-        assert!(input.tpm_limit.is_none());
-        assert!(input.compression_prompt.is_none());
-        assert!(input.classification_prompt.is_none());
-        assert!(input.max_input_tokens.is_none());
-        assert!(input.max_output_tokens.is_none());
-        assert!(input.temperature.is_none());
-    }
-
-    #[test]
-    fn test_llm_prompt_config_default() {
-        let config = LlmPromptConfig::default();
-
-        assert!(config.compression_prompt.is_none());
-        assert!(config.classification_prompt.is_none());
     }
 }
