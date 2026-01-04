@@ -195,6 +195,52 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
         }
     }
 
+    /// Reconcile an extracted memory with existing matches using a dynamic LLM provider
+    ///
+    /// This method allows passing an LLM provider at runtime for consistency checking,
+    /// which is useful when the LLM provider is determined by the request context.
+    #[instrument(skip(self, event, extracted, matches, llm_provider), fields(event_id = %event.id))]
+    pub async fn reconcile_with_llm(
+        &self,
+        event: &Event,
+        extracted: &ExtractedMemory,
+        matches: Vec<MatchResult>,
+        llm_provider: std::sync::Arc<dyn crate::llm::LlmProvider>,
+    ) -> AppResult<ReconcileOutcome> {
+        // Case A: No matches - create new memory
+        if matches.is_empty() {
+            debug!("No matches found, creating new memory");
+            return self.create_new(event, extracted).await;
+        }
+
+        // Get the best match (highest similarity)
+        let best_match = &matches[0];
+        debug!(
+            memory_id = %best_match.memory.id,
+            similarity = best_match.similarity_score,
+            "Found best match, checking consistency with LLM"
+        );
+
+        // Use LLM to check semantic consistency
+        let llm_checker = LlmConsistencyChecker::new(llm_provider);
+        let consistency = llm_checker
+            .check_consistency(&best_match.memory.content, &extracted.content)
+            .await?;
+
+        match consistency {
+            // Case B: Consistent - reinforce existing memory
+            ConsistencyResult::Consistent => {
+                debug!("Content is consistent (LLM), reinforcing memory");
+                self.reinforce(event, &best_match.memory).await
+            }
+            // Case C: Conflicting - create new version (supersede)
+            ConsistencyResult::Conflicting => {
+                debug!("Content conflicts (LLM), creating new version");
+                self.supersede(event, extracted, &best_match.memory).await
+            }
+        }
+    }
+
     /// Create a new memory (no match found)
     async fn create_new(
         &self,
@@ -351,6 +397,74 @@ impl ConsistencyChecker for AlwaysConflictingChecker {
         _new_content: &str,
     ) -> AppResult<ConsistencyResult> {
         Ok(ConsistencyResult::Conflicting)
+    }
+}
+
+/// LLM-based consistency checker
+/// Uses LLM to determine if two pieces of content are semantically consistent or conflicting
+pub struct LlmConsistencyChecker {
+    llm_provider: std::sync::Arc<dyn crate::llm::LlmProvider>,
+}
+
+impl LlmConsistencyChecker {
+    /// Create a new LLM-based consistency checker
+    pub fn new(llm_provider: std::sync::Arc<dyn crate::llm::LlmProvider>) -> Self {
+        Self { llm_provider }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConsistencyChecker for LlmConsistencyChecker {
+    async fn check_consistency(
+        &self,
+        existing_content: &str,
+        new_content: &str,
+    ) -> AppResult<ConsistencyResult> {
+        use crate::llm::ChatRequest;
+
+        let prompt = format!(
+            r#"You are analyzing two pieces of information to determine if they are consistent or conflicting.
+
+EXISTING MEMORY:
+{}
+
+NEW INFORMATION:
+{}
+
+Analyze whether the new information:
+1. CONSISTENT: Supports, reinforces, or is compatible with the existing memory
+2. CONFLICTING: Contradicts, opposes, or updates/changes the existing memory
+
+Consider:
+- If the new information expresses an opposite opinion or preference, it's CONFLICTING
+- If the new information updates or changes a previous stance, it's CONFLICTING
+- If the new information adds detail without contradiction, it's CONSISTENT
+- If the new information reinforces the same viewpoint, it's CONSISTENT
+
+Respond with ONLY one word: "CONSISTENT" or "CONFLICTING""#,
+            existing_content, new_content
+        );
+
+        let request = ChatRequest::new(prompt);
+
+        let response = self.llm_provider.chat(request).await.map_err(|e| {
+            crate::error::AppError::Internal(format!("LLM consistency check failed: {}", e))
+        })?;
+
+        let result = response.content.trim().to_uppercase();
+
+        tracing::debug!(
+            existing = %existing_content,
+            new = %new_content,
+            result = %result,
+            "LLM consistency check result"
+        );
+
+        if result.contains("CONFLICTING") {
+            Ok(ConsistencyResult::Conflicting)
+        } else {
+            Ok(ConsistencyResult::Consistent)
+        }
     }
 }
 

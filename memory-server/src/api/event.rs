@@ -233,9 +233,7 @@ pub async fn create_event_async(
         .event_repo()
         .create(&event)
         .await
-        .map_err(|e| {
-            crate::error::AppError::Internal(format!("Failed to create event: {}", e))
-        })?;
+        .map_err(|e| crate::error::AppError::Internal(format!("Failed to create event: {}", e)))?;
 
     // Clone what we need for the background task
     let state_clone = state.clone();
@@ -266,7 +264,10 @@ pub async fn create_event_async(
     let response = CreateEventAsyncResponse {
         event_id,
         status: "pending".to_string(),
-        message: format!("Event created. Check status at GET /api/v1/events/{}", event_id),
+        message: format!(
+            "Event created. Check status at GET /api/v1/events/{}",
+            event_id
+        ),
     };
 
     Ok((StatusCode::ACCEPTED, Json(response)))
@@ -307,7 +308,7 @@ async fn process_event_background(
         }
     };
 
-    let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider));
+    let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
 
     // Create embedding provider
     let embedding_config = state
@@ -391,6 +392,7 @@ async fn process_event_background(
     // Build context and process
     let context = EventProcessingContext {
         memory_processor,
+        llm_provider,
         embedding_provider,
         embedding_provider_name: request.embedding_provider.clone(),
         qdrant_repo,
@@ -436,7 +438,7 @@ pub async fn create_event(
         embedding_provider = %request.embedding_provider,
         "create_event: starting request"
     );
-    
+
     // Get the LLM provider config by name
     debug!("create_event: getting LLM provider config from cache");
     let llm_config = state
@@ -474,8 +476,8 @@ pub async fn create_event(
 
     debug!("create_event: LLM provider instance created");
 
-    // Create MemoryProcessor with the LLM provider
-    let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider));
+    // Create MemoryProcessor with a clone of the LLM provider (we need llm_provider for context too)
+    let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
     debug!("create_event: MemoryProcessor created");
 
     // Get the embedding provider config (for new memories)
@@ -601,8 +603,10 @@ pub async fn create_event(
 
     // Build EventProcessingContext
     debug!("create_event: building EventProcessingContext");
+
     let context = EventProcessingContext {
         memory_processor,
+        llm_provider,
         embedding_provider,
         embedding_provider_name: request.embedding_provider.clone(),
         qdrant_repo,

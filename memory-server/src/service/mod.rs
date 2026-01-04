@@ -32,7 +32,7 @@ pub use memory_processor::{
 };
 pub use memory_reconciler::{
     AlwaysConflictingChecker, AlwaysConsistentChecker, ConsistencyChecker, ConsistencyResult,
-    ExtractedMemory, MemoryReconciler, ReconcileOutcome, ReconcilerConfig,
+    ExtractedMemory, LlmConsistencyChecker, MemoryReconciler, ReconcileOutcome, ReconcilerConfig,
 };
 pub use retrieval_engine::{
     CategoryQuery, MemoryEvidence, MemoryHistory, RetrievalEngine, RetrieveRequest,

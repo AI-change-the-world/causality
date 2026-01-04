@@ -56,6 +56,8 @@ pub struct ProcessEventResult {
 pub struct EventProcessingContext {
     /// Memory processor for LLM-driven extraction
     pub memory_processor: Arc<MemoryProcessor>,
+    /// LLM provider for consistency checking
+    pub llm_provider: Arc<dyn crate::llm::LlmProvider>,
     /// Embedding provider for new memories (from request)
     pub embedding_provider: Arc<dyn EmbeddingProvider>,
     /// Name of the embedding provider for new memories
@@ -488,8 +490,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                 // Filter memories that match our criteria
                 for memory in memories {
                     if let Some(&score) = score_map.get(&memory.id) {
-                        // Check similarity threshold (0.85)
-                        if score >= 0.85
+                        // Check similarity threshold (0.70 - lower to catch related but potentially conflicting content)
+                        if score >= 0.70
                             && memory.is_current_version
                             && memory.status == crate::domain::Status::Active
                         {
@@ -510,9 +512,15 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             });
 
             // Reconcile: decide whether to create, reinforce, or supersede
+            // Use LLM-based consistency checking with the context's LLM provider
             let outcome = self
                 .memory_reconciler
-                .reconcile(event, &extracted_memory, all_matches)
+                .reconcile_with_llm(
+                    event,
+                    &extracted_memory,
+                    all_matches,
+                    context.llm_provider.clone(),
+                )
                 .await?;
 
             // Track the outcome
