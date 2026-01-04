@@ -315,8 +315,16 @@ pub async fn create_memory(
             .await
         {
             Ok(provider_name) => {
-                memory.embedding_status = EmbeddingStatus::Completed;
-                memory.embedding_provider = Some(provider_name);
+                // Update embedding status in database
+                memory = state
+                    .memory_guard
+                    .memory_repo()
+                    .update_embedding_status_and_provider(
+                        memory.id,
+                        EmbeddingStatus::Completed,
+                        Some(&provider_name),
+                    )
+                    .await?;
             }
             Err(e) => {
                 tracing::warn!(
@@ -324,7 +332,12 @@ pub async fn create_memory(
                     error = %e,
                     "Failed to generate embedding, memory created without vector"
                 );
-                memory.embedding_status = EmbeddingStatus::Failed;
+                // Update embedding status to failed in database
+                memory = state
+                    .memory_guard
+                    .memory_repo()
+                    .update_embedding_status_and_provider(memory.id, EmbeddingStatus::Failed, None)
+                    .await?;
             }
         }
     }

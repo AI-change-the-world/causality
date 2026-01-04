@@ -555,9 +555,15 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         )
                         .await?;
 
-                    // Update memory with embedding info
-                    // Note: This would require a new repo method to update embedding_provider and embedding_status
-                    // For now, we'll just track the created memory
+                    // Update memory with embedding status and provider in database
+                    memory = self
+                        .memory_repo
+                        .update_embedding_status_and_provider(
+                            memory.id,
+                            crate::domain::EmbeddingStatus::Completed,
+                            Some(&context.embedding_provider_name),
+                        )
+                        .await?;
 
                     debug!(
                         memory_id = %memory.id,
@@ -657,6 +663,16 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                             new_memory.id,
                             embedding_response.embedding,
                             payload,
+                        )
+                        .await?;
+
+                    // Update new memory with embedding status and provider in database
+                    let _updated_memory = self
+                        .memory_repo
+                        .update_embedding_status_and_provider(
+                            new_memory.id,
+                            crate::domain::EmbeddingStatus::Completed,
+                            Some(provider_name),
                         )
                         .await?;
 

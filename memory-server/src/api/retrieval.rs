@@ -30,10 +30,6 @@ pub struct RetrieveApiRequest {
     pub owner_id: String,
     /// Filter by scope ID (when provided, also includes global memories)
     pub scope_id: Option<String>,
-    /// Filter by category prefix (e.g., "work.code" matches "work.code.eslint")
-    pub category_prefix: Option<String>,
-    /// Filter by tags (extracted keywords)
-    pub tags: Option<Vec<String>>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
     /// Minimum score threshold
@@ -54,9 +50,6 @@ pub struct RetrieveApiRequest {
     /// Whether to include version history for each memory
     #[serde(default)]
     pub include_history: Option<bool>,
-    /// Whether to enhance the query with semantic synonyms (default: false)
-    #[serde(default)]
-    pub enhance_query: bool,
 }
 
 impl From<RetrieveApiRequest> for RetrieveRequest {
@@ -65,8 +58,8 @@ impl From<RetrieveApiRequest> for RetrieveRequest {
             query: req.query,
             owner_id: req.owner_id,
             scope_id: req.scope_id,
-            category_prefix: req.category_prefix,
-            tags: req.tags,
+            category_prefix: None,
+            tags: None,
             top_k: req.top_k,
             min_score: req.min_score,
             min_confidence: req.min_confidence,
@@ -206,8 +199,6 @@ pub struct AutoRetrieveApiRequest {
     pub context: Option<String>,
     /// Filter by scope ID
     pub scope_id: Option<String>,
-    /// Filter by category prefix
-    pub category_prefix: Option<String>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
     /// Minimum score threshold
@@ -256,14 +247,12 @@ pub fn retrieval_routes() -> Router<AppState> {
 /// POST /api/v1/memories/retrieve - Retrieve memories
 ///
 /// Retrieves memories based on query and filters:
-/// 1. Applies structured filters (owner_id, scope_id + is_global, category_prefix)
-/// 2. Default: is_current_version = true, status NOT IN ('superseded', 'archived')
-/// 3. Optionally enhances query with semantic synonyms (if enhance_query=true)
-/// 4. Performs vector similarity search
-/// 5. Computes composite scores
-/// 6. Returns top-K results sorted by score
-/// 7. Updates hit counts for returned memories
-/// 8. Optionally loads evidence and history
+/// 1. For memories with embedding_provider: vector search + fulltext search
+/// 2. For memories without embedding_provider: fulltext search only
+/// 3. Merges results and computes composite scores
+/// 4. Returns top-K results sorted by score
+/// 5. Updates hit counts for returned memories
+/// 6. Optionally loads evidence and history
 #[utoipa::path(
     post,
     path = "/api/v1/memories/retrieve",
@@ -279,21 +268,153 @@ pub async fn retrieve_memories(
     State(state): State<AppState>,
     Json(request): Json<RetrieveApiRequest>,
 ) -> AppResult<Json<RetrieveApiResponse>> {
-    let enhance_query = request.enhance_query;
-    let retrieve_request: RetrieveRequest = request.into();
-
-    // Use retrieve_with_enhancement if enhance_query is true, otherwise use regular retrieve
-    let result = if enhance_query {
-        state
-            .memory_guard
-            .retrieve_with_enhancement(retrieve_request, true, None, None)
-            .await?
-    } else {
-        state
-            .retrieval_engine
-            .retrieve(retrieve_request, None, None)
-            .await?
+    use crate::embedding::{
+        EmbeddingProvider, EmbeddingRequest, LocalProvider, OpenAIProvider, ProviderType,
     };
+    use std::sync::Arc;
+    use tracing::{debug, warn};
+
+    debug!(
+        query = %request.query,
+        owner_id = %request.owner_id,
+        scope_id = ?request.scope_id,
+        "retrieve_memories: starting request"
+    );
+
+    let include_global = request.scope_id.is_some();
+    let top_k = request.top_k.unwrap_or(10);
+    let use_vector = request.use_vector.unwrap_or(true);
+    let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
+
+    // Step 1: Try vector search if enabled
+    if use_vector {
+        // Query memories grouped by embedding_provider (only those with embeddings)
+        let memories_by_provider = state
+            .memory_guard
+            .memory_repo()
+            .find_by_owner_scope_grouped_by_provider(
+                &request.owner_id,
+                request.scope_id.as_deref(),
+                include_global,
+            )
+            .await?;
+
+        debug!(
+            provider_count = memories_by_provider.len(),
+            "retrieve_memories: found memories with embeddings grouped by provider"
+        );
+
+        // Get Qdrant repository for vector search
+        if let Some(qdrant_repo) = state.config_center.qdrant_repo() {
+            // For each provider, generate query embedding and search
+            for provider_name in memories_by_provider.keys() {
+                // Get provider config
+                let provider_config = match state
+                    .config_center
+                    .get_cached_provider(provider_name)
+                    .await
+                {
+                    Some(config) if config.enabled => config,
+                    Some(_) => {
+                        warn!(provider = %provider_name, "Embedding provider is disabled, skipping");
+                        continue;
+                    }
+                    None => {
+                        warn!(provider = %provider_name, "Embedding provider not found, skipping");
+                        continue;
+                    }
+                };
+
+                // Create embedding provider instance
+                let embedding_provider: Arc<dyn EmbeddingProvider> = match provider_config
+                    .provider_type
+                {
+                    ProviderType::OpenAI | ProviderType::Azure => {
+                        match OpenAIProvider::new(provider_config.clone()) {
+                            Ok(p) => Arc::new(p),
+                            Err(e) => {
+                                warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
+                                continue;
+                            }
+                        }
+                    }
+                    ProviderType::Local => match LocalProvider::new(provider_config.clone()) {
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
+                            continue;
+                        }
+                    },
+                };
+
+                // Generate query embedding for this provider
+                let embedding_request = EmbeddingRequest::new(&request.query);
+                let query_embedding = match embedding_provider.embed(embedding_request).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!(provider = %provider_name, error = %e, "Failed to generate query embedding, skipping");
+                        continue;
+                    }
+                };
+
+                // Search in this provider's Qdrant collection
+                let search_results = match qdrant_repo
+                    .search(
+                        provider_name,
+                        query_embedding.embedding,
+                        top_k * 2, // Get more candidates for filtering
+                        None,
+                    )
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        warn!(provider = %provider_name, error = %e, "Vector search failed, skipping");
+                        continue;
+                    }
+                };
+
+                debug!(
+                    provider = %provider_name,
+                    results = search_results.len(),
+                    "retrieve_memories: vector search completed for provider"
+                );
+
+                // Add results to combined list
+                for result in search_results {
+                    all_similarities.push((result.memory_id, result.score));
+                }
+            }
+        }
+    }
+
+    debug!(
+        total_similarities = all_similarities.len(),
+        "retrieve_memories: combined all vector search results"
+    );
+
+    let mut retrieve_request: RetrieveRequest = request.into();
+
+    // If no vector results, disable vector search in the request
+    let has_vector_results = !all_similarities.is_empty();
+    if !has_vector_results {
+        retrieve_request.use_vector = Some(false);
+    }
+
+    // Step 2: Use retrieval engine with the combined similarity results
+    // This will also do fulltext search for ALL memories (including those without embeddings)
+    let result = state
+        .retrieval_engine
+        .retrieve(
+            retrieve_request,
+            if has_vector_results {
+                Some(all_similarities)
+            } else {
+                None
+            },
+            None,
+        )
+        .await?;
 
     let memories: Vec<RetrievedMemoryResponse> = result
         .memories
@@ -332,9 +453,9 @@ pub async fn retrieve_memories(
 /// POST /api/v1/memories/retrieve/auto - Auto retrieve with query parsing
 ///
 /// Automatically retrieves memories by:
-/// 1. Parsing user query through LLM to understand intent
-/// 2. Performing hybrid search (vector + fulltext)
-/// 3. Returning formatted markdown output
+/// 1. For memories with embedding_provider: vector search + fulltext search
+/// 2. For memories without embedding_provider: fulltext search only
+/// 3. Merges results and returns formatted markdown output
 #[utoipa::path(
     post,
     path = "/api/v1/memories/retrieve/auto",
@@ -350,28 +471,137 @@ pub async fn auto_retrieve_memories(
     State(state): State<AppState>,
     Json(request): Json<AutoRetrieveApiRequest>,
 ) -> AppResult<Json<AutoRetrieveApiResponse>> {
-    // Build retrieve request with query enhancement enabled
+    use crate::embedding::{
+        EmbeddingProvider, EmbeddingRequest, LocalProvider, OpenAIProvider, ProviderType,
+    };
+    use std::sync::Arc;
+    use tracing::{debug, warn};
+
+    debug!(
+        query = %request.query,
+        owner_id = %request.owner_id,
+        scope_id = ?request.scope_id,
+        "auto_retrieve_memories: starting request"
+    );
+
+    let include_global = request.scope_id.is_some();
+    let top_k = request.top_k.unwrap_or(10);
+    let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
+
+    // Step 1: Try vector search for memories with embeddings
+    let memories_by_provider = state
+        .memory_guard
+        .memory_repo()
+        .find_by_owner_scope_grouped_by_provider(
+            &request.owner_id,
+            request.scope_id.as_deref(),
+            include_global,
+        )
+        .await?;
+
+    debug!(
+        provider_count = memories_by_provider.len(),
+        "auto_retrieve_memories: found memories with embeddings grouped by provider"
+    );
+
+    if let Some(qdrant_repo) = state.config_center.qdrant_repo() {
+        for provider_name in memories_by_provider.keys() {
+            let provider_config = match state.config_center.get_cached_provider(provider_name).await
+            {
+                Some(config) if config.enabled => config,
+                Some(_) => {
+                    warn!(provider = %provider_name, "Embedding provider is disabled, skipping");
+                    continue;
+                }
+                None => {
+                    warn!(provider = %provider_name, "Embedding provider not found, skipping");
+                    continue;
+                }
+            };
+
+            let embedding_provider: Arc<dyn EmbeddingProvider> = match provider_config.provider_type
+            {
+                ProviderType::OpenAI | ProviderType::Azure => {
+                    match OpenAIProvider::new(provider_config.clone()) {
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
+                            continue;
+                        }
+                    }
+                }
+                ProviderType::Local => match LocalProvider::new(provider_config.clone()) {
+                    Ok(p) => Arc::new(p),
+                    Err(e) => {
+                        warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
+                        continue;
+                    }
+                },
+            };
+
+            let embedding_request = EmbeddingRequest::new(&request.query);
+            let query_embedding = match embedding_provider.embed(embedding_request).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    warn!(provider = %provider_name, error = %e, "Failed to generate query embedding, skipping");
+                    continue;
+                }
+            };
+
+            let search_results = match qdrant_repo
+                .search(provider_name, query_embedding.embedding, top_k * 2, None)
+                .await
+            {
+                Ok(results) => results,
+                Err(e) => {
+                    warn!(provider = %provider_name, error = %e, "Vector search failed, skipping");
+                    continue;
+                }
+            };
+
+            debug!(
+                provider = %provider_name,
+                results = search_results.len(),
+                "auto_retrieve_memories: vector search completed for provider"
+            );
+
+            for result in search_results {
+                all_similarities.push((result.memory_id, result.score));
+            }
+        }
+    }
+
+    // Build retrieve request - use_vector depends on whether we have vector results
+    let has_vector_results = !all_similarities.is_empty();
     let retrieve_request = RetrieveRequest {
         query: request.query.clone(),
         owner_id: request.owner_id.clone(),
         scope_id: request.scope_id,
-        category_prefix: request.category_prefix,
+        category_prefix: None,
         tags: None,
         top_k: request.top_k,
         min_score: request.min_score,
         min_confidence: None,
         use_fulltext: Some(true),
-        use_vector: Some(true),
+        use_vector: Some(has_vector_results),
         fulltext_weight: None,
         highlight: Some(true),
         include_evidence: None,
         include_history: None,
     };
 
-    // Use retrieve_with_enhancement for better query understanding
+    // Use retrieval engine with the combined similarity results
     let result = state
-        .memory_guard
-        .retrieve_with_enhancement(retrieve_request, true, None, None)
+        .retrieval_engine
+        .retrieve(
+            retrieve_request,
+            if has_vector_results {
+                Some(all_similarities)
+            } else {
+                None
+            },
+            None,
+        )
         .await?;
 
     // Convert to formatted records
@@ -451,8 +681,6 @@ mod tests {
             query: "test query".to_string(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
-            category_prefix: Some("work.code".to_string()),
-            tags: Some(vec!["important".to_string(), "work".to_string()]),
             top_k: Some(20),
             min_score: Some(0.5),
             min_confidence: Some(0.7),
@@ -462,7 +690,6 @@ mod tests {
             highlight: Some(true),
             include_evidence: Some(true),
             include_history: Some(false),
-            enhance_query: false,
         };
 
         let retrieve_request: RetrieveRequest = api_request.clone().into();
@@ -470,11 +697,9 @@ mod tests {
         assert_eq!(retrieve_request.query, api_request.query);
         assert_eq!(retrieve_request.owner_id, api_request.owner_id);
         assert_eq!(retrieve_request.scope_id, api_request.scope_id);
-        assert_eq!(
-            retrieve_request.category_prefix,
-            api_request.category_prefix
-        );
-        assert_eq!(retrieve_request.tags, api_request.tags);
+        // category_prefix and tags are set to None in conversion (internal use only)
+        assert!(retrieve_request.category_prefix.is_none());
+        assert!(retrieve_request.tags.is_none());
         assert_eq!(retrieve_request.top_k, api_request.top_k);
         assert_eq!(retrieve_request.min_score, api_request.min_score);
         assert_eq!(retrieve_request.min_confidence, api_request.min_confidence);
@@ -501,8 +726,6 @@ mod tests {
             query: "simple query".to_string(),
             owner_id: "owner123".to_string(),
             scope_id: None,
-            category_prefix: None,
-            tags: None,
             top_k: None,
             min_score: None,
             min_confidence: None,
@@ -512,7 +735,6 @@ mod tests {
             highlight: None,
             include_evidence: None,
             include_history: None,
-            enhance_query: false,
         };
 
         let retrieve_request: RetrieveRequest = api_request.into();
@@ -534,26 +756,15 @@ mod tests {
     }
 
     #[test]
-    fn test_retrieve_request_with_enhance_query() {
-        let json = r#"{
-            "query": "test query",
-            "owner_id": "owner123",
-            "enhance_query": true
-        }"#;
-
-        let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
-        assert!(api_request.enhance_query);
-    }
-
-    #[test]
-    fn test_retrieve_request_enhance_query_default() {
+    fn test_retrieve_request_parsing() {
         let json = r#"{
             "query": "test query",
             "owner_id": "owner123"
         }"#;
 
         let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
-        assert!(!api_request.enhance_query); // Default is false
+        assert_eq!(api_request.query, "test query");
+        assert_eq!(api_request.owner_id, "owner123");
     }
 
     #[test]
@@ -562,7 +773,6 @@ mod tests {
             "query": "用户喜欢什么颜色",
             "owner_id": "owner123",
             "scope_id": "user123",
-            "category_prefix": "preference",
             "top_k": 5
         }"#;
 
@@ -570,7 +780,6 @@ mod tests {
         assert_eq!(api_request.query, "用户喜欢什么颜色");
         assert_eq!(api_request.owner_id, "owner123");
         assert_eq!(api_request.scope_id, Some("user123".to_string()));
-        assert_eq!(api_request.category_prefix, Some("preference".to_string()));
         assert_eq!(api_request.top_k, Some(5));
         assert!(api_request.context.is_none());
     }
@@ -586,7 +795,6 @@ mod tests {
         assert_eq!(api_request.query, "test query");
         assert_eq!(api_request.owner_id, "owner456");
         assert!(api_request.scope_id.is_none());
-        assert!(api_request.category_prefix.is_none());
         assert!(api_request.top_k.is_none());
         assert!(api_request.min_score.is_none());
     }

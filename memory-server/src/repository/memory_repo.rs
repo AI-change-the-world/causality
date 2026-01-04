@@ -242,6 +242,32 @@ impl MemoryRepository {
         Ok(row.into())
     }
 
+    /// Update the embedding status and provider of a memory
+    pub async fn update_embedding_status_and_provider(
+        &self,
+        id: Uuid,
+        embedding_status: EmbeddingStatus,
+        embedding_provider: Option<&str>,
+    ) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                UPDATE memories
+                SET embedding_status = $2, embedding_provider = $3, updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .bind(&embedding_status)
+        .bind(embedding_provider)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
+    }
+
     /// Mark a memory as superseded by a new version
     pub async fn update_superseded(&self, id: Uuid, superseded_by_id: Uuid) -> AppResult<Memory> {
         let row = sqlx::query_as::<_, MemoryRow>(&format!(
@@ -318,6 +344,10 @@ impl MemoryRepository {
     }
 
     /// Find memories with structured filters for retrieval
+    ///
+    /// Scope logic:
+    /// - If scope_id is NULL: returns all memories for this owner (no scope filter)
+    /// - If scope_id is provided: returns matching scope_id OR global (if include_global is true)
     pub async fn find_for_retrieval(
         &self,
         owner_id: &str,
@@ -334,7 +364,7 @@ impl MemoryRepository {
                   AND is_current_version = true
                   AND status NOT IN ('superseded', 'archived')
                   AND (
-                    ($2::text IS NULL AND is_global = true)
+                    $2::text IS NULL
                     OR scope_id = $2
                     OR ($3 = true AND is_global = true)
                   )
@@ -822,7 +852,10 @@ impl MemoryRepository {
     /// Returns memories that are:
     /// - Current version
     /// - Not superseded or archived
-    /// - Matching the owner_id and scope_id (or global if include_global is true)
+    /// - Have completed embedding
+    /// - Matching the owner_id
+    /// - If scope_id is provided: matching scope_id OR global (if include_global is true)
+    /// - If scope_id is NULL: all memories for this owner (no scope filter)
     pub async fn find_by_owner_scope_grouped_by_provider(
         &self,
         owner_id: &str,
@@ -839,7 +872,7 @@ impl MemoryRepository {
                   AND embedding_status = 'completed'
                   AND embedding_provider IS NOT NULL
                   AND (
-                    ($2::text IS NULL AND is_global = true)
+                    $2::text IS NULL
                     OR scope_id = $2
                     OR ($3 = true AND is_global = true)
                   )
