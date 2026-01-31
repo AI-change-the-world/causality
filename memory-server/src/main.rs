@@ -12,13 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::header::HeaderName;
-use memory_server::api::{create_router, health::init_start_time, AppState};
-use memory_server::config::AppConfig;
-use memory_server::repository::{
+use causality::api::{create_router, health::init_start_time, AppState};
+use causality::config::AppConfig;
+use causality::repository::{
     AuditRepository, ConfigRepository, EventRepository, LlmProviderRepository, MemoryRepository,
-    QdrantRepository,
+    ProfileRepository, QdrantRepository,
 };
-use memory_server::service::{ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine};
+use causality::service::{
+    ConfigCenter, LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine,
+};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -135,12 +137,74 @@ async fn main() -> anyhow::Result<()> {
         config.audit.enabled,
     );
 
+    // Create ProfileService with default LLM provider
+    let profile_repo = ProfileRepository::new(pool.clone());
+    let profile_service = {
+        // Try to get the default LLM provider
+        let llm_provider: Arc<dyn causality::llm::LlmProvider> = match config_center
+            .get_default_llm_provider_name()
+            .await
+        {
+            Ok(Some(name)) => {
+                if let Some(llm_config) = config_center.get_cached_llm_provider(&name).await {
+                    match llm_config.provider_type {
+                        causality::llm::LlmProviderType::OpenAI
+                        | causality::llm::LlmProviderType::Azure => {
+                            Arc::new(causality::llm::OpenAILlmProvider::new(llm_config).map_err(
+                                |e| anyhow::anyhow!("Failed to create LLM provider: {}", e),
+                            )?)
+                        }
+                        causality::llm::LlmProviderType::Local => {
+                            Arc::new(causality::llm::LocalLlmProvider::new(llm_config).map_err(
+                                |e| anyhow::anyhow!("Failed to create LLM provider: {}", e),
+                            )?)
+                        }
+                    }
+                } else {
+                    warn!("Default LLM provider not found in cache, using placeholder");
+                    Arc::new(
+                        causality::llm::LocalLlmProvider::new(causality::llm::LlmProviderConfig {
+                            name: "placeholder".to_string(),
+                            provider_type: causality::llm::LlmProviderType::Local,
+                            endpoint: "http://localhost:11434".to_string(),
+                            api_key: None,
+                            model: "llama2".to_string(),
+                            enabled: false,
+                        })
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to create placeholder LLM provider: {}", e)
+                        })?,
+                    )
+                }
+            }
+            _ => {
+                warn!("No default LLM provider configured, using placeholder");
+                Arc::new(
+                    causality::llm::LocalLlmProvider::new(causality::llm::LlmProviderConfig {
+                        name: "placeholder".to_string(),
+                        provider_type: causality::llm::LlmProviderType::Local,
+                        endpoint: "http://localhost:11434".to_string(),
+                        api_key: None,
+                        model: "llama2".to_string(),
+                        enabled: false,
+                    })
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to create placeholder LLM provider: {}", e)
+                    })?,
+                )
+            }
+        };
+
+        ProfileService::new(profile_repo, llm_provider)
+    };
+
     // Create application state
     let app_state = AppState {
         memory_guard: Arc::new(memory_guard),
         retrieval_engine,
         config_center,
         lifecycle_manager,
+        profile_service,
     };
 
     // Create router with middleware

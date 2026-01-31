@@ -12,6 +12,7 @@ mod memory_guard;
 mod memory_matcher;
 mod memory_processor;
 mod memory_reconciler;
+mod profile_service;
 mod retrieval_engine;
 
 pub use config_center::{ConfigCenter, LlmProviderInfo, ProviderInfo};
@@ -34,6 +35,7 @@ pub use memory_reconciler::{
     AlwaysConflictingChecker, AlwaysConsistentChecker, ConsistencyChecker, ConsistencyResult,
     ExtractedMemory, LlmConsistencyChecker, MemoryReconciler, ReconcileOutcome, ReconcilerConfig,
 };
+pub use profile_service::ProfileService;
 pub use retrieval_engine::{
     CategoryQuery, MemoryEvidence, MemoryHistory, RetrievalEngine, RetrieveRequest,
     RetrieveResponse, RetrievedMemory,

@@ -8,6 +8,7 @@ mod config;
 mod event;
 pub mod health;
 mod memory;
+mod profile;
 mod retrieval;
 
 pub use admin::admin_routes;
@@ -17,6 +18,7 @@ pub use event::event_async_routes;
 pub use event::event_routes;
 pub use health::health_routes;
 pub use memory::memory_routes;
+pub use profile::profile_routes;
 pub use retrieval::retrieval_routes;
 
 use axum::Router;
@@ -26,7 +28,9 @@ use utoipa_swagger_ui::SwaggerUi;
 use std::sync::Arc;
 
 use crate::service::AlwaysConsistentChecker;
-use crate::service::{ConfigCenter, LifecycleManager, MemoryGuard, RetrievalEngine};
+use crate::service::{
+    ConfigCenter, LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine,
+};
 
 /// Application state shared across all handlers
 /// Uses AlwaysConsistentChecker as the default consistency checker
@@ -36,6 +40,7 @@ pub struct AppState {
     pub retrieval_engine: RetrievalEngine,
     pub config_center: ConfigCenter,
     pub lifecycle_manager: LifecycleManager,
+    pub profile_service: ProfileService,
 }
 
 /// OpenAPI documentation
@@ -57,7 +62,8 @@ pub struct AppState {
         (name = "admin", description = "Administrative operations"),
         (name = "config", description = "Provider configuration management"),
         (name = "audit", description = "Audit log queries"),
-        (name = "health", description = "Health check and metrics")
+        (name = "health", description = "Health check and metrics"),
+        (name = "system", description = "System profile management")
     ),
     paths(
         memory::create_memory,
@@ -84,6 +90,9 @@ pub struct AppState {
         audit::query_audit_logs,
         health::health_check,
         health::metrics,
+        profile::initialize_profile,
+        profile::get_profile,
+        profile::update_profile,
     ),
     components(schemas(
         // Memory types
@@ -135,6 +144,10 @@ pub struct AppState {
         health::HealthResponse,
         health::ComponentHealth,
         health::HealthStatus,
+        // Profile types
+        profile::InitializeProfileRequest,
+        profile::ProfileResponse,
+        profile::UpdateProfileRequest,
         // Domain types
         crate::domain::Status,
         crate::domain::EmbeddingStatus,
@@ -162,6 +175,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/api/v1/admin", admin_routes())
         .nest("/api/v1/config", config_routes())
         .nest("/api/v1/audit", audit_routes())
+        .nest("/api/v1/system", profile_routes())
         .merge(health_routes())
         .with_state(state)
 }

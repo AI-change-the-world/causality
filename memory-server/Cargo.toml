@@ -1,9 +1,9 @@
 [package]
-name = "memory-server"
+name = "causality"  # 因果律
 version = "0.1.0"
 edition = "2021"
 description = "A context memory governance service for Agent/LLM applications"
-authors = ["Memory Server Team"]
+authors = ["xiaoshuyui"]
 
 [dependencies]
 # Web framework

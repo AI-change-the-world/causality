@@ -121,36 +121,56 @@ CREATE TABLE event_memory_relations (
 );
 
 -- ============================================================================
--- PROVIDER CONFIGURATION TABLES
+-- SYSTEM PROFILE TABLE (Singleton)
 -- ============================================================================
 
--- Embedding provider configuration table
-CREATE TABLE embedding_providers (
-    name VARCHAR(100) PRIMARY KEY,
-    provider_type provider_type NOT NULL,
-    endpoint VARCHAR(500) NOT NULL,
-    api_key_encrypted BYTEA,
-    model VARCHAR(200) NOT NULL,
-    dimension INTEGER NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT true,
-    is_default BOOLEAN NOT NULL DEFAULT false,
+CREATE TABLE system_profile (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    description TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    domain VARCHAR(100) NOT NULL,
+    target_audience VARCHAR(255) NOT NULL,
+    event_categories TEXT[] NOT NULL DEFAULT '{}',
+    memory_focus TEXT[] NOT NULL DEFAULT '{}',
+    boundaries TEXT[] NOT NULL DEFAULT '{}',
+    -- 事件提取 prompt (完整的 prompt 模板)
+    extraction_prompt TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- LLM provider configuration table (for memory processing)
--- Only stores essential connection parameters - processing parameters are internal
-CREATE TABLE llm_providers (
-    name VARCHAR(100) PRIMARY KEY,
-    provider_type provider_type NOT NULL,
-    endpoint VARCHAR(500) NOT NULL,
-    api_key_encrypted BYTEA,
-    model VARCHAR(200) NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT true,
-    is_default BOOLEAN NOT NULL DEFAULT false,
+-- Ensure singleton (only one row allowed)
+CREATE UNIQUE INDEX idx_system_profile_singleton ON system_profile ((true));
+
+-- ============================================================================
+-- STRUCTURED EVENTS TABLE (六要素 + 两辅助)
+-- ============================================================================
+
+CREATE TABLE structured_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    -- 六要素
+    time_element TEXT,
+    location_element TEXT,
+    actor_element VARCHAR(255) NOT NULL,
+    cause_element TEXT,
+    process_element TEXT,
+    result_element TEXT,
+    -- 两辅助
+    background_element TEXT,
+    details_element TEXT,
+    -- 分类
+    category VARCHAR(100),
+    -- 时间戳
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    -- 一个事件只有一个结构化记录
+    UNIQUE(event_id)
 );
+
+CREATE INDEX idx_structured_events_event ON structured_events(event_id);
+CREATE INDEX idx_structured_events_category ON structured_events(category);
+CREATE INDEX idx_structured_events_actor ON structured_events(actor_element);
 
 -- ============================================================================
 -- AUDIT LOG TABLE
@@ -268,15 +288,9 @@ CREATE TRIGGER update_memories_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
--- Auto-update updated_at for embedding_providers table
-CREATE TRIGGER update_embedding_providers_updated_at
-    BEFORE UPDATE ON embedding_providers
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
--- Auto-update updated_at for llm_providers table
-CREATE TRIGGER update_llm_providers_updated_at
-    BEFORE UPDATE ON llm_providers
+-- Auto-update updated_at for system_profile table
+CREATE TRIGGER update_system_profile_updated_at
+    BEFORE UPDATE ON system_profile
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

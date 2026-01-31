@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release
 
-RUN rm -f target/release/memory-server
+RUN rm -f target/release/causality
 
 COPY src ./src
 COPY migrations ./migrations
@@ -28,7 +28,7 @@ COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release && \
-    strip target/release/memory-server
+    strip target/release/causality
 
 
 FROM debian:bookworm-slim
@@ -38,23 +38,23 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -s /bin/false -u 1000 memory-server
+RUN useradd -r -s /bin/false -u 1000 causality
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/memory-server /app/memory-server
+COPY --from=builder /app/target/release/causality /app/causality
 COPY --from=builder /app/migrations /app/migrations
 
-RUN mkdir -p /app/config && chown -R memory-server:memory-server /app
+RUN mkdir -p /app/config && chown -R causality:causality /app
 
-USER memory-server
+USER causality
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD /app/memory-server --healthcheck || exit 1
+    CMD /app/causality --healthcheck || exit 1
 
 ENV RUST_LOG=info
 ENV CONFIG_PATH=/app/config/config.yaml
 
-CMD ["/app/memory-server"]
+CMD ["/app/causality"]
