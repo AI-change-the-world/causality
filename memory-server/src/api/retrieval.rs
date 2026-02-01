@@ -14,6 +14,7 @@ use axum::{extract::State, routing::post, Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::api::memory::GetMemoryResponse;
 use crate::api::AppState;
@@ -24,6 +25,8 @@ use crate::service::RetrieveRequest;
 /// Request body for memory retrieval
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RetrieveApiRequest {
+    /// System profile ID - which business system to retrieve from (required)
+    pub profile_id: Uuid,
     /// Query text for semantic search and full-text search
     pub query: String,
     /// Owner ID - the unique identifier of the memory owner (required)
@@ -55,6 +58,7 @@ pub struct RetrieveApiRequest {
 impl From<RetrieveApiRequest> for RetrieveRequest {
     fn from(req: RetrieveApiRequest) -> Self {
         RetrieveRequest {
+            profile_id: req.profile_id,
             query: req.query,
             owner_id: req.owner_id,
             scope_id: req.scope_id,
@@ -190,6 +194,8 @@ pub struct RetrieveApiResponse {
 /// Request body for auto retrieval
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AutoRetrieveApiRequest {
+    /// System profile ID - which business system to retrieve from (required)
+    pub profile_id: Uuid,
     /// User query text (will be parsed by LLM to extract search intent)
     pub query: String,
     /// Owner ID - the unique identifier of the memory owner (required)
@@ -272,6 +278,7 @@ pub async fn retrieve_memories(
     use tracing::{debug, warn};
 
     debug!(
+        profile_id = %request.profile_id,
         query = %request.query,
         owner_id = %request.owner_id,
         scope_id = ?request.scope_id,
@@ -430,6 +437,7 @@ pub async fn auto_retrieve_memories(
     use tracing::{debug, warn};
 
     debug!(
+        profile_id = %request.profile_id,
         query = %request.query,
         owner_id = %request.owner_id,
         scope_id = ?request.scope_id,
@@ -499,6 +507,7 @@ pub async fn auto_retrieve_memories(
     // Build retrieve request - use_vector depends on whether we have vector results
     let has_vector_results = !all_similarities.is_empty();
     let retrieve_request = RetrieveRequest {
+        profile_id: request.profile_id,
         query: request.query.clone(),
         owner_id: request.owner_id.clone(),
         scope_id: request.scope_id,
@@ -602,7 +611,9 @@ mod tests {
 
     #[test]
     fn test_retrieve_request_conversion() {
+        let profile_id = Uuid::new_v4();
         let api_request = RetrieveApiRequest {
+            profile_id,
             query: "test query".to_string(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
@@ -619,6 +630,7 @@ mod tests {
 
         let retrieve_request: RetrieveRequest = api_request.clone().into();
 
+        assert_eq!(retrieve_request.profile_id, profile_id);
         assert_eq!(retrieve_request.query, api_request.query);
         assert_eq!(retrieve_request.owner_id, api_request.owner_id);
         assert_eq!(retrieve_request.scope_id, api_request.scope_id);
@@ -647,7 +659,9 @@ mod tests {
 
     #[test]
     fn test_retrieve_request_minimal() {
+        let profile_id = Uuid::new_v4();
         let api_request = RetrieveApiRequest {
+            profile_id,
             query: "simple query".to_string(),
             owner_id: "owner123".to_string(),
             scope_id: None,
@@ -664,6 +678,7 @@ mod tests {
 
         let retrieve_request: RetrieveRequest = api_request.into();
 
+        assert_eq!(retrieve_request.profile_id, profile_id);
         assert_eq!(retrieve_request.query, "simple query");
         assert_eq!(retrieve_request.owner_id, "owner123");
         assert!(retrieve_request.scope_id.is_none());
@@ -683,6 +698,7 @@ mod tests {
     #[test]
     fn test_retrieve_request_parsing() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "query": "test query",
             "owner_id": "owner123"
         }"#;
@@ -695,6 +711,7 @@ mod tests {
     #[test]
     fn test_auto_retrieve_request_parsing() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "query": "用户喜欢什么颜色",
             "owner_id": "owner123",
             "scope_id": "user123",
@@ -712,6 +729,7 @@ mod tests {
     #[test]
     fn test_auto_retrieve_request_minimal() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "query": "test query",
             "owner_id": "owner456"
         }"#;

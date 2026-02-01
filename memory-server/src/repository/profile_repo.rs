@@ -22,13 +22,13 @@ impl ProfileRepository {
         Self { pool }
     }
 
-    /// Create a new system profile (singleton - only one allowed)
+    /// Create a new system profile
     ///
     /// Returns an error if a profile already exists.
     pub async fn create(&self, profile: &SystemProfile) -> AppResult<SystemProfile> {
         let row = sqlx::query_as::<_, ProfileRow>(
             r#"
-            INSERT INTO system_profile (
+            INSERT INTO system_profiles (
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
                 created_at, updated_at
@@ -57,7 +57,7 @@ impl ProfileRepository {
         .map_err(|e| {
             // Check for unique constraint violation (singleton)
             if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("idx_system_profile_singleton") {
+                if db_err.constraint() == Some("idx_system_profiles_name") {
                     return AppError::Validation(
                         "System profile already exists. Use update instead.".to_string(),
                     );
@@ -79,7 +79,7 @@ impl ProfileRepository {
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
                 created_at, updated_at
-            FROM system_profile
+            FROM system_profiles
             LIMIT 1
             "#,
         )
@@ -95,7 +95,7 @@ impl ProfileRepository {
     pub async fn update(&self, profile: &SystemProfile) -> AppResult<SystemProfile> {
         let row = sqlx::query_as::<_, ProfileRow>(
             r#"
-            UPDATE system_profile
+            UPDATE system_profiles
             SET name = $2,
                 description = $3,
                 purpose = $4,
@@ -135,7 +135,7 @@ impl ProfileRepository {
 
     /// Check if a system profile exists
     pub async fn exists(&self) -> AppResult<bool> {
-        let count = sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM system_profile"#)
+        let count = sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM system_profiles"#)
             .fetch_one(&self.pool)
             .await?;
 

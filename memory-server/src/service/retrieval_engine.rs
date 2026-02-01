@@ -64,6 +64,8 @@ impl CategoryQuery {
 /// Request for memory retrieval
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrieveRequest {
+    /// System profile ID - which business system to retrieve from (required)
+    pub profile_id: Uuid,
     /// Query text for semantic search and full-text search
     pub query: String,
     /// Owner ID - the unique identifier of the memory owner (required)
@@ -192,6 +194,7 @@ impl RetrievalEngine {
     ///
     /// Process:
     /// 1. Apply structured filters (PostgreSQL)
+    ///    - profile_id (required for multi-tenant)
     ///    - owner_id (required)
     ///    - scope_id + is_global (when scope_id provided, also includes global memories)
     ///    - is_current_version = true (default)
@@ -211,6 +214,7 @@ impl RetrievalEngine {
         actor_id: Option<String>,
     ) -> AppResult<RetrieveResponse> {
         debug!(
+            profile_id = %request.profile_id,
             query = %request.query,
             owner_id = %request.owner_id,
             scope_id = ?request.scope_id,
@@ -239,13 +243,15 @@ impl RetrievalEngine {
             .unwrap_or(self.config.score_weights.fulltext);
 
         // Step 1: Structured filtering (PostgreSQL)
+        // - profile_id (required for multi-tenant)
         // - is_current_version = true (default)
         // - status NOT IN ('superseded', 'archived') (default)
         // - scope_id + is_global combined query
         let include_global = request.scope_id.is_some(); // Include global when scope is specified
         let candidates = self
             .memory_repo
-            .find_for_retrieval(
+            .find_for_retrieval_by_profile(
+                request.profile_id,
                 &request.owner_id,
                 request.scope_id.as_deref(),
                 request.category_prefix.as_deref(),

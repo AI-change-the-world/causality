@@ -18,7 +18,7 @@ mod retrieval_engine;
 pub use decay_calculator::{
     calculate_decay_score, calculate_decay_score_at_time, DecayCalculator, DecayConfig,
 };
-pub use event_handler::EventHandler;
+pub use event_handler::{EventHandler, RelevanceCheckResult};
 pub use eviction_manager::{EvictionConfig, EvictionManager, EvictionResult};
 pub use global_promoter::{GlobalPromoter, PromotionCheck, PromotionCriteria};
 pub use lifecycle_manager::LifecycleManager;

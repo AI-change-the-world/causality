@@ -91,6 +91,12 @@ pub struct CreateEventApiResponse {
     pub created_memory_ids: Vec<Uuid>,
     /// IDs of reinforced memories
     pub reinforced_memory_ids: Vec<Uuid>,
+    /// Whether the event was skipped due to irrelevance (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<bool>,
+    /// Reason for skipping (if skipped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 /// Response for getting an event
@@ -258,15 +264,44 @@ async fn process_event_background(
     // Use global LLM provider from AppState
     let llm_provider = state.llm_provider.clone();
 
+    // Create EventHandler with ProfileService for relevance checking
+    let event_handler = crate::service::EventHandler::with_profile_service(
+        llm_provider.clone(),
+        state.profile_service.clone(),
+    );
+
+    // Check event relevance against SystemProfile
+    let relevance_result = event_handler
+        .check_relevance_with_profile(&event.content)
+        .await?;
+
+    // If event is not relevant, skip processing
+    if !relevance_result.is_relevant {
+        tracing::info!(
+            event_id = %event_id,
+            relevance_score = relevance_result.relevance_score,
+            reason = %relevance_result.reason,
+            "Background task: event skipped due to irrelevance"
+        );
+
+        // Mark as processed with skip reason in summary
+        let skip_summary = format!(
+            "[SKIPPED] 事件与系统业务领域不相关。相关性分数: {:.2}, 原因: {}",
+            relevance_result.relevance_score, relevance_result.reason
+        );
+        state
+            .memory_guard
+            .event_repo()
+            .mark_processed(event_id, &skip_summary)
+            .await?;
+
+        return Ok(());
+    }
+
     let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
 
-    // Create EventHandler with ProfileService
-    let event_handler = Some(Arc::new(
-        crate::service::EventHandler::with_profile_service(
-            llm_provider.clone(),
-            state.profile_service.clone(),
-        ),
-    ));
+    // Wrap EventHandler in Arc for context
+    let event_handler = Some(Arc::new(event_handler));
 
     // Use global Embedding provider from AppState
     let embedding_provider = state.embedding_provider.clone();
@@ -327,18 +362,80 @@ pub async fn create_event(
     debug!("create_event: using global LLM provider from AppState");
     let llm_provider = state.llm_provider.clone();
 
+    // Create EventHandler with ProfileService for relevance checking
+    debug!("create_event: creating EventHandler with ProfileService");
+    let event_handler = crate::service::EventHandler::with_profile_service(
+        llm_provider.clone(),
+        state.profile_service.clone(),
+    );
+
+    // Step 1: Check event relevance against SystemProfile
+    debug!("create_event: checking event relevance");
+    let relevance_result = event_handler
+        .check_relevance_with_profile(&request.content)
+        .await?;
+
+    // If event is not relevant, skip processing and return early
+    if !relevance_result.is_relevant {
+        tracing::info!(
+            owner_id = %request.owner_id,
+            relevance_score = relevance_result.relevance_score,
+            reason = %relevance_result.reason,
+            "create_event: event skipped due to irrelevance"
+        );
+
+        // Still create the event record but mark it as processed (skipped)
+        let event_input = crate::domain::CreateEventInput {
+            profile_id: request.profile_id,
+            owner_id: request.owner_id.clone(),
+            scope_id: request.scope_id.clone(),
+            content: request.content.clone(),
+            context: request.context.clone(),
+            source: request.source.clone(),
+            event_time: None,
+        };
+
+        let event = crate::domain::Event::new(event_input);
+        let stored_event = state.memory_guard.event_repo().create(&event).await?;
+
+        // Mark as processed with skip reason in summary
+        let skip_summary = format!(
+            "[SKIPPED] 事件与系统业务领域不相关。相关性分数: {:.2}, 原因: {}",
+            relevance_result.relevance_score, relevance_result.reason
+        );
+        let _ = state
+            .memory_guard
+            .event_repo()
+            .mark_processed(stored_event.id, &skip_summary)
+            .await;
+
+        let response = CreateEventApiResponse {
+            event_id: stored_event.id,
+            processed: true,
+            event_summary: Some(skip_summary),
+            memories_created: 0,
+            memories_reinforced: 0,
+            memories_superseded: 0,
+            created_memory_ids: vec![],
+            reinforced_memory_ids: vec![],
+            skipped: Some(true),
+            skip_reason: Some(relevance_result.reason),
+        };
+
+        return Ok((StatusCode::OK, Json(response)));
+    }
+
+    debug!(
+        "create_event: event is relevant (score: {:.2}), proceeding with processing",
+        relevance_result.relevance_score
+    );
+
     // Create MemoryProcessor with the global LLM provider
     let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
     debug!("create_event: MemoryProcessor created");
 
-    // Create EventHandler with ProfileService
-    debug!("create_event: creating EventHandler with ProfileService");
-    let event_handler = Some(Arc::new(
-        crate::service::EventHandler::with_profile_service(
-            llm_provider.clone(),
-            state.profile_service.clone(),
-        ),
-    ));
+    // Wrap EventHandler in Arc for context
+    let event_handler = Some(Arc::new(event_handler));
 
     // Use global Embedding provider from AppState
     debug!("create_event: using global Embedding provider from AppState");
@@ -400,6 +497,8 @@ pub async fn create_event(
         memories_superseded: result.memories_superseded,
         created_memory_ids: result.created_memory_ids.clone(),
         reinforced_memory_ids: vec![], // TODO: Add to CreateFromEventResult if needed
+        skipped: None,
+        skip_reason: None,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -532,6 +631,8 @@ mod tests {
     fn test_create_event_response_serialization() {
         let id = Uuid::new_v4();
         let response = CreateEventApiResponse {
+            skip_reason: None,
+            skipped: None,
             event_id: id,
             processed: true,
             event_summary: Some("User changed theme settings".to_string()),
@@ -552,6 +653,8 @@ mod tests {
     #[test]
     fn test_create_event_response_without_summary() {
         let response = CreateEventApiResponse {
+            skip_reason: None,
+            skipped: None,
             event_id: Uuid::new_v4(),
             processed: false,
             event_summary: None,

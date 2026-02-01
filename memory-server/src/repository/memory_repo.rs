@@ -344,6 +344,65 @@ impl MemoryRepository {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Find memories with structured filters for retrieval (with profile_id for multi-tenant)
+    ///
+    /// Scope logic:
+    /// - profile_id is required for multi-tenant isolation
+    /// - If scope_id is NULL: returns all memories for this owner (no scope filter)
+    /// - If scope_id is provided: returns matching scope_id OR global (if include_global is true)
+    pub async fn find_for_retrieval_by_profile(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+        scope_id: Option<&str>,
+        category_prefix: Option<&str>,
+        tags: Option<&[String]>,
+        include_global: bool,
+    ) -> AppResult<Vec<Memory>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                SELECT {}
+                FROM memories
+                WHERE profile_id = $1
+                  AND owner_id = $2
+                  AND is_current_version = true
+                  AND status NOT IN ('superseded', 'archived')
+                  AND (
+                    $3::text IS NULL
+                    OR scope_id = $3
+                    OR ($4 = true AND is_global = true)
+                  )
+                  AND ($5::text IS NULL OR category LIKE $5 || '%')
+                ORDER BY decay_score DESC, updated_at DESC
+                LIMIT 1000
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(profile_id)
+        .bind(owner_id)
+        .bind(scope_id)
+        .bind(include_global)
+        .bind(category_prefix)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut memories: Vec<Memory> = rows.into_iter().map(Into::into).collect();
+
+        // Apply tags filter in memory
+        if let Some(tag_filter) = tags {
+            if !tag_filter.is_empty() {
+                memories.retain(|m| {
+                    m.tags
+                        .as_ref()
+                        .map(|memory_tags| tag_filter.iter().any(|t| memory_tags.contains(t)))
+                        .unwrap_or(false)
+                });
+            }
+        }
+
+        Ok(memories)
+    }
+
     /// Find memories with structured filters for retrieval
     ///
     /// Scope logic:

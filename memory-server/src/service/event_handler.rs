@@ -15,12 +15,14 @@
 //! - Background (背景): Context/scenario
 //! - Details (细节): Key details, follow-up actions
 //!
+//! Also includes relevance filtering to ensure events match the SystemProfile's domain.
+//!
 //! Requirements: 6.9-6.10, 7.1-7.5, 8.1-8.4
 
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::domain::{Event, ParsedStructuredEvent, StructuredEvent};
+use crate::domain::{Event, ParsedStructuredEvent, StructuredEvent, SystemProfile};
 use crate::error::{AppError, AppResult};
 use crate::llm::{ChatRequest, LlmProvider};
 use crate::service::ProfileService;
@@ -57,6 +59,55 @@ const DEFAULT_EXTRACTION_PROMPT: &str = r#"你是一个事件分析助手。请�
   "category": "分类或null"
 }
 ```"#;
+
+/// Prompt template for checking event relevance against SystemProfile
+const RELEVANCE_CHECK_PROMPT: &str = r#"你是一个事件相关性判断助手。请判断以下事件内容是否与系统的业务领域相关。
+
+## 系统信息
+- 系统名称: {system_name}
+- 系统用途: {purpose}
+- 业务领域: {domain}
+- 目标用户: {target_audience}
+- 事件类型: {event_categories}
+- 关注的记忆类型: {memory_focus}
+- 系统边界（不处理的内容）: {boundaries}
+
+## 事件内容
+{content}
+
+## 判断标准
+1. 事件内容是否与业务领域相关
+2. 事件是否属于系统定义的事件类型范围
+3. 事件是否在系统边界之内（不在 boundaries 列表中）
+4. 事件是否可能产生对目标用户有价值的记忆
+
+## 请以 JSON 格式返回判断结果：
+```json
+{
+  "is_relevant": true或false,
+  "relevance_score": 0.0到1.0之间的相关性分数,
+  "reason": "判断理由的简短说明",
+  "matched_categories": ["匹配的事件类型列表，如果有的话"]
+}
+```
+
+注意：
+- 如果事件内容与业务领域完全无关，is_relevant 应为 false
+- relevance_score 低于 0.3 时，建议 is_relevant 为 false
+- 请严格按照系统边界判断，边界内的内容不应被处理"#;
+
+/// Result of relevance check
+#[derive(Debug, Clone)]
+pub struct RelevanceCheckResult {
+    /// Whether the event is relevant to the system profile
+    pub is_relevant: bool,
+    /// Relevance score (0.0 - 1.0)
+    pub relevance_score: f32,
+    /// Reason for the relevance decision
+    pub reason: String,
+    /// Matched event categories (if any)
+    pub matched_categories: Vec<String>,
+}
 
 /// EventHandler service for structuring raw events
 ///
@@ -141,6 +192,133 @@ impl EventHandler {
         );
 
         Ok(structured_event)
+    }
+
+    /// Check if an event is relevant to the SystemProfile
+    ///
+    /// Uses LLM to determine if the event content matches the system's
+    /// business domain, event categories, and is within system boundaries.
+    ///
+    /// # Arguments
+    /// * `content` - The event content to check
+    /// * `profile` - The SystemProfile to check against
+    ///
+    /// # Returns
+    /// * `Ok(RelevanceCheckResult)` - The relevance check result
+    /// * `Err(AppError)` - If LLM check fails
+    pub async fn check_relevance(
+        &self,
+        content: &str,
+        profile: &SystemProfile,
+    ) -> AppResult<RelevanceCheckResult> {
+        debug!(
+            profile_id = %profile.id,
+            content_len = content.len(),
+            "Checking event relevance against SystemProfile"
+        );
+
+        // Build the relevance check prompt
+        let prompt = RELEVANCE_CHECK_PROMPT
+            .replace("{system_name}", &profile.name)
+            .replace("{purpose}", &profile.purpose)
+            .replace("{domain}", &profile.domain)
+            .replace("{target_audience}", &profile.target_audience)
+            .replace("{event_categories}", &profile.event_categories.join(", "))
+            .replace("{memory_focus}", &profile.memory_focus.join(", "))
+            .replace("{boundaries}", &profile.boundaries.join(", "))
+            .replace("{content}", content);
+
+        // Call LLM to check relevance
+        let chat_request = ChatRequest::new(prompt)
+            .with_temperature(0.1) // Low temperature for consistent judgment
+            .with_json_response();
+
+        let response = self.llm_provider.chat(chat_request).await.map_err(|e| {
+            warn!(error = %e, "LLM relevance check failed");
+            AppError::Internal(format!("Failed to check event relevance: {}", e))
+        })?;
+
+        // Parse the relevance check response
+        let result = self.parse_relevance_response(&response.content)?;
+
+        info!(
+            is_relevant = result.is_relevant,
+            relevance_score = result.relevance_score,
+            reason = %result.reason,
+            "Event relevance check completed"
+        );
+
+        Ok(result)
+    }
+
+    /// Check relevance using the profile from ProfileService
+    ///
+    /// Convenience method that fetches the profile and checks relevance.
+    /// If no profile exists, returns a default "relevant" result (permissive mode).
+    ///
+    /// # Arguments
+    /// * `content` - The event content to check
+    ///
+    /// # Returns
+    /// * `Ok(RelevanceCheckResult)` - The relevance check result
+    pub async fn check_relevance_with_profile(
+        &self,
+        content: &str,
+    ) -> AppResult<RelevanceCheckResult> {
+        if let Some(ref profile_service) = self.profile_service {
+            match profile_service.get().await {
+                Ok(profile) => {
+                    return self.check_relevance(content, &profile).await;
+                }
+                Err(e) => {
+                    debug!(error = %e, "No SystemProfile found, skipping relevance check");
+                }
+            }
+        }
+
+        // No profile available - default to permissive (relevant)
+        Ok(RelevanceCheckResult {
+            is_relevant: true,
+            relevance_score: 1.0,
+            reason: "No SystemProfile configured, accepting all events".to_string(),
+            matched_categories: vec![],
+        })
+    }
+
+    /// Parse the LLM response for relevance check
+    fn parse_relevance_response(&self, response: &str) -> AppResult<RelevanceCheckResult> {
+        let json_str = Self::extract_json(response);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            warn!(response = %response, error = %e, "Failed to parse relevance check response");
+            AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
+        })?;
+
+        let is_relevant = parsed["is_relevant"].as_bool().unwrap_or(true);
+        let relevance_score = parsed["relevance_score"]
+            .as_f64()
+            .map(|f| f as f32)
+            .unwrap_or(if is_relevant { 1.0 } else { 0.0 });
+        let reason = parsed["reason"]
+            .as_str()
+            .unwrap_or("No reason provided")
+            .to_string();
+        let matched_categories = parsed["matched_categories"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(RelevanceCheckResult {
+            is_relevant,
+            relevance_score,
+            reason,
+            matched_categories,
+        })
     }
 
     /// Get the extraction prompt from SystemProfile or use default
@@ -457,5 +635,120 @@ mod tests {
             details,
             category,
         })
+    }
+
+    /// Helper function for testing parse_relevance_response
+    fn parse_relevance_response_test(
+        response: &str,
+    ) -> crate::error::AppResult<RelevanceCheckResult> {
+        let json_str = EventHandler::extract_json(response);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            crate::error::AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
+        })?;
+
+        let is_relevant = parsed["is_relevant"].as_bool().unwrap_or(true);
+        let relevance_score = parsed["relevance_score"]
+            .as_f64()
+            .map(|f| f as f32)
+            .unwrap_or(if is_relevant { 1.0 } else { 0.0 });
+        let reason = parsed["reason"]
+            .as_str()
+            .unwrap_or("No reason provided")
+            .to_string();
+        let matched_categories = parsed["matched_categories"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(RelevanceCheckResult {
+            is_relevant,
+            relevance_score,
+            reason,
+            matched_categories,
+        })
+    }
+
+    #[test]
+    fn test_relevance_check_prompt_contains_placeholders() {
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{system_name}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{purpose}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{domain}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{target_audience}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{event_categories}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{memory_focus}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{boundaries}"));
+        assert!(RELEVANCE_CHECK_PROMPT.contains("{content}"));
+    }
+
+    #[test]
+    fn test_parse_relevance_response_relevant() {
+        let response = r#"{
+            "is_relevant": true,
+            "relevance_score": 0.85,
+            "reason": "事件内容与房产推荐业务相关",
+            "matched_categories": ["咨询", "看房"]
+        }"#;
+
+        let result = parse_relevance_response_test(response).unwrap();
+
+        assert!(result.is_relevant);
+        assert!((result.relevance_score - 0.85).abs() < 0.01);
+        assert_eq!(result.reason, "事件内容与房产推荐业务相关");
+        assert_eq!(result.matched_categories, vec!["咨询", "看房"]);
+    }
+
+    #[test]
+    fn test_parse_relevance_response_not_relevant() {
+        let response = r#"{
+            "is_relevant": false,
+            "relevance_score": 0.15,
+            "reason": "事件内容与房产业务无关，是关于编程语言的讨论",
+            "matched_categories": []
+        }"#;
+
+        let result = parse_relevance_response_test(response).unwrap();
+
+        assert!(!result.is_relevant);
+        assert!((result.relevance_score - 0.15).abs() < 0.01);
+        assert!(result.reason.contains("编程语言"));
+        assert!(result.matched_categories.is_empty());
+    }
+
+    #[test]
+    fn test_parse_relevance_response_with_code_block() {
+        let response = r#"```json
+{
+    "is_relevant": false,
+    "relevance_score": 0.1,
+    "reason": "内容与系统业务领域不相关",
+    "matched_categories": []
+}
+```"#;
+
+        let result = parse_relevance_response_test(response).unwrap();
+
+        assert!(!result.is_relevant);
+        assert!((result.relevance_score - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_relevance_response_defaults() {
+        // Test with minimal response - should use defaults
+        let response = r#"{"reason": "Some reason"}"#;
+
+        let result = parse_relevance_response_test(response).unwrap();
+
+        // Default is_relevant is true
+        assert!(result.is_relevant);
+        // Default score for relevant is 1.0
+        assert!((result.relevance_score - 1.0).abs() < 0.01);
+        assert_eq!(result.reason, "Some reason");
+        assert!(result.matched_categories.is_empty());
     }
 }
