@@ -25,7 +25,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::embedding::{EmbeddingProvider, LocalProvider, OpenAIProvider, ProviderType};
+use crate::embedding::EmbeddingProvider;
 use crate::error::AppResult;
 use crate::service::{CreateFromEventRequest, EventProcessingContext};
 
@@ -34,16 +34,15 @@ use crate::service::{CreateFromEventRequest, EventProcessingContext};
 /// This endpoint accepts raw event content and uses LLM to extract
 /// structured memories. The LLM automatically understands the event type
 /// and extracts relevant facts, preferences, patterns, and rules.
+///
+/// LLM and Embedding providers are configured globally in config.yaml,
+/// no need to specify them per request.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateEventApiRequest {
     /// Owner ID - the unique identifier of the memory owner
     pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
     pub content: String,
-    /// LLM provider name to use for memory extraction (must be a configured provider)
-    pub llm_provider: String,
-    /// embedding provider name to convert memory to vectors
-    pub embedding_provider: String,
     /// Optional context to help LLM better understand the event
     #[serde(default)]
     pub context: Option<String>,
@@ -182,37 +181,8 @@ pub async fn create_event_async(
 ) -> AppResult<(StatusCode, Json<CreateEventAsyncResponse>)> {
     tracing::info!(
         owner_id = %request.owner_id,
-        llm_provider = %request.llm_provider,
-        embedding_provider = %request.embedding_provider,
         "create_event_async: starting async request"
     );
-
-    // Validate providers exist before creating event
-    let llm_config = state
-        .config_center
-        .get_cached_llm_provider(&request.llm_provider)
-        .await
-        .ok_or_else(|| crate::error::AppError::ProviderNotFound(request.llm_provider.clone()))?;
-
-    if !llm_config.enabled {
-        return Err(crate::error::AppError::ProviderDisabled(
-            request.llm_provider.clone(),
-        ));
-    }
-
-    let embedding_config = state
-        .config_center
-        .get_cached_provider(&request.embedding_provider)
-        .await
-        .ok_or_else(|| {
-            crate::error::AppError::ProviderNotFound(request.embedding_provider.clone())
-        })?;
-
-    if !embedding_config.enabled {
-        return Err(crate::error::AppError::ProviderDisabled(
-            request.embedding_provider.clone(),
-        ));
-    }
 
     // Create the event first (unprocessed)
     let event_input = crate::domain::CreateEventInput {
@@ -237,7 +207,6 @@ pub async fn create_event_async(
 
     // Clone what we need for the background task
     let state_clone = state.clone();
-    let request_clone = request.clone();
 
     // Spawn background task for processing
     tokio::spawn(async move {
@@ -246,7 +215,7 @@ pub async fn create_event_async(
             "Background task: starting event processing"
         );
 
-        if let Err(e) = process_event_background(state_clone, event_id, request_clone).await {
+        if let Err(e) = process_event_background(state_clone, event_id).await {
             tracing::error!(
                 event_id = %event_id,
                 error = %e,
@@ -274,127 +243,44 @@ pub async fn create_event_async(
 }
 
 /// Background task to process an event
+/// Uses global LLM and Embedding providers from AppState (configured in config.yaml)
 async fn process_event_background(
     state: AppState,
     event_id: Uuid,
-    request: CreateEventApiRequest,
 ) -> Result<(), crate::error::AppError> {
     // Get the event we created
     let event = state.retrieval_engine.get_event(event_id).await?;
 
-    // Create LLM provider
-    let llm_config = state
-        .config_center
-        .get_cached_llm_provider(&request.llm_provider)
-        .await
-        .ok_or_else(|| crate::error::AppError::ProviderNotFound(request.llm_provider.clone()))?;
-
-    let llm_provider: Arc<dyn crate::llm::LlmProvider> = match llm_config.provider_type {
-        crate::llm::LlmProviderType::OpenAI | crate::llm::LlmProviderType::Azure => {
-            Arc::new(crate::llm::OpenAILlmProvider::new(llm_config).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create OpenAI LLM provider: {}",
-                    e
-                ))
-            })?)
-        }
-        crate::llm::LlmProviderType::Local => {
-            Arc::new(crate::llm::LocalLlmProvider::new(llm_config).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create local LLM provider: {}",
-                    e
-                ))
-            })?)
-        }
-    };
+    // Use global LLM provider from AppState
+    let llm_provider = state.llm_provider.clone();
 
     let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
 
-    // Create embedding provider
-    let embedding_config = state
-        .config_center
-        .get_cached_provider(&request.embedding_provider)
-        .await
-        .ok_or_else(|| {
-            crate::error::AppError::ProviderNotFound(request.embedding_provider.clone())
-        })?;
+    // Create EventHandler with ProfileService
+    let event_handler = Some(Arc::new(
+        crate::service::EventHandler::with_profile_service(
+            llm_provider.clone(),
+            state.profile_service.clone(),
+        ),
+    ));
 
-    let embedding_provider: Arc<dyn EmbeddingProvider> = match embedding_config.provider_type {
-        ProviderType::OpenAI | ProviderType::Azure => {
-            Arc::new(OpenAIProvider::new(embedding_config.clone()).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create OpenAI embedding provider: {}",
-                    e
-                ))
-            })?)
-        }
-        ProviderType::Local => {
-            Arc::new(LocalProvider::new(embedding_config.clone()).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create local embedding provider: {}",
-                    e
-                ))
-            })?)
-        }
-    };
-
-    // Query existing memories to find all unique embedding providers used
-    let memories_by_provider = state
-        .memory_guard
-        .memory_repo()
-        .find_by_owner_scope_grouped_by_provider(
-            &request.owner_id,
-            request.scope_id.as_deref(),
-            true,
-        )
-        .await?;
-
-    // Build embedding providers map
-    let mut embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
-    embedding_providers.insert(
-        request.embedding_provider.clone(),
-        embedding_provider.clone(),
-    );
-
-    for provider_name in memories_by_provider.keys() {
-        if embedding_providers.contains_key(provider_name) {
-            continue;
-        }
-
-        if let Some(config) = state.config_center.get_cached_provider(provider_name).await {
-            if config.enabled {
-                let provider: Arc<dyn EmbeddingProvider> = match config.provider_type {
-                    ProviderType::OpenAI | ProviderType::Azure => {
-                        match OpenAIProvider::new(config.clone()) {
-                            Ok(p) => Arc::new(p),
-                            Err(_) => continue,
-                        }
-                    }
-                    ProviderType::Local => match LocalProvider::new(config.clone()) {
-                        Ok(p) => Arc::new(p),
-                        Err(_) => continue,
-                    },
-                };
-                embedding_providers.insert(provider_name.clone(), provider);
-            }
-        }
-    }
+    // Use global Embedding provider from AppState
+    let embedding_provider = state.embedding_provider.clone();
+    let embedding_provider_name = state.embedding_provider_name.clone();
 
     // Get Qdrant repository
-    let qdrant_repo = state
-        .config_center
-        .qdrant_repo()
-        .ok_or_else(|| {
-            crate::error::AppError::Internal("Qdrant repository not configured".to_string())
-        })?
-        .clone();
+    let qdrant_repo = state.qdrant_repo.clone();
+
+    // Empty map - we only use the global embedding provider now
+    let embedding_providers = HashMap::new();
 
     // Build context and process
     let context = EventProcessingContext {
         memory_processor,
+        event_handler,
         llm_provider,
         embedding_provider,
-        embedding_provider_name: request.embedding_provider.clone(),
+        embedding_provider_name,
         qdrant_repo,
         embedding_providers,
     };
@@ -412,11 +298,7 @@ async fn process_event_background(
 /// Creates an event and extracts memories from raw event content using LLM processing.
 /// Returns the event details along with memory processing results.
 ///
-/// The handler:
-/// 1. Creates LLM provider from request's llm_provider
-/// 2. Queries existing memories for owner_id/scope_id to find used embedding providers
-/// 3. Creates embedding provider instances for each unique provider
-/// 4. Builds EventProcessingContext and processes the event
+/// The handler uses global LLM and Embedding providers configured in config.yaml.
 #[utoipa::path(
     post,
     path = "/api/v1/events",
@@ -434,92 +316,32 @@ pub async fn create_event(
 ) -> AppResult<(StatusCode, Json<CreateEventApiResponse>)> {
     tracing::info!(
         owner_id = %request.owner_id,
-        llm_provider = %request.llm_provider,
-        embedding_provider = %request.embedding_provider,
         "create_event: starting request"
     );
 
-    // Get the LLM provider config by name
-    debug!("create_event: getting LLM provider config from cache");
-    let llm_config = state
-        .config_center
-        .get_cached_llm_provider(&request.llm_provider)
-        .await
-        .ok_or_else(|| crate::error::AppError::ProviderNotFound(request.llm_provider.clone()))?;
-    debug!("create_event: got LLM provider config");
+    // Use global LLM provider from AppState
+    debug!("create_event: using global LLM provider from AppState");
+    let llm_provider = state.llm_provider.clone();
 
-    if !llm_config.enabled {
-        return Err(crate::error::AppError::ProviderDisabled(
-            request.llm_provider.clone(),
-        ));
-    }
-
-    // Create LLM provider instance based on type
-    let llm_provider: Arc<dyn crate::llm::LlmProvider> = match llm_config.provider_type {
-        crate::llm::LlmProviderType::OpenAI | crate::llm::LlmProviderType::Azure => {
-            Arc::new(crate::llm::OpenAILlmProvider::new(llm_config).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create OpenAI LLM provider: {}",
-                    e
-                ))
-            })?)
-        }
-        crate::llm::LlmProviderType::Local => {
-            Arc::new(crate::llm::LocalLlmProvider::new(llm_config).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create local LLM provider: {}",
-                    e
-                ))
-            })?)
-        }
-    };
-
-    debug!("create_event: LLM provider instance created");
-
-    // Create MemoryProcessor with a clone of the LLM provider (we need llm_provider for context too)
+    // Create MemoryProcessor with the global LLM provider
     let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
     debug!("create_event: MemoryProcessor created");
 
-    // Get the embedding provider config (for new memories)
-    debug!("create_event: getting embedding provider config from cache");
-    let embedding_config = state
-        .config_center
-        .get_cached_provider(&request.embedding_provider)
-        .await
-        .ok_or_else(|| {
-            crate::error::AppError::ProviderNotFound(request.embedding_provider.clone())
-        })?;
-    debug!("create_event: got embedding provider config");
+    // Create EventHandler with ProfileService
+    debug!("create_event: creating EventHandler with ProfileService");
+    let event_handler = Some(Arc::new(
+        crate::service::EventHandler::with_profile_service(
+            llm_provider.clone(),
+            state.profile_service.clone(),
+        ),
+    ));
 
-    if !embedding_config.enabled {
-        return Err(crate::error::AppError::ProviderDisabled(
-            request.embedding_provider.clone(),
-        ));
-    }
+    // Use global Embedding provider from AppState
+    debug!("create_event: using global Embedding provider from AppState");
+    let embedding_provider = state.embedding_provider.clone();
+    let embedding_provider_name = state.embedding_provider_name.clone();
 
-    // Create embedding provider instance for new memories
-    let embedding_provider: Arc<dyn EmbeddingProvider> = match embedding_config.provider_type {
-        ProviderType::OpenAI | ProviderType::Azure => {
-            Arc::new(OpenAIProvider::new(embedding_config.clone()).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create OpenAI embedding provider: {}",
-                    e
-                ))
-            })?)
-        }
-        ProviderType::Local => {
-            Arc::new(LocalProvider::new(embedding_config.clone()).map_err(|e| {
-                crate::error::AppError::Internal(format!(
-                    "Failed to create local embedding provider: {}",
-                    e
-                ))
-            })?)
-        }
-    };
-
-    debug!("create_event: embedding provider instance created");
-
-    // Query existing memories to find all unique embedding providers used
+    // Query existing memories (for potential future use, but we only use global provider now)
     debug!("create_event: querying existing memories by provider");
     let memories_by_provider = state
         .memory_guard
@@ -536,79 +358,23 @@ pub async fn create_event(
         "create_event: found existing memories grouped by provider"
     );
 
-    // Build embedding providers map for all providers used by existing memories
-    let mut embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
-
-    // Always include the provider for new memories
-    embedding_providers.insert(
-        request.embedding_provider.clone(),
-        embedding_provider.clone(),
-    );
-
-    // Create embedding provider instances for each unique provider used by existing memories
-    for provider_name in memories_by_provider.keys() {
-        if embedding_providers.contains_key(provider_name) {
-            continue; // Already have this provider
-        }
-
-        // Get provider config
-        if let Some(config) = state.config_center.get_cached_provider(provider_name).await {
-            if config.enabled {
-                let provider: Arc<dyn EmbeddingProvider> = match config.provider_type {
-                    ProviderType::OpenAI | ProviderType::Azure => {
-                        match OpenAIProvider::new(config.clone()) {
-                            Ok(p) => Arc::new(p),
-                            Err(e) => {
-                                tracing::warn!(
-                                    provider_name = %provider_name,
-                                    error = %e,
-                                    "Failed to create embedding provider, skipping"
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    ProviderType::Local => match LocalProvider::new(config.clone()) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            tracing::warn!(
-                                provider_name = %provider_name,
-                                error = %e,
-                                "Failed to create embedding provider, skipping"
-                            );
-                            continue;
-                        }
-                    },
-                };
-                embedding_providers.insert(provider_name.clone(), provider);
-            }
-        }
-    }
-
-    debug!(
-        total_providers = embedding_providers.len(),
-        "create_event: built embedding providers map"
-    );
+    // Empty map - we only use the global embedding provider now
+    let embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
 
     // Get Qdrant repository
     debug!("create_event: getting Qdrant repository");
-    let qdrant_repo = state
-        .config_center
-        .qdrant_repo()
-        .ok_or_else(|| {
-            crate::error::AppError::Internal("Qdrant repository not configured".to_string())
-        })?
-        .clone();
+    let qdrant_repo = state.qdrant_repo.clone();
     debug!("create_event: got Qdrant repository");
 
-    // Build EventProcessingContext
+    // Build EventProcessingContext with global providers
     debug!("create_event: building EventProcessingContext");
 
     let context = EventProcessingContext {
         memory_processor,
+        event_handler,
         llm_provider,
         embedding_provider,
-        embedding_provider_name: request.embedding_provider.clone(),
+        embedding_provider_name,
         qdrant_repo,
         embedding_providers,
     };
@@ -706,8 +472,6 @@ mod tests {
         let api_request = CreateEventApiRequest {
             owner_id: "owner123".to_string(),
             content: "User clicked the dark mode button".to_string(),
-            llm_provider: "openai".to_string(),
-            embedding_provider: "text-embedding".to_string(),
             context: Some("Settings page".to_string()),
             scope_id: Some("user123".to_string()),
             source: Some("api".to_string()),
@@ -726,20 +490,35 @@ mod tests {
     fn test_create_event_request_defaults() {
         let json = r#"{
             "owner_id": "owner123",
-            "content": "Test event content",
-            "llm_provider": "my-llm",
-            "embedding_provider": "my-embedding"
+            "content": "Test event content"
         }"#;
 
         let api_request: CreateEventApiRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(api_request.owner_id, "owner123");
         assert_eq!(api_request.content, "Test event content");
-        assert_eq!(api_request.llm_provider, "my-llm");
-        assert_eq!(api_request.embedding_provider, "my-embedding");
         assert!(api_request.context.is_none());
         assert!(api_request.scope_id.is_none());
         assert!(api_request.source.is_none());
+    }
+
+    #[test]
+    fn test_create_event_request_with_all_fields() {
+        let json = r#"{
+            "owner_id": "owner123",
+            "content": "Test event content",
+            "context": "Test context",
+            "scope_id": "scope456",
+            "source": "api"
+        }"#;
+
+        let api_request: CreateEventApiRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(api_request.owner_id, "owner123");
+        assert_eq!(api_request.content, "Test event content");
+        assert_eq!(api_request.context, Some("Test context".to_string()));
+        assert_eq!(api_request.scope_id, Some("scope456".to_string()));
+        assert_eq!(api_request.source, Some("api".to_string()));
     }
 
     #[test]

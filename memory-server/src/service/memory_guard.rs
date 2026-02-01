@@ -56,6 +56,8 @@ pub struct ProcessEventResult {
 pub struct EventProcessingContext {
     /// Memory processor for LLM-driven extraction
     pub memory_processor: Arc<MemoryProcessor>,
+    /// Event handler for structuring events into six-element format
+    pub event_handler: Option<Arc<super::EventHandler>>,
     /// LLM provider for consistency checking
     pub llm_provider: Arc<dyn crate::llm::LlmProvider>,
     /// Embedding provider for new memories (from request)
@@ -66,6 +68,9 @@ pub struct EventProcessingContext {
     pub qdrant_repo: QdrantRepository,
     /// Map of embedding provider name -> provider instance (for existing memories)
     /// This is populated based on what providers are used by existing memories
+    /// TODO remove later because embedding and llm are provided by config
+    /// not databse
+    /// so only there will be only one llm provider and embedding provider
     pub embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>>,
 }
 
@@ -355,7 +360,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
     ///
     /// This is the main entry point for the Event → Memory processing flow.
     /// It:
-    /// 1. Stores the event
+    /// 1. Structures the event into six-element format (if EventHandler is available)
     /// 2. Extracts potential memories using LLM
     /// 3. For each extracted memory:
     ///    a. Queries existing memories grouped by embedding_provider
@@ -365,7 +370,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
     ///
     /// The context parameter provides all dynamically created providers.
     ///
-    /// Requirements: 2.1, 3.1, 3.2, 3.3, 3.4
+    /// Requirements: 2.1, 3.1, 3.2, 3.3, 3.4, 6.9-6.10, 8.1-8.4
     pub async fn process_event_with_context(
         &self,
         event: &Event,
@@ -379,12 +384,50 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             "Processing event with context"
         );
 
-        // Extract memories from the event using LLM
-        let extract_request = ExtractFromEventRequest {
-            content: event.content.clone(),
-            context: event.context.clone(),
+        // Step 1: Structure the event into six-element format (if EventHandler is available)
+        let structured_event = if let Some(ref event_handler) = context.event_handler {
+            match event_handler.structure_event(event).await {
+                Ok(structured) => {
+                    debug!(
+                        event_id = %event.id,
+                        structured_event_id = %structured.id,
+                        "Event structured into six-element format"
+                    );
+                    Some(structured)
+                }
+                Err(e) => {
+                    warn!(
+                        event_id = %event.id,
+                        error = %e,
+                        "Failed to structure event, continuing with raw content"
+                    );
+                    None
+                }
+            }
+        } else {
+            debug!(
+                event_id = %event.id,
+                "No EventHandler available, using raw event content"
+            );
+            None
         };
 
+        // Step 2: Build extraction request with structured event info if available
+        let extract_request = if let Some(ref structured) = structured_event {
+            // Build enhanced context from structured event
+            let enhanced_context = Self::build_enhanced_context(event, structured);
+            ExtractFromEventRequest {
+                content: event.content.clone(),
+                context: Some(enhanced_context),
+            }
+        } else {
+            ExtractFromEventRequest {
+                content: event.content.clone(),
+                context: event.context.clone(),
+            }
+        };
+
+        // Step 3: Extract memories from the event using LLM
         let extract_result = context
             .memory_processor
             .extract_from_event(extract_request)
@@ -890,6 +933,53 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
         // Perform retrieval
         engine.retrieve(request, similarities, actor_id).await
+    }
+
+    /// Build enhanced context from structured event for memory extraction
+    ///
+    /// Combines the original event context with structured event information
+    /// to provide richer context for memory extraction.
+    fn build_enhanced_context(
+        event: &Event,
+        structured: &crate::domain::StructuredEvent,
+    ) -> String {
+        let mut context_parts = Vec::new();
+
+        // Add original context if present
+        if let Some(ref ctx) = event.context {
+            context_parts.push(format!("原始上下文: {}", ctx));
+        }
+
+        // Add structured event elements
+        context_parts.push("结构化事件信息:".to_string());
+
+        if let Some(ref time) = structured.time_element {
+            context_parts.push(format!("- 时间: {}", time));
+        }
+        if let Some(ref location) = structured.location_element {
+            context_parts.push(format!("- 地点: {}", location));
+        }
+        context_parts.push(format!("- 人物: {}", structured.actor_element));
+        if let Some(ref cause) = structured.cause_element {
+            context_parts.push(format!("- 起因: {}", cause));
+        }
+        if let Some(ref process) = structured.process_element {
+            context_parts.push(format!("- 经过: {}", process));
+        }
+        if let Some(ref result) = structured.result_element {
+            context_parts.push(format!("- 结果: {}", result));
+        }
+        if let Some(ref background) = structured.background_element {
+            context_parts.push(format!("- 背景: {}", background));
+        }
+        if let Some(ref details) = structured.details_element {
+            context_parts.push(format!("- 细节: {}", details));
+        }
+        if let Some(ref category) = structured.category {
+            context_parts.push(format!("- 分类: {}", category));
+        }
+
+        context_parts.join("\n")
     }
 }
 

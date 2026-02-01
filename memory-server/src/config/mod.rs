@@ -6,12 +6,16 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::env;
 
+use crate::embedding::ProviderType;
+use crate::llm::LlmProviderType;
+
 /// Main application configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub qdrant: QdrantConfig,
+    pub llm: LlmConfig,
     pub embedding: EmbeddingConfig,
     pub lifecycle: LifecycleConfig,
     pub retrieval: RetrievalConfig,
@@ -72,35 +76,34 @@ fn default_collection_name() -> String {
     "memories".to_string()
 }
 
-/// Embedding provider configuration
+/// LLM provider configuration (loaded from config.yaml)
 #[derive(Debug, Clone, Deserialize)]
-pub struct EmbeddingConfig {
-    #[serde(default)]
-    pub default_provider: Option<String>,
-    #[serde(default)]
-    pub providers: Vec<ProviderConfig>,
-}
-
-/// Individual embedding provider configuration
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProviderConfig {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub provider_type: String,
+pub struct LlmConfig {
+    /// Provider type (openai, azure, local)
+    pub provider_type: LlmProviderType,
+    /// API endpoint URL
     pub endpoint: String,
+    /// API key (can be overridden via MEMORY_SERVER__LLM__API_KEY)
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Model name/identifier
     pub model: String,
-    pub dimension: usize,
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitConfig>,
 }
 
-/// Rate limiting configuration for embedding providers
+/// Embedding provider configuration (loaded from config.yaml)
 #[derive(Debug, Clone, Deserialize)]
-pub struct RateLimitConfig {
-    pub requests_per_minute: Option<u32>,
-    pub tokens_per_minute: Option<u32>,
+pub struct EmbeddingConfig {
+    /// Provider type (openai, azure, local)
+    pub provider_type: ProviderType,
+    /// API endpoint URL
+    pub endpoint: String,
+    /// API key (can be overridden via MEMORY_SERVER__EMBEDDING__API_KEY)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model name/identifier
+    pub model: String,
+    /// Embedding dimension
+    pub dimension: usize,
 }
 
 /// Memory lifecycle management configuration

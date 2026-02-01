@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::domain::{CreateMemoryInput, EmbeddingStatus, Memory, ProcessingStatus, Status};
+use crate::embedding::EmbeddingRequest;
 use crate::error::AppResult;
 use crate::service::UpdateMemoryRequest;
 
@@ -284,61 +285,77 @@ pub async fn create_memory(
 ) -> AppResult<(StatusCode, Json<CreateMemoryResponse>)> {
     use crate::repository::VectorPayload;
 
-    let embedding_provider = request.embedding_provider.clone();
     let input: CreateMemoryInput = request.into();
 
     let mut memory = state.memory_guard.create_memory(input, None).await?;
 
-    // Generate embedding and store in Qdrant if provider is available
-    if state
-        .config_center
-        .has_enabled_provider()
-        .await
-        .unwrap_or(false)
-    {
-        let payload = VectorPayload {
-            memory_id: memory.id,
-            scope_id: memory.scope_id.clone(),
-            category: memory.category.clone(),
-            is_global: memory.is_global,
-            status: memory.status.to_string(),
-        };
+    let payload = VectorPayload {
+        memory_id: memory.id,
+        scope_id: memory.scope_id.clone(),
+        category: memory.category.clone(),
+        is_global: memory.is_global,
+        status: memory.status.to_string(),
+    };
 
-        match state
-            .config_center
-            .generate_and_store_embedding(
-                memory.id,
-                &memory.content,
-                embedding_provider.as_deref(),
-                payload,
-            )
-            .await
-        {
-            Ok(provider_name) => {
-                // Update embedding status in database
-                memory = state
-                    .memory_guard
-                    .memory_repo()
-                    .update_embedding_status_and_provider(
-                        memory.id,
-                        EmbeddingStatus::Completed,
-                        Some(&provider_name),
-                    )
-                    .await?;
+    let embedding_provider_name = state.embedding_provider_name.clone();
+
+    // Generate embedding using global provider
+    let embedding_request = EmbeddingRequest::new(&memory.content);
+    match state.embedding_provider.embed(embedding_request).await {
+        Ok(embedding_response) => {
+            // Store in Qdrant
+            match state
+                .qdrant_repo
+                .upsert_vector(
+                    &embedding_provider_name,
+                    memory.id,
+                    embedding_response.embedding,
+                    payload,
+                )
+                .await
+            {
+                Ok(_) => {
+                    // Update embedding status in database
+                    memory = state
+                        .memory_guard
+                        .memory_repo()
+                        .update_embedding_status_and_provider(
+                            memory.id,
+                            EmbeddingStatus::Completed,
+                            Some(&embedding_provider_name),
+                        )
+                        .await?;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %memory.id,
+                        error = %e,
+                        "Failed to store embedding in Qdrant"
+                    );
+                    memory = state
+                        .memory_guard
+                        .memory_repo()
+                        .update_embedding_status_and_provider(
+                            memory.id,
+                            EmbeddingStatus::Failed,
+                            None,
+                        )
+                        .await?;
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    memory_id = %memory.id,
-                    error = %e,
-                    "Failed to generate embedding, memory created without vector"
-                );
-                // Update embedding status to failed in database
-                memory = state
-                    .memory_guard
-                    .memory_repo()
-                    .update_embedding_status_and_provider(memory.id, EmbeddingStatus::Failed, None)
-                    .await?;
-            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                memory_id = %memory.id,
+                error = %e,
+                "Failed to generate embedding, memory created without vector"
+            );
+            // Update embedding status to failed in database
+            memory = state
+                .memory_guard
+                .memory_repo()
+                .update_embedding_status_and_provider(memory.id, EmbeddingStatus::Failed, None)
+                .await?;
         }
     }
 

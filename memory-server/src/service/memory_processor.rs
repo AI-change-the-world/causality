@@ -721,6 +721,113 @@ impl MemoryProcessor {
             enhanced_query,
         })
     }
+
+    /// Extract memories from a structured event
+    ///
+    /// This method uses the six-element structured event information to provide
+    /// richer context for memory extraction. It builds a specialized prompt
+    /// that includes all structured elements.
+    ///
+    /// # Arguments
+    /// * `content` - The original event content
+    /// * `structured_event` - The structured event with six elements
+    ///
+    /// # Returns
+    /// * `Ok(ExtractFromEventResult)` - Extracted memories with enhanced context
+    /// * `Err(ProcessingError)` - If extraction fails
+    pub async fn extract_from_structured_event(
+        &self,
+        content: &str,
+        structured_event: &crate::domain::StructuredEvent,
+    ) -> Result<ExtractFromEventResult, ProcessingError> {
+        debug!(
+            content_len = content.len(),
+            event_id = %structured_event.event_id,
+            "Extracting memories from structured event"
+        );
+
+        // Validate minimum content length
+        if content.trim().len() < MIN_EVENT_CONTENT_LENGTH {
+            return Err(ProcessingError::EventContentTooShort {
+                min: MIN_EVENT_CONTENT_LENGTH,
+            });
+        }
+
+        // Build enhanced context from structured event
+        let structured_context = Self::build_structured_context(structured_event);
+
+        // Summarize if content is too long
+        let processed_content = if self.needs_summary(content) {
+            self.summarize_conversation(content).await?
+        } else {
+            content.to_string()
+        };
+
+        // Build the extraction prompt with structured context
+        let prompt = self.build_extraction_prompt(&processed_content, &Some(structured_context));
+
+        // Call LLM for extraction
+        let chat_request = ChatRequest::new(prompt)
+            .with_temperature(0.3)
+            .with_json_response();
+
+        let response = self.llm_provider.chat(chat_request).await?;
+
+        // Parse the extraction response
+        let result = Self::parse_extraction_response(&response.content)?;
+
+        info!(
+            memory_count = result.extracted_memories.len(),
+            confidence = result.confidence,
+            event_id = %structured_event.event_id,
+            "Memories extracted from structured event"
+        );
+
+        Ok(result)
+    }
+
+    /// Build structured context from a StructuredEvent
+    ///
+    /// Creates a formatted context string containing all six elements
+    /// plus auxiliary information from the structured event.
+    fn build_structured_context(structured_event: &crate::domain::StructuredEvent) -> String {
+        let mut context_parts = Vec::new();
+
+        context_parts.push("结构化事件信息（六要素）:".to_string());
+
+        // Core six elements
+        if let Some(ref time) = structured_event.time_element {
+            context_parts.push(format!("- 时间: {}", time));
+        }
+        if let Some(ref location) = structured_event.location_element {
+            context_parts.push(format!("- 地点: {}", location));
+        }
+        context_parts.push(format!("- 人物: {}", structured_event.actor_element));
+        if let Some(ref cause) = structured_event.cause_element {
+            context_parts.push(format!("- 起因: {}", cause));
+        }
+        if let Some(ref process) = structured_event.process_element {
+            context_parts.push(format!("- 经过: {}", process));
+        }
+        if let Some(ref result) = structured_event.result_element {
+            context_parts.push(format!("- 结果: {}", result));
+        }
+
+        // Auxiliary elements
+        if let Some(ref background) = structured_event.background_element {
+            context_parts.push(format!("- 背景: {}", background));
+        }
+        if let Some(ref details) = structured_event.details_element {
+            context_parts.push(format!("- 细节: {}", details));
+        }
+
+        // Category
+        if let Some(ref category) = structured_event.category {
+            context_parts.push(format!("- 事件分类: {}", category));
+        }
+
+        context_parts.join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -914,7 +1021,7 @@ mod tests {
             name: "test".to_string(),
             provider_type: LlmProviderType::Local,
             endpoint: "http://localhost:11434".to_string(),
-            api_key: None,
+            api_key: Some("test-key".to_string()), // API key required for provider creation
             model: "test".to_string(),
             enabled: true,
         };

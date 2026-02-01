@@ -17,17 +17,22 @@ qdrant:
   url: "http://qdrant:6334"
   collection_name: "memories"
 
-# Embedding providers are managed via API
-# POST /api/v1/config/providers
-embedding:
-  default_provider: null
-  providers: []
-
-# LLM providers are managed via API
-# POST /api/v1/config/llm-providers
+# LLM provider configuration (single provider from config)
+# API key can be overridden via MEMORY_SERVER__LLM__API_KEY
 llm:
-  default_provider: null
-  providers: []
+  provider_type: openai  # openai | azure | local
+  endpoint: "https://api.openai.com/v1"
+  api_key: ""  # Set via environment variable for security
+  model: "gpt-4o-mini"
+
+# Embedding provider configuration (single provider from config)
+# API key can be overridden via MEMORY_SERVER__EMBEDDING__API_KEY
+embedding:
+  provider_type: openai  # openai | azure | local
+  endpoint: "https://api.openai.com/v1"
+  api_key: ""  # Set via environment variable for security
+  model: "text-embedding-3-small"
+  dimension: 1536
 
 lifecycle:
   cooldown_check_interval_seconds: 3600

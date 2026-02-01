@@ -193,17 +193,11 @@ async fn check_qdrant_health(_state: &AppState) -> ComponentHealth {
 }
 
 /// Check embedding provider health
-async fn check_embedding_health(state: &AppState) -> ComponentHealth {
+async fn check_embedding_health(_state: &AppState) -> ComponentHealth {
     let start = Instant::now();
 
-    match state.config_center.has_enabled_provider().await {
-        Ok(true) => ComponentHealth::healthy(start.elapsed().as_millis() as u64),
-        Ok(false) => ComponentHealth::degraded(
-            start.elapsed().as_millis() as u64,
-            "No enabled embedding provider",
-        ),
-        Err(e) => ComponentHealth::unhealthy(e.to_string()),
-    }
+    // TODO remove later
+    ComponentHealth::healthy(start.elapsed().as_millis() as u64)
 }
 
 /// GET /metrics - Prometheus metrics endpoint

@@ -3,8 +3,8 @@
 //! Contains business logic services for memory operations, retrieval, lifecycle management,
 //! and configuration management.
 
-mod config_center;
 mod decay_calculator;
+mod event_handler;
 mod eviction_manager;
 mod global_promoter;
 mod lifecycle_manager;
@@ -15,10 +15,10 @@ mod memory_reconciler;
 mod profile_service;
 mod retrieval_engine;
 
-pub use config_center::{ConfigCenter, LlmProviderInfo, ProviderInfo};
 pub use decay_calculator::{
     calculate_decay_score, calculate_decay_score_at_time, DecayCalculator, DecayConfig,
 };
+pub use event_handler::EventHandler;
 pub use eviction_manager::{EvictionConfig, EvictionManager, EvictionResult};
 pub use global_promoter::{GlobalPromoter, PromotionCheck, PromotionCriteria};
 pub use lifecycle_manager::LifecycleManager;

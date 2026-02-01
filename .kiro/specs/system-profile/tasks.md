@@ -77,19 +77,19 @@
   - 运行 `cargo test --lib`
   - 确保所有测试通过，如有问题请询问用户
 
-- [ ] 7. Provider 配置简化
-  - [ ] 7.1 更新配置模块
+- [-] 7. Provider 配置简化
+  - [x] 7.1 更新配置模块
     - 修改 `memory-server/src/config/mod.rs`
     - 添加完整的 LlmConfig 结构（provider_type, endpoint, api_key, model）
     - 添加完整的 EmbeddingConfig 结构（provider_type, endpoint, api_key, model, dimension）
     - _Requirements: 5.1, 5.2_
-  - [ ] 7.2 删除 Provider 数据库相关代码
+  - [x] 7.2 删除 Provider 数据库相关代码
     - 删除 `memory-server/src/repository/config_repo.rs` 中的 provider 相关方法
     - 删除 `memory-server/src/repository/llm_provider_repo.rs`
     - 删除 `memory-server/src/api/config.rs` 中的 provider 管理 API
     - 更新相关 mod.rs 导出
     - _Requirements: 5.3, 5.4_
-  - [ ] 7.3 更新 AppState 初始化
+  - [x] 7.3 更新 AppState 初始化
     - 修改 `memory-server/src/main.rs`
     - 在启动时从 config.yaml 加载 LLM 和 Embedding 配置
     - 创建全局 LLM provider 实例并存入 AppState
@@ -98,30 +98,30 @@
     - 配置无效时启动失败并输出错误信息
     - _Requirements: 5.5, 5.6_
 
-- [ ] 8. Event API 简化
-  - [ ] 8.1 修改 CreateEventApiRequest
+- [x] 8. Event API 简化
+  - [x] 8.1 修改 CreateEventApiRequest
     - 修改 `memory-server/src/api/event.rs`
     - 删除 llm_provider 和 embedding_provider 字段
     - 使用 AppState 中的全局 provider
     - _Requirements: 5.5_
-  - [ ] 8.2 更新 process_event_background 和 create_event
+  - [x] 8.2 更新 process_event_background 和 create_event
     - 移除动态 provider 创建逻辑
     - 直接使用 AppState 中的 provider 实例
     - _Requirements: 5.5_
 
-- [ ] 9. EventHandler 实现
-  - [ ] 9.1 创建 EventHandler 服务
+- [x] 9. EventHandler 实现
+  - [x] 9.1 创建 EventHandler 服务
     - 创建 `memory-server/src/service/event_handler.rs`
     - 实现 structure_event 方法（使用 LLM 解析六要素）
     - 实现 build_extraction_prompt 方法（使用 SystemProfile 的 extraction_strategy）
     - 更新 `memory-server/src/service/mod.rs` 导出
     - _Requirements: 6.9-6.10, 7.1-7.5_
-  - [ ] 9.2 集成到事件处理流程
+  - [x] 9.2 集成到事件处理流程
     - 修改 `memory-server/src/api/event.rs` 或相关处理逻辑
     - 在处理事件时先调用 EventHandler.structure_event
     - 将 StructuredEvent 传递给 MemoryProcessor
     - _Requirements: 8.1-8.4_
-  - [ ] 9.3 更新 MemoryProcessor
+  - [x] 9.3 更新 MemoryProcessor
     - 修改 `memory-server/src/service/memory_processor.rs`
     - 使用 StructuredEvent 的结构化信息提取记忆
     - 在 prompt 中包含六要素信息

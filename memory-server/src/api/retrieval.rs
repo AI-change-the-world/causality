@@ -268,10 +268,7 @@ pub async fn retrieve_memories(
     State(state): State<AppState>,
     Json(request): Json<RetrieveApiRequest>,
 ) -> AppResult<Json<RetrieveApiResponse>> {
-    use crate::embedding::{
-        EmbeddingProvider, EmbeddingRequest, LocalProvider, OpenAIProvider, ProviderType,
-    };
-    use std::sync::Arc;
+    use crate::embedding::EmbeddingRequest;
     use tracing::{debug, warn};
 
     debug!(
@@ -304,63 +301,18 @@ pub async fn retrieve_memories(
             "retrieve_memories: found memories with embeddings grouped by provider"
         );
 
-        // Get Qdrant repository for vector search
-        if let Some(qdrant_repo) = state.config_center.qdrant_repo() {
-            // For each provider, generate query embedding and search
-            for provider_name in memories_by_provider.keys() {
-                // Get provider config
-                let provider_config = match state
-                    .config_center
-                    .get_cached_provider(provider_name)
-                    .await
-                {
-                    Some(config) if config.enabled => config,
-                    Some(_) => {
-                        warn!(provider = %provider_name, "Embedding provider is disabled, skipping");
-                        continue;
-                    }
-                    None => {
-                        warn!(provider = %provider_name, "Embedding provider not found, skipping");
-                        continue;
-                    }
-                };
+        // Use global embedding provider for query embedding
+        let embedding_provider_name = &state.embedding_provider_name;
 
-                // Create embedding provider instance
-                let embedding_provider: Arc<dyn EmbeddingProvider> = match provider_config
-                    .provider_type
-                {
-                    ProviderType::OpenAI | ProviderType::Azure => {
-                        match OpenAIProvider::new(provider_config.clone()) {
-                            Ok(p) => Arc::new(p),
-                            Err(e) => {
-                                warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
-                                continue;
-                            }
-                        }
-                    }
-                    ProviderType::Local => match LocalProvider::new(provider_config.clone()) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
-                            continue;
-                        }
-                    },
-                };
-
-                // Generate query embedding for this provider
-                let embedding_request = EmbeddingRequest::new(&request.query);
-                let query_embedding = match embedding_provider.embed(embedding_request).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        warn!(provider = %provider_name, error = %e, "Failed to generate query embedding, skipping");
-                        continue;
-                    }
-                };
-
-                // Search in this provider's Qdrant collection
-                let search_results = match qdrant_repo
+        // Generate query embedding using global provider
+        let embedding_request = EmbeddingRequest::new(&request.query);
+        match state.embedding_provider.embed(embedding_request).await {
+            Ok(query_embedding) => {
+                // Search in the global provider's Qdrant collection
+                let search_results = match state
+                    .qdrant_repo
                     .search(
-                        provider_name,
+                        embedding_provider_name,
                         query_embedding.embedding,
                         top_k * 2, // Get more candidates for filtering
                         None,
@@ -369,21 +321,24 @@ pub async fn retrieve_memories(
                 {
                     Ok(results) => results,
                     Err(e) => {
-                        warn!(provider = %provider_name, error = %e, "Vector search failed, skipping");
-                        continue;
+                        warn!(provider = %embedding_provider_name, error = %e, "Vector search failed");
+                        vec![]
                     }
                 };
 
                 debug!(
-                    provider = %provider_name,
+                    provider = %embedding_provider_name,
                     results = search_results.len(),
-                    "retrieve_memories: vector search completed for provider"
+                    "retrieve_memories: vector search completed"
                 );
 
                 // Add results to combined list
                 for result in search_results {
                     all_similarities.push((result.memory_id, result.score));
                 }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to generate query embedding");
             }
         }
     }
@@ -471,10 +426,7 @@ pub async fn auto_retrieve_memories(
     State(state): State<AppState>,
     Json(request): Json<AutoRetrieveApiRequest>,
 ) -> AppResult<Json<AutoRetrieveApiResponse>> {
-    use crate::embedding::{
-        EmbeddingProvider, EmbeddingRequest, LocalProvider, OpenAIProvider, ProviderType,
-    };
-    use std::sync::Arc;
+    use crate::embedding::EmbeddingRequest;
     use tracing::{debug, warn};
 
     debug!(
@@ -504,70 +456,43 @@ pub async fn auto_retrieve_memories(
         "auto_retrieve_memories: found memories with embeddings grouped by provider"
     );
 
-    if let Some(qdrant_repo) = state.config_center.qdrant_repo() {
-        for provider_name in memories_by_provider.keys() {
-            let provider_config = match state.config_center.get_cached_provider(provider_name).await
-            {
-                Some(config) if config.enabled => config,
-                Some(_) => {
-                    warn!(provider = %provider_name, "Embedding provider is disabled, skipping");
-                    continue;
-                }
-                None => {
-                    warn!(provider = %provider_name, "Embedding provider not found, skipping");
-                    continue;
-                }
-            };
+    // Use global embedding provider for query embedding
+    let embedding_provider_name = &state.embedding_provider_name;
 
-            let embedding_provider: Arc<dyn EmbeddingProvider> = match provider_config.provider_type
-            {
-                ProviderType::OpenAI | ProviderType::Azure => {
-                    match OpenAIProvider::new(provider_config.clone()) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
-                            continue;
-                        }
-                    }
-                }
-                ProviderType::Local => match LocalProvider::new(provider_config.clone()) {
-                    Ok(p) => Arc::new(p),
-                    Err(e) => {
-                        warn!(provider = %provider_name, error = %e, "Failed to create embedding provider, skipping");
-                        continue;
-                    }
-                },
-            };
-
-            let embedding_request = EmbeddingRequest::new(&request.query);
-            let query_embedding = match embedding_provider.embed(embedding_request).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    warn!(provider = %provider_name, error = %e, "Failed to generate query embedding, skipping");
-                    continue;
-                }
-            };
-
-            let search_results = match qdrant_repo
-                .search(provider_name, query_embedding.embedding, top_k * 2, None)
+    // Generate query embedding using global provider
+    let embedding_request = EmbeddingRequest::new(&request.query);
+    match state.embedding_provider.embed(embedding_request).await {
+        Ok(query_embedding) => {
+            // Search in the global provider's Qdrant collection
+            let search_results = match state
+                .qdrant_repo
+                .search(
+                    embedding_provider_name,
+                    query_embedding.embedding,
+                    top_k * 2,
+                    None,
+                )
                 .await
             {
                 Ok(results) => results,
                 Err(e) => {
-                    warn!(provider = %provider_name, error = %e, "Vector search failed, skipping");
-                    continue;
+                    warn!(provider = %embedding_provider_name, error = %e, "Vector search failed");
+                    vec![]
                 }
             };
 
             debug!(
-                provider = %provider_name,
+                provider = %embedding_provider_name,
                 results = search_results.len(),
-                "auto_retrieve_memories: vector search completed for provider"
+                "auto_retrieve_memories: vector search completed"
             );
 
             for result in search_results {
                 all_similarities.push((result.memory_id, result.score));
             }
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to generate query embedding");
         }
     }
 

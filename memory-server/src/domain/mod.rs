@@ -31,4 +31,4 @@ pub use status::{
     EmbeddingStatus, ExtractedMemory, InferenceType, MemoryCategory, ProcessingMode,
     ProcessingStatus, Status,
 };
-pub use structured_event::StructuredEvent;
+pub use structured_event::{CreateStructuredEventInput, ParsedStructuredEvent, StructuredEvent};

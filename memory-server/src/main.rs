@@ -5,6 +5,7 @@
 //! - Database connection pool initialization
 //! - Database migration execution
 //! - Qdrant client initialization
+//! - Global LLM and Embedding provider initialization
 //! - HTTP server startup
 
 use std::net::SocketAddr;
@@ -14,19 +15,20 @@ use std::time::Duration;
 use axum::http::header::HeaderName;
 use causality::api::{create_router, health::init_start_time, AppState};
 use causality::config::AppConfig;
+use causality::embedding::{EmbeddingProvider, LocalProvider, OpenAIProvider, ProviderType};
+use causality::llm::{
+    LlmProvider, LlmProviderConfig, LlmProviderType, LocalLlmProvider, OpenAILlmProvider,
+};
 use causality::repository::{
-    AuditRepository, ConfigRepository, EventRepository, LlmProviderRepository, MemoryRepository,
-    ProfileRepository, QdrantRepository,
+    AuditRepository, EventRepository, MemoryRepository, ProfileRepository, QdrantRepository,
 };
-use causality::service::{
-    ConfigCenter, LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine,
-};
+use causality::service::{LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -100,12 +102,60 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Qdrant client initialized");
 
+    // Initialize global LLM provider from config
+    info!(
+        provider_type = %config.llm.provider_type,
+        model = %config.llm.model,
+        "Initializing global LLM provider"
+    );
+
+    let llm_provider: Arc<dyn LlmProvider> = create_llm_provider(&config)?;
+    info!("Global LLM provider initialized");
+
+    // Initialize global Embedding provider from config
+    info!(
+        provider_type = %config.embedding.provider_type,
+        model = %config.embedding.model,
+        dimension = config.embedding.dimension,
+        "Initializing global Embedding provider"
+    );
+
+    let (embedding_provider, embedding_provider_name) = create_embedding_provider(&config)?;
+    info!(
+        provider_name = %embedding_provider_name,
+        "Global Embedding provider initialized"
+    );
+
+    // Ensure Qdrant collection exists for the embedding provider
+    if !qdrant_repo
+        .collection_exists(&embedding_provider_name)
+        .await
+    {
+        info!(
+            collection = %embedding_provider_name,
+            dimension = config.embedding.dimension,
+            "Creating Qdrant collection"
+        );
+        qdrant_repo
+            .create_collection(&embedding_provider_name, config.embedding.dimension)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to create Qdrant collection");
+                anyhow::anyhow!("Qdrant collection creation error: {}", e)
+            })?;
+        info!("Qdrant collection created");
+    } else {
+        info!(
+            collection = %embedding_provider_name,
+            "Qdrant collection already exists"
+        );
+    }
+
     // Create repositories
     let memory_repo = MemoryRepository::new(pool.clone());
     let event_repo = EventRepository::new(pool.clone());
     let audit_repo = AuditRepository::new(pool.clone());
-    let config_repo = ConfigRepository::new(pool.clone());
-    let llm_repo = LlmProviderRepository::new(pool.clone());
+    let profile_repo = ProfileRepository::new(pool.clone());
 
     // Create services
     let memory_guard = MemoryGuard::new_basic(
@@ -123,13 +173,6 @@ async fn main() -> anyhow::Result<()> {
         config.audit.enabled,
     );
 
-    let config_center = ConfigCenter::with_full_support(config_repo.clone(), llm_repo, qdrant_repo);
-
-    // Initialize config center (load providers from database)
-    if let Err(e) = config_center.initialize().await {
-        warn!(error = %e, "Failed to initialize config center - providers may not be loaded");
-    }
-
     let lifecycle_manager = LifecycleManager::new(
         memory_repo.clone(),
         audit_repo.clone(),
@@ -137,74 +180,19 @@ async fn main() -> anyhow::Result<()> {
         config.audit.enabled,
     );
 
-    // Create ProfileService with default LLM provider
-    let profile_repo = ProfileRepository::new(pool.clone());
-    let profile_service = {
-        // Try to get the default LLM provider
-        let llm_provider: Arc<dyn causality::llm::LlmProvider> = match config_center
-            .get_default_llm_provider_name()
-            .await
-        {
-            Ok(Some(name)) => {
-                if let Some(llm_config) = config_center.get_cached_llm_provider(&name).await {
-                    match llm_config.provider_type {
-                        causality::llm::LlmProviderType::OpenAI
-                        | causality::llm::LlmProviderType::Azure => {
-                            Arc::new(causality::llm::OpenAILlmProvider::new(llm_config).map_err(
-                                |e| anyhow::anyhow!("Failed to create LLM provider: {}", e),
-                            )?)
-                        }
-                        causality::llm::LlmProviderType::Local => {
-                            Arc::new(causality::llm::LocalLlmProvider::new(llm_config).map_err(
-                                |e| anyhow::anyhow!("Failed to create LLM provider: {}", e),
-                            )?)
-                        }
-                    }
-                } else {
-                    warn!("Default LLM provider not found in cache, using placeholder");
-                    Arc::new(
-                        causality::llm::LocalLlmProvider::new(causality::llm::LlmProviderConfig {
-                            name: "placeholder".to_string(),
-                            provider_type: causality::llm::LlmProviderType::Local,
-                            endpoint: "http://localhost:11434".to_string(),
-                            api_key: None,
-                            model: "llama2".to_string(),
-                            enabled: false,
-                        })
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to create placeholder LLM provider: {}", e)
-                        })?,
-                    )
-                }
-            }
-            _ => {
-                warn!("No default LLM provider configured, using placeholder");
-                Arc::new(
-                    causality::llm::LocalLlmProvider::new(causality::llm::LlmProviderConfig {
-                        name: "placeholder".to_string(),
-                        provider_type: causality::llm::LlmProviderType::Local,
-                        endpoint: "http://localhost:11434".to_string(),
-                        api_key: None,
-                        model: "llama2".to_string(),
-                        enabled: false,
-                    })
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to create placeholder LLM provider: {}", e)
-                    })?,
-                )
-            }
-        };
-
-        ProfileService::new(profile_repo, llm_provider)
-    };
+    // Create ProfileService with global LLM provider
+    let profile_service = ProfileService::new(profile_repo, llm_provider.clone());
 
     // Create application state
     let app_state = AppState {
         memory_guard: Arc::new(memory_guard),
         retrieval_engine,
-        config_center,
         lifecycle_manager,
         profile_service,
+        llm_provider,
+        embedding_provider,
+        embedding_provider_name,
+        qdrant_repo,
     };
 
     // Create router with middleware
@@ -248,6 +236,70 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Create LLM provider from configuration
+fn create_llm_provider(config: &AppConfig) -> anyhow::Result<Arc<dyn LlmProvider>> {
+    let llm_config = LlmProviderConfig {
+        name: format!("{}-{}", config.llm.provider_type, config.llm.model),
+        provider_type: config.llm.provider_type,
+        endpoint: config.llm.endpoint.clone(),
+        api_key: config.llm.api_key.clone(),
+        model: config.llm.model.clone(),
+        enabled: true,
+    };
+
+    match config.llm.provider_type {
+        LlmProviderType::OpenAI | LlmProviderType::Azure => Ok(Arc::new(
+            OpenAILlmProvider::new(llm_config).map_err(|e| {
+                error!(error = %e, "Failed to create OpenAI LLM provider");
+                anyhow::anyhow!("LLM provider initialization error: {}", e)
+            })?,
+        )),
+        LlmProviderType::Local => Ok(Arc::new(LocalLlmProvider::new(llm_config).map_err(
+            |e| {
+                error!(error = %e, "Failed to create local LLM provider");
+                anyhow::anyhow!("LLM provider initialization error: {}", e)
+            },
+        )?)),
+    }
+}
+
+/// Create Embedding provider from configuration
+fn create_embedding_provider(
+    config: &AppConfig,
+) -> anyhow::Result<(Arc<dyn EmbeddingProvider>, String)> {
+    use causality::embedding::ProviderConfig;
+
+    let provider_name = format!(
+        "{}-{}",
+        config.embedding.provider_type, config.embedding.model
+    );
+
+    let embedding_config = ProviderConfig {
+        name: provider_name.clone(),
+        provider_type: config.embedding.provider_type,
+        endpoint: config.embedding.endpoint.clone(),
+        api_key: config.embedding.api_key.clone(),
+        model: config.embedding.model.clone(),
+        dimension: config.embedding.dimension,
+        enabled: true,
+    };
+
+    let provider: Arc<dyn EmbeddingProvider> = match config.embedding.provider_type {
+        ProviderType::OpenAI | ProviderType::Azure => {
+            Arc::new(OpenAIProvider::new(embedding_config).map_err(|e| {
+                error!(error = %e, "Failed to create OpenAI Embedding provider");
+                anyhow::anyhow!("Embedding provider initialization error: {}", e)
+            })?)
+        }
+        ProviderType::Local => Arc::new(LocalProvider::new(embedding_config).map_err(|e| {
+            error!(error = %e, "Failed to create local Embedding provider");
+            anyhow::anyhow!("Embedding provider initialization error: {}", e)
+        })?),
+    };
+
+    Ok((provider, provider_name))
 }
 
 /// Run database migrations

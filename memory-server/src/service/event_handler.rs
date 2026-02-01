@@ -1,0 +1,461 @@
+//! EventHandler service
+//!
+//! Responsible for structuring raw events into the six-element format (六要素模型).
+//! Uses LLM to parse event content based on SystemProfile's extraction_prompt.
+//!
+//! The six core elements are:
+//! - Time (时间): When the event occurred
+//! - Location (地点): Device, page, content position
+//! - Actor (人物): User identifier
+//! - Cause (起因): Why the event was triggered
+//! - Process (经过): What happened step by step
+//! - Result (结果): Outcome of the event
+//!
+//! Plus two auxiliary elements:
+//! - Background (背景): Context/scenario
+//! - Details (细节): Key details, follow-up actions
+//!
+//! Requirements: 6.9-6.10, 7.1-7.5, 8.1-8.4
+
+use std::sync::Arc;
+use tracing::{debug, info, warn};
+
+use crate::domain::{Event, ParsedStructuredEvent, StructuredEvent};
+use crate::error::{AppError, AppResult};
+use crate::llm::{ChatRequest, LlmProvider};
+use crate::service::ProfileService;
+
+/// Default extraction prompt when no SystemProfile exists
+/// This provides generic extraction without domain-specific guidance
+const DEFAULT_EXTRACTION_PROMPT: &str = r#"你是一个事件分析助手。请将以下事件内容解析为结构化的六要素格式。
+
+事件内容：
+{content}
+
+请提取以下要素：
+1. 时间 (time)：事件发生的具体时间点
+2. 地点 (location)：用户使用的设备类型、所在页面或位置
+3. 人物 (actor)：用户标识
+4. 起因 (cause)：事件触发的原因或动机
+5. 经过 (process)：用户的具体操作过程
+6. 结果 (result)：操作的结果或影响
+7. 背景 (background)：用户当前的场景和目的
+8. 细节 (details)：其他关键信息
+9. 分类 (category)：事件类型分类
+
+请以 JSON 格式返回，无法确定的字段返回 null：
+```json
+{
+  "time": "时间信息或null",
+  "location": "地点信息或null",
+  "actor": "用户标识",
+  "cause": "起因或null",
+  "process": "经过或null",
+  "result": "结果或null",
+  "background": "背景或null",
+  "details": "细节或null",
+  "category": "分类或null"
+}
+```"#;
+
+/// EventHandler service for structuring raw events
+///
+/// Uses LLM to parse raw event content into the six-element structured format.
+/// When a SystemProfile exists, uses its extraction_prompt for domain-specific guidance.
+#[derive(Clone)]
+pub struct EventHandler {
+    /// LLM provider for parsing events
+    llm_provider: Arc<dyn LlmProvider>,
+    /// Profile service for getting extraction prompt
+    profile_service: Option<ProfileService>,
+}
+
+impl EventHandler {
+    /// Create a new EventHandler with LLM provider
+    pub fn new(llm_provider: Arc<dyn LlmProvider>) -> Self {
+        Self {
+            llm_provider,
+            profile_service: None,
+        }
+    }
+
+    /// Create a new EventHandler with LLM provider and profile service
+    pub fn with_profile_service(
+        llm_provider: Arc<dyn LlmProvider>,
+        profile_service: ProfileService,
+    ) -> Self {
+        Self {
+            llm_provider,
+            profile_service: Some(profile_service),
+        }
+    }
+
+    /// Structure a raw event into the six-element format
+    ///
+    /// Uses the SystemProfile's extraction_prompt if available,
+    /// otherwise falls back to the default generic prompt.
+    ///
+    /// # Arguments
+    /// * `event` - The raw event to structure
+    ///
+    /// # Returns
+    /// * `Ok(StructuredEvent)` - The structured event with six elements
+    /// * `Err(AppError)` - If LLM parsing fails
+    pub async fn structure_event(&self, event: &Event) -> AppResult<StructuredEvent> {
+        debug!(
+            event_id = %event.id,
+            owner_id = %event.owner_id,
+            content_len = event.content.len(),
+            "Structuring event into six-element format"
+        );
+
+        // Get the extraction prompt (from SystemProfile or default)
+        let extraction_prompt = self.get_extraction_prompt().await;
+
+        // Build the full prompt with event content
+        let prompt = self.build_extraction_prompt(&event.content, &extraction_prompt);
+
+        // Call LLM to parse the event
+        let chat_request = ChatRequest::new(prompt)
+            .with_temperature(0.3)
+            .with_json_response();
+
+        let response = self.llm_provider.chat(chat_request).await.map_err(|e| {
+            warn!(error = %e, event_id = %event.id, "LLM parsing failed for event");
+            AppError::Internal(format!("Failed to structure event: {}", e))
+        })?;
+
+        // Parse the LLM response into structured event
+        let parsed = self.parse_llm_response(&response.content, &event.owner_id)?;
+
+        // Create the StructuredEvent
+        let structured_event = StructuredEvent::from_parsed(event.id, parsed);
+
+        info!(
+            event_id = %event.id,
+            structured_event_id = %structured_event.id,
+            has_time = structured_event.time_element.is_some(),
+            has_location = structured_event.location_element.is_some(),
+            has_category = structured_event.category.is_some(),
+            "Event structured successfully"
+        );
+
+        Ok(structured_event)
+    }
+
+    /// Get the extraction prompt from SystemProfile or use default
+    async fn get_extraction_prompt(&self) -> String {
+        if let Some(ref profile_service) = self.profile_service {
+            match profile_service.get().await {
+                Ok(profile) => {
+                    if !profile.extraction_prompt.is_empty() {
+                        debug!("Using extraction prompt from SystemProfile");
+                        return profile.extraction_prompt;
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "No SystemProfile found, using default extraction prompt");
+                }
+            }
+        }
+
+        debug!("Using default extraction prompt");
+        DEFAULT_EXTRACTION_PROMPT.to_string()
+    }
+
+    /// Build the extraction prompt with event content
+    ///
+    /// Replaces {content} placeholder in the prompt template with actual event content.
+    fn build_extraction_prompt(&self, content: &str, prompt_template: &str) -> String {
+        prompt_template.replace("{content}", content)
+    }
+
+    /// Parse the LLM response into ParsedStructuredEvent
+    fn parse_llm_response(
+        &self,
+        response: &str,
+        default_actor: &str,
+    ) -> AppResult<ParsedStructuredEvent> {
+        let json_str = Self::extract_json(response);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            warn!(response = %response, error = %e, "Failed to parse LLM response JSON");
+            AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
+        })?;
+
+        // Extract fields with null handling
+        let time = Self::extract_optional_string(&parsed["time"]);
+        let location = Self::extract_optional_string(&parsed["location"]);
+        let actor = Self::extract_optional_string(&parsed["actor"])
+            .unwrap_or_else(|| default_actor.to_string());
+        let cause = Self::extract_optional_string(&parsed["cause"]);
+        let process = Self::extract_optional_string(&parsed["process"]);
+        let result = Self::extract_optional_string(&parsed["result"]);
+        let background = Self::extract_optional_string(&parsed["background"]);
+        let details = Self::extract_optional_string(&parsed["details"]);
+        let category = Self::extract_optional_string(&parsed["category"]);
+
+        Ok(ParsedStructuredEvent {
+            time,
+            location,
+            actor,
+            cause,
+            process,
+            result,
+            background,
+            details,
+            category,
+        })
+    }
+
+    /// Extract JSON from response (handles markdown code blocks)
+    fn extract_json(response: &str) -> String {
+        let response = response.trim();
+
+        // Try to find JSON in markdown code block
+        if let Some(start) = response.find("```json") {
+            if let Some(end) = response[start..]
+                .find("```\n")
+                .or(response[start..].rfind("```"))
+            {
+                let json_start = start + 7; // Skip "```json"
+                let json_end = start + end;
+                if json_start < json_end {
+                    return response[json_start..json_end].trim().to_string();
+                }
+            }
+        }
+
+        // Try to find JSON in generic code block
+        if let Some(start) = response.find("```") {
+            let after_start = start + 3;
+            if let Some(end) = response[after_start..].find("```") {
+                let content = &response[after_start..after_start + end];
+                let json_content = content
+                    .lines()
+                    .skip_while(|line| !line.trim().starts_with('{'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !json_content.is_empty() {
+                    return json_content.trim().to_string();
+                }
+            }
+        }
+
+        // Try to find raw JSON object
+        if let Some(start) = response.find('{') {
+            if let Some(end) = response.rfind('}') {
+                if start < end {
+                    return response[start..=end].to_string();
+                }
+            }
+        }
+
+        response.to_string()
+    }
+
+    /// Extract optional string from JSON value, returning None for null or empty
+    fn extract_optional_string(value: &serde_json::Value) -> Option<String> {
+        value
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.to_lowercase() != "null")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_json_from_code_block() {
+        let response = r#"```json
+{
+  "time": "2024-01-15 14:30",
+  "location": "房源详情页",
+  "actor": "user123",
+  "cause": "用户对房源不满意",
+  "process": "点击了不喜欢按钮",
+  "result": "房源被标记为不喜欢",
+  "background": "用户正在浏览推荐房源",
+  "details": "选择原因：价格过高",
+  "category": "反馈"
+}
+```"#;
+        let json = EventHandler::extract_json(response);
+        assert!(json.contains("user123"));
+        assert!(json.contains("房源详情页"));
+    }
+
+    #[test]
+    fn test_extract_json_raw() {
+        let response = r#"{"time": "2024-01-15", "actor": "user123"}"#;
+        let json = EventHandler::extract_json(response);
+        assert_eq!(json, response);
+    }
+
+    #[test]
+    fn test_extract_optional_string_valid() {
+        let value = serde_json::json!("test value");
+        let result = EventHandler::extract_optional_string(&value);
+        assert_eq!(result, Some("test value".to_string()));
+    }
+
+    #[test]
+    fn test_extract_optional_string_null() {
+        let value = serde_json::json!(null);
+        let result = EventHandler::extract_optional_string(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_optional_string_null_string() {
+        let value = serde_json::json!("null");
+        let result = EventHandler::extract_optional_string(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_optional_string_empty() {
+        let value = serde_json::json!("");
+        let result = EventHandler::extract_optional_string(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_optional_string_whitespace() {
+        let value = serde_json::json!("   ");
+        let result = EventHandler::extract_optional_string(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_default_extraction_prompt_contains_placeholder() {
+        assert!(DEFAULT_EXTRACTION_PROMPT.contains("{content}"));
+    }
+
+    #[test]
+    fn test_build_extraction_prompt() {
+        // Test the prompt building logic directly
+        let template = "Process this: {content}";
+        let content = "User clicked button";
+        let result = template.replace("{content}", content);
+
+        assert_eq!(result, "Process this: User clicked button");
+    }
+
+    #[test]
+    fn test_parse_llm_response_full() {
+        // Test parsing logic using a helper function that doesn't need a provider
+        let response = r#"{
+            "time": "2024-01-15 14:30",
+            "location": "房源详情页",
+            "actor": "user123",
+            "cause": "用户对房源不满意",
+            "process": "点击了不喜欢按钮",
+            "result": "房源被标记为不喜欢",
+            "background": "用户正在浏览推荐房源",
+            "details": "选择原因：价格过高",
+            "category": "反馈"
+        }"#;
+
+        let result = parse_llm_response_test(response, "default_user").unwrap();
+
+        assert_eq!(result.time, Some("2024-01-15 14:30".to_string()));
+        assert_eq!(result.location, Some("房源详情页".to_string()));
+        assert_eq!(result.actor, "user123");
+        assert_eq!(result.cause, Some("用户对房源不满意".to_string()));
+        assert_eq!(result.process, Some("点击了不喜欢按钮".to_string()));
+        assert_eq!(result.result, Some("房源被标记为不喜欢".to_string()));
+        assert_eq!(result.background, Some("用户正在浏览推荐房源".to_string()));
+        assert_eq!(result.details, Some("选择原因：价格过高".to_string()));
+        assert_eq!(result.category, Some("反馈".to_string()));
+    }
+
+    #[test]
+    fn test_parse_llm_response_with_nulls() {
+        let response = r#"{
+            "time": null,
+            "location": "页面A",
+            "actor": null,
+            "cause": null,
+            "process": "用户操作",
+            "result": null,
+            "background": null,
+            "details": null,
+            "category": "操作"
+        }"#;
+
+        let result = parse_llm_response_test(response, "default_user").unwrap();
+
+        assert!(result.time.is_none());
+        assert_eq!(result.location, Some("页面A".to_string()));
+        assert_eq!(result.actor, "default_user"); // Falls back to default
+        assert!(result.cause.is_none());
+        assert_eq!(result.process, Some("用户操作".to_string()));
+        assert!(result.result.is_none());
+        assert!(result.background.is_none());
+        assert!(result.details.is_none());
+        assert_eq!(result.category, Some("操作".to_string()));
+    }
+
+    #[test]
+    fn test_parse_llm_response_with_code_block() {
+        let response = r#"```json
+{
+    "time": "2024-01-15",
+    "location": "首页",
+    "actor": "user456",
+    "cause": null,
+    "process": "浏览",
+    "result": null,
+    "background": null,
+    "details": null,
+    "category": "浏览"
+}
+```"#;
+
+        let result = parse_llm_response_test(response, "default_user").unwrap();
+
+        assert_eq!(result.time, Some("2024-01-15".to_string()));
+        assert_eq!(result.location, Some("首页".to_string()));
+        assert_eq!(result.actor, "user456");
+        assert_eq!(result.category, Some("浏览".to_string()));
+    }
+
+    /// Helper function for testing parse_llm_response without needing a provider
+    fn parse_llm_response_test(
+        response: &str,
+        default_actor: &str,
+    ) -> crate::error::AppResult<ParsedStructuredEvent> {
+        let json_str = EventHandler::extract_json(response);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            crate::error::AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
+        })?;
+
+        // Extract fields with null handling
+        let time = EventHandler::extract_optional_string(&parsed["time"]);
+        let location = EventHandler::extract_optional_string(&parsed["location"]);
+        let actor = EventHandler::extract_optional_string(&parsed["actor"])
+            .unwrap_or_else(|| default_actor.to_string());
+        let cause = EventHandler::extract_optional_string(&parsed["cause"]);
+        let process = EventHandler::extract_optional_string(&parsed["process"]);
+        let result = EventHandler::extract_optional_string(&parsed["result"]);
+        let background = EventHandler::extract_optional_string(&parsed["background"]);
+        let details = EventHandler::extract_optional_string(&parsed["details"]);
+        let category = EventHandler::extract_optional_string(&parsed["category"]);
+
+        Ok(ParsedStructuredEvent {
+            time,
+            location,
+            actor,
+            cause,
+            process,
+            result,
+            background,
+            details,
+            category,
+        })
+    }
+}

@@ -27,10 +27,11 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use std::sync::Arc;
 
+use crate::embedding::EmbeddingProvider;
+use crate::llm::LlmProvider;
+use crate::repository::QdrantRepository;
 use crate::service::AlwaysConsistentChecker;
-use crate::service::{
-    ConfigCenter, LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine,
-};
+use crate::service::{LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine};
 
 /// Application state shared across all handlers
 /// Uses AlwaysConsistentChecker as the default consistency checker
@@ -38,9 +39,16 @@ use crate::service::{
 pub struct AppState {
     pub memory_guard: Arc<MemoryGuard<AlwaysConsistentChecker>>,
     pub retrieval_engine: RetrievalEngine,
-    pub config_center: ConfigCenter,
     pub lifecycle_manager: LifecycleManager,
     pub profile_service: ProfileService,
+    /// Global LLM provider instance (from config.yaml)
+    pub llm_provider: Arc<dyn LlmProvider>,
+    /// Global Embedding provider instance (from config.yaml)
+    pub embedding_provider: Arc<dyn EmbeddingProvider>,
+    /// Embedding provider name (for Qdrant collection)
+    pub embedding_provider_name: String,
+    /// Qdrant repository for vector operations
+    pub qdrant_repo: QdrantRepository,
 }
 
 /// OpenAPI documentation
@@ -60,7 +68,6 @@ pub struct AppState {
         (name = "events", description = "Event creation and processing"),
         (name = "retrieval", description = "Memory retrieval and search"),
         (name = "admin", description = "Administrative operations"),
-        (name = "config", description = "Provider configuration management"),
         (name = "audit", description = "Audit log queries"),
         (name = "health", description = "Health check and metrics"),
         (name = "system", description = "System profile management")
@@ -79,14 +86,6 @@ pub struct AppState {
         retrieval::auto_retrieve_memories,
         admin::run_eviction,
         admin::update_decay_scores,
-        config::list_providers,
-        config::create_provider,
-        config::update_provider,
-        config::delete_provider,
-        config::list_llm_providers,
-        config::create_llm_provider,
-        config::update_llm_provider,
-        config::delete_llm_provider,
         audit::query_audit_logs,
         health::health_check,
         health::metrics,
@@ -125,17 +124,6 @@ pub struct AppState {
         admin::DecayConfigRequest,
         admin::DecayUpdateResponse,
         admin::DecayConfigResponse,
-        // Config types - Embedding providers
-        config::ListProvidersResponse,
-        config::ProviderInfoResponse,
-        config::CreateProviderRequest,
-        config::UpdateProviderRequest,
-        config::RateLimitConfigResponse,
-        // Config types - LLM providers
-        config::ListLlmProvidersResponse,
-        config::LlmProviderInfoResponse,
-        config::CreateLlmProviderRequest,
-        config::UpdateLlmProviderRequest,
         // Audit types
         audit::AuditQueryRequest,
         audit::AuditQueryResponse,
