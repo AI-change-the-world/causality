@@ -282,6 +282,7 @@ mod tests {
         use crate::domain::{CreateMemoryInput, Memory};
 
         let input = CreateMemoryInput {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test memory".to_string(),

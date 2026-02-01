@@ -77,6 +77,8 @@ pub struct EventProcessingContext {
 /// Request for creating memories from an event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateFromEventRequest {
+    /// System profile ID - which business system this event belongs to
+    pub profile_id: Uuid,
     /// Owner ID - the unique identifier of the memory owner
     pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
@@ -837,6 +839,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
         // Create the event
         let event_input = CreateEventInput {
+            profile_id: request.profile_id,
             owner_id: request.owner_id,
             scope_id: request.scope_id,
             content: request.content,

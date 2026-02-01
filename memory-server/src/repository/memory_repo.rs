@@ -44,7 +44,7 @@ pub struct MemoryRepository {
 
 // SQL column list for Memory (used in multiple queries)
 const MEMORY_COLUMNS: &str = r#"
-    id, owner_id, scope_id, content, category, tags, importance, confidence,
+    id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
     root_memory_id, version_number, is_current_version, supersedes, superseded_by,
     is_global, hit_count, last_hit_at, decay_score, source_event_id,
     status, embedding_status, embedding_provider, processing_status, llm_provider,
@@ -66,20 +66,21 @@ impl MemoryRepository {
             &format!(
                 r#"
                 INSERT INTO memories (
-                    id, owner_id, scope_id, content, category, tags, importance, confidence,
+                    id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
                     root_memory_id, version_number, is_current_version, supersedes, superseded_by,
                     is_global, hit_count, last_hit_at, decay_score, source_event_id,
                     status, embedding_status, embedding_provider, processing_status, llm_provider,
                     inference_type, inference_confidence, inference_reasoning,
                     promoted_at, promotion_reason, created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
                 RETURNING {}
                 "#,
                 MEMORY_COLUMNS
             ),
         )
         .bind(memory.id)
+        .bind(memory.profile_id)
         .bind(&memory.owner_id)
         .bind(&memory.scope_id)
         .bind(&memory.content)
@@ -472,6 +473,7 @@ impl MemoryRepository {
         for row in rows {
             let memory = Memory {
                 id: row.get("id"),
+                profile_id: row.get("profile_id"),
                 owner_id: row.get("owner_id"),
                 scope_id: row.get("scope_id"),
                 content: row.get("content"),
@@ -727,6 +729,7 @@ impl MemoryRepository {
         for row in rows {
             let memory = Memory {
                 id: row.get("id"),
+                profile_id: row.get("profile_id"),
                 owner_id: row.get("owner_id"),
                 scope_id: row.get("scope_id"),
                 content: row.get("content"),
@@ -904,6 +907,7 @@ impl MemoryRepository {
 #[derive(Debug, FromRow)]
 struct MemoryRow {
     id: Uuid,
+    profile_id: Uuid,
     owner_id: String,
     scope_id: Option<String>,
     content: String,
@@ -947,6 +951,7 @@ impl From<MemoryRow> for Memory {
     fn from(row: MemoryRow) -> Self {
         Memory {
             id: row.id,
+            profile_id: row.profile_id,
             owner_id: row.owner_id,
             scope_id: row.scope_id,
             content: row.content,

@@ -53,6 +53,8 @@ impl std::str::FromStr for EventMemoryRelationType {
 pub struct Event {
     /// Unique identifier
     pub id: Uuid,
+    /// System profile ID - which business system this event belongs to
+    pub profile_id: Uuid,
     /// Owner ID - user-defined, not validated semantically
     pub owner_id: String,
     /// Scope identifier - user-defined, null = global context
@@ -79,6 +81,7 @@ impl Event {
         let now = Utc::now();
         Event {
             id: Uuid::new_v4(),
+            profile_id: input.profile_id,
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
@@ -102,6 +105,8 @@ impl Event {
 /// Input for creating a new event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateEventInput {
+    /// System profile ID - which business system this event belongs to
+    pub profile_id: Uuid,
     /// Owner ID - user-defined, not validated semantically
     pub owner_id: String,
     /// Scope identifier - user-defined, null = global context
@@ -207,6 +212,7 @@ mod tests {
 
     fn valid_event_input() -> CreateEventInput {
         CreateEventInput {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "User clicked dark mode button".to_string(),
@@ -219,8 +225,10 @@ mod tests {
     #[test]
     fn test_event_creation() {
         let input = valid_event_input();
+        let profile_id = input.profile_id;
         let event = Event::new(input);
 
+        assert_eq!(event.profile_id, profile_id);
         assert_eq!(event.owner_id, "owner123");
         assert_eq!(event.scope_id, Some("scope456".to_string()));
         assert_eq!(event.content, "User clicked dark mode button");
@@ -233,6 +241,7 @@ mod tests {
     #[test]
     fn test_event_creation_without_scope() {
         let input = CreateEventInput {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: None,
             content: "Global event".to_string(),

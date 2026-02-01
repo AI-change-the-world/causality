@@ -39,6 +39,8 @@ use crate::service::{CreateFromEventRequest, EventProcessingContext};
 /// no need to specify them per request.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateEventApiRequest {
+    /// System profile ID - which business system this event belongs to
+    pub profile_id: Uuid,
     /// Owner ID - the unique identifier of the memory owner
     pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
@@ -57,6 +59,7 @@ pub struct CreateEventApiRequest {
 impl From<CreateEventApiRequest> for CreateFromEventRequest {
     fn from(req: CreateEventApiRequest) -> Self {
         CreateFromEventRequest {
+            profile_id: req.profile_id,
             owner_id: req.owner_id,
             content: req.content,
             context: req.context,
@@ -186,6 +189,7 @@ pub async fn create_event_async(
 
     // Create the event first (unprocessed)
     let event_input = crate::domain::CreateEventInput {
+        profile_id: request.profile_id,
         owner_id: request.owner_id.clone(),
         scope_id: request.scope_id.clone(),
         content: request.content.clone(),
@@ -470,6 +474,7 @@ mod tests {
     #[test]
     fn test_create_event_request_conversion() {
         let api_request = CreateEventApiRequest {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             content: "User clicked the dark mode button".to_string(),
             context: Some("Settings page".to_string()),
@@ -489,6 +494,7 @@ mod tests {
     #[test]
     fn test_create_event_request_defaults() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Test event content"
         }"#;
@@ -505,6 +511,7 @@ mod tests {
     #[test]
     fn test_create_event_request_with_all_fields() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Test event content",
             "context": "Test context",

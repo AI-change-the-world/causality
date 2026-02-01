@@ -248,6 +248,7 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
         extracted: &ExtractedMemory,
     ) -> AppResult<ReconcileOutcome> {
         let input = CreateMemoryFromEventInput {
+            profile_id: event.profile_id,
             owner_id: event.owner_id.clone(),
             scope_id: event.scope_id.clone(),
             content: extracted.content.clone(),
@@ -324,6 +325,7 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
             old_memory_id: old_memory.id,
             root_memory_id: root_id,
             version_number: new_version,
+            profile_id: old_memory.profile_id,
             owner_id: old_memory.owner_id.clone(),
             scope_id: old_memory.scope_id.clone(),
             content: extracted.content.clone(),

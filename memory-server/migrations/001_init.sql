@@ -30,6 +30,7 @@ CREATE TYPE event_memory_relation_type AS ENUM ('created_from', 'reinforced_by')
 
 CREATE TABLE events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_id UUID NOT NULL REFERENCES system_profiles(id),
     owner_id VARCHAR(255) NOT NULL,
     scope_id VARCHAR(255),  -- nullable, user-defined
     -- Event content and metadata
@@ -50,6 +51,7 @@ CREATE TABLE events (
 
 CREATE TABLE memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_id UUID NOT NULL REFERENCES system_profiles(id),
     owner_id VARCHAR(255) NOT NULL,
     scope_id VARCHAR(255),  -- nullable, null = global memory
     
@@ -121,10 +123,10 @@ CREATE TABLE event_memory_relations (
 );
 
 -- ============================================================================
--- SYSTEM PROFILE TABLE (Singleton)
+-- SYSTEM PROFILE TABLE (Multi-tenant)
 -- ============================================================================
 
-CREATE TABLE system_profile (
+CREATE TABLE system_profiles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(100) NOT NULL,
     description TEXT NOT NULL,
@@ -140,8 +142,8 @@ CREATE TABLE system_profile (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Ensure singleton (only one row allowed)
-CREATE UNIQUE INDEX idx_system_profile_singleton ON system_profile ((true));
+-- Index for profile name lookup
+CREATE INDEX idx_system_profiles_name ON system_profiles(name);
 
 -- ============================================================================
 -- STRUCTURED EVENTS TABLE (六要素 + 两辅助)
@@ -201,6 +203,8 @@ CREATE TABLE lifecycle_config (
 -- INDEXES FOR EVENTS
 -- ============================================================================
 
+CREATE INDEX idx_events_profile ON events(profile_id);
+CREATE INDEX idx_events_profile_owner ON events(profile_id, owner_id);
 CREATE INDEX idx_events_owner ON events(owner_id);
 CREATE INDEX idx_events_owner_scope ON events(owner_id, scope_id);
 CREATE INDEX idx_events_processed ON events(processed) WHERE processed = false;
@@ -210,6 +214,10 @@ CREATE INDEX idx_events_created_at ON events(created_at);
 -- ============================================================================
 -- INDEXES FOR MEMORIES
 -- ============================================================================
+
+-- Profile index
+CREATE INDEX idx_memories_profile ON memories(profile_id);
+CREATE INDEX idx_memories_profile_owner ON memories(profile_id, owner_id);
 
 -- Version chain indexes (core optimization for O(1) queries)
 CREATE INDEX idx_memories_root ON memories(root_memory_id);
@@ -288,9 +296,9 @@ CREATE TRIGGER update_memories_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
--- Auto-update updated_at for system_profile table
-CREATE TRIGGER update_system_profile_updated_at
-    BEFORE UPDATE ON system_profile
+-- Auto-update updated_at for system_profiles table
+CREATE TRIGGER update_system_profiles_updated_at
+    BEFORE UPDATE ON system_profiles
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

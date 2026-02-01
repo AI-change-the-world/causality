@@ -21,6 +21,8 @@ use crate::error::AppError;
 pub struct Memory {
     /// Unique identifier
     pub id: Uuid,
+    /// System profile ID - which business system this memory belongs to
+    pub profile_id: Uuid,
     /// Owner ID - user-defined, not validated semantically
     pub owner_id: String,
     /// Scope identifier - user-defined, null = global memory
@@ -102,6 +104,8 @@ pub struct Memory {
 /// Input for creating a new memory directly (not from event)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMemoryInput {
+    /// System profile ID - which business system this memory belongs to
+    pub profile_id: Uuid,
     /// Owner ID - user-defined, not validated semantically
     pub owner_id: String,
     /// Scope identifier - user-defined, null = global memory
@@ -131,6 +135,8 @@ pub struct CreateMemoryInput {
 /// Input for creating a memory from an event extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMemoryFromEventInput {
+    /// System profile ID
+    pub profile_id: Uuid,
     /// Owner ID
     pub owner_id: String,
     /// Scope identifier (from the source event)
@@ -168,6 +174,8 @@ pub struct CreateSupersedingMemoryInput {
     pub root_memory_id: Uuid,
     /// New version number
     pub version_number: i32,
+    /// System profile ID (inherited from old memory)
+    pub profile_id: Uuid,
     /// Owner ID (inherited from old memory)
     pub owner_id: String,
     /// Scope ID (inherited from old memory)
@@ -262,6 +270,7 @@ impl Memory {
 
         Memory {
             id,
+            profile_id: input.profile_id,
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
@@ -312,6 +321,7 @@ impl Memory {
 
         Memory {
             id,
+            profile_id: input.profile_id,
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
@@ -359,6 +369,7 @@ impl Memory {
 
         Memory {
             id,
+            profile_id: input.profile_id,
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
@@ -500,6 +511,7 @@ mod tests {
 
     fn valid_input() -> CreateMemoryInput {
         CreateMemoryInput {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test memory content".to_string(),
@@ -516,6 +528,7 @@ mod tests {
 
     fn valid_event_input() -> CreateMemoryFromEventInput {
         CreateMemoryFromEventInput {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "User prefers dark mode".to_string(),
@@ -586,6 +599,7 @@ mod tests {
     #[test]
     fn test_memory_creation_with_defaults() {
         let input = CreateMemoryInput {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: None,
             content: "Test content".to_string(),
@@ -639,6 +653,7 @@ mod tests {
     #[test]
     fn test_memory_superseding() {
         let first_input = valid_event_input();
+        let profile_id = first_input.profile_id;
         let first_memory = Memory::new_from_event(first_input);
         let first_id = first_memory.id;
         let root_id = first_memory.root_memory_id.unwrap();
@@ -647,6 +662,7 @@ mod tests {
             old_memory_id: first_id,
             root_memory_id: root_id,
             version_number: 2,
+            profile_id,
             owner_id: first_memory.owner_id.clone(),
             scope_id: first_memory.scope_id.clone(),
             content: "User now prefers light mode".to_string(),

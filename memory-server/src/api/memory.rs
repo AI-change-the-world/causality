@@ -35,6 +35,8 @@ use crate::service::UpdateMemoryRequest;
 /// For LLM-assisted memory extraction from events, use POST /api/v1/events instead.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateMemoryApiRequest {
+    /// System profile ID - which business system this memory belongs to
+    pub profile_id: Uuid,
     /// Owner ID - the unique identifier of the memory owner
     pub owner_id: String,
     /// Scope identifier (null = global memory)
@@ -59,6 +61,7 @@ pub struct CreateMemoryApiRequest {
 impl From<CreateMemoryApiRequest> for CreateMemoryInput {
     fn from(req: CreateMemoryApiRequest) -> Self {
         CreateMemoryInput {
+            profile_id: req.profile_id,
             owner_id: req.owner_id,
             scope_id: req.scope_id,
             content: req.content,
@@ -584,6 +587,7 @@ mod tests {
     #[test]
     fn test_create_memory_request_conversion() {
         let api_request = CreateMemoryApiRequest {
+            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test content".to_string(),
@@ -627,6 +631,7 @@ mod tests {
     #[test]
     fn test_memory_to_response_conversion() {
         let memory = Memory {
+            profile_id: Uuid::new_v4(),
             id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
@@ -683,6 +688,7 @@ mod tests {
     #[test]
     fn test_create_memory_request_minimal() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Test content"
         }"#;
@@ -702,6 +708,7 @@ mod tests {
     #[test]
     fn test_create_memory_request_global() {
         let json = r#"{
+            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Global memory content",
             "is_global": true

@@ -609,6 +609,7 @@ mod tests {
 
     fn test_memory(status: Status) -> Memory {
         Memory {
+            profile_id: Uuid::new_v4(),
             id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),

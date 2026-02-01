@@ -31,16 +31,17 @@ impl EventRepository {
         let row = sqlx::query_as::<_, EventRow>(
             r#"
             INSERT INTO events (
-                id, owner_id, scope_id, content, context,
+                id, profile_id, owner_id, scope_id, content, context,
                 summary, source, processed, event_time, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING
-                id, owner_id, scope_id, content, context,
+                id, profile_id, owner_id, scope_id, content, context,
                 summary, source, processed, event_time, created_at
             "#,
         )
         .bind(event.id)
+        .bind(event.profile_id)
         .bind(&event.owner_id)
         .bind(&event.scope_id)
         .bind(&event.content)
@@ -61,7 +62,7 @@ impl EventRepository {
         let row = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT
-                id, owner_id, scope_id, content, context,
+                id, profile_id, owner_id, scope_id, content, context,
                 summary, source, processed, event_time, created_at
             FROM events
             WHERE id = $1
@@ -83,7 +84,7 @@ impl EventRepository {
             SET processed = true, summary = $2
             WHERE id = $1
             RETURNING
-                id, owner_id, scope_id, content, context,
+                id, profile_id, owner_id, scope_id, content, context,
                 summary, source, processed, event_time, created_at
             "#,
         )
@@ -101,7 +102,7 @@ impl EventRepository {
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT
-                id, owner_id, scope_id, content, context,
+                id, profile_id, owner_id, scope_id, content, context,
                 summary, source, processed, event_time, created_at
             FROM events
             WHERE owner_id = $1 AND processed = false
@@ -128,7 +129,7 @@ impl EventRepository {
             sqlx::query_as::<_, EventRow>(
                 r#"
                 SELECT
-                    id, owner_id, scope_id, content, context,
+                    id, profile_id, owner_id, scope_id, content, context,
                     summary, source, processed, event_time, created_at
                 FROM events
                 WHERE owner_id = $1 AND scope_id = $2
@@ -146,7 +147,7 @@ impl EventRepository {
             sqlx::query_as::<_, EventRow>(
                 r#"
                 SELECT
-                    id, owner_id, scope_id, content, context,
+                    id, profile_id, owner_id, scope_id, content, context,
                     summary, source, processed, event_time, created_at
                 FROM events
                 WHERE owner_id = $1 AND scope_id IS NULL
@@ -168,7 +169,7 @@ impl EventRepository {
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT
-                id, owner_id, scope_id, content, context,
+                id, profile_id, owner_id, scope_id, content, context,
                 summary, source, processed, event_time, created_at
             FROM events
             WHERE owner_id = $1
@@ -327,6 +328,7 @@ impl EventRepository {
 #[derive(Debug, FromRow)]
 struct EventRow {
     id: Uuid,
+    profile_id: Uuid,
     owner_id: String,
     scope_id: Option<String>,
     content: String,
@@ -342,6 +344,7 @@ impl From<EventRow> for Event {
     fn from(row: EventRow) -> Self {
         Event {
             id: row.id,
+            profile_id: row.profile_id,
             owner_id: row.owner_id,
             scope_id: row.scope_id,
             content: row.content,
