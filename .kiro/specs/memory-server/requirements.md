@@ -89,7 +89,7 @@ Memory Server 是一个独立的、可嵌入任意 Agent / LLM 应用的上下�
 2. THE Memory_Server SHALL store the embedding vector in Qdrant with the memory ID as reference
 3. WHEN embedding fails, THE Memory_Server SHALL retry up to 3 times with exponential backoff
 4. IF embedding fails after retries, THEN THE Memory_Server SHALL mark the memory with embedding_status "failed" and continue operation
-5. THE Memory_Server SHALL support configurable embedding providers (OpenAI, local models)
+5. THE Memory_Server SHALL support configurable embedding providers (Openai, local models)
 
 ### Requirement 6: Docker Compose 部署
 
@@ -144,14 +144,14 @@ Memory Server 是一个独立的、可嵌入任意 Agent / LLM 应用的上下�
 
 #### Acceptance Criteria
 
-1. THE Memory_Server SHALL support configuring multiple embedding providers (OpenAI, Azure OpenAI, local models like BGE)
+1. THE Memory_Server SHALL support configuring multiple embedding providers (Openai, Azure Openai, local models like BGE)
 2. THE configuration SHALL include provider-specific settings: API endpoint, API key, model name, embedding dimension
 3. THE Memory_Server SHALL support setting a default embedding provider for new memories
 4. WHEN creating a memory, THE Agent SHALL be able to specify which embedding provider to use
 5. THE Memory_Server SHALL validate embedding dimension matches the configured Qdrant collection dimension
 6. THE configuration SHALL support rate limiting settings per provider (requests per minute, tokens per minute)
 7. WHEN rate limit is exceeded, THE Memory_Server SHALL queue embedding requests and process them when quota refreshes
-8. THE Memory_Server SHALL support local embedding models via HTTP endpoint (compatible with OpenAI API format)
+8. THE Memory_Server SHALL support local embedding models via HTTP endpoint (compatible with Openai API format)
 
 ### Requirement 11: 模型参数热更新
 

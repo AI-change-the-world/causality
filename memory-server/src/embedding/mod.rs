@@ -1,6 +1,6 @@
 //! Embedding module for Memory Server
 //!
-//! Provides abstraction for embedding providers (OpenAI, Azure, local models)
+//! Provides abstraction for embedding providers (Openai, Azure, local models)
 //! with support for multiple providers, retry logic, and rate limiting.
 
 mod local;

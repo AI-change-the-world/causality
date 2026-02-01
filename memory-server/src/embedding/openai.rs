@@ -1,6 +1,6 @@
-//! OpenAI Embedding Provider
+//! Openai Embedding Provider
 //!
-//! Implements the EmbeddingProvider trait for OpenAI's embedding API.
+//! Implements the EmbeddingProvider trait for Openai's embedding API.
 //! Supports retry logic with exponential backoff.
 
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ use super::{
     ProviderType, RetryConfig,
 };
 
-/// OpenAI embedding API request body
+/// Openai embedding API request body
 #[derive(Debug, Serialize)]
 struct OpenAIEmbeddingRequest {
     input: String,
@@ -24,7 +24,7 @@ struct OpenAIEmbeddingRequest {
     encoding_format: Option<String>,
 }
 
-/// OpenAI embedding API response
+/// Openai embedding API response
 #[derive(Debug, Deserialize)]
 struct OpenAIEmbeddingResponse {
     data: Vec<OpenAIEmbeddingData>,
@@ -46,7 +46,7 @@ struct OpenAIUsage {
     total_tokens: u32,
 }
 
-/// OpenAI API error response
+/// Openai API error response
 #[derive(Debug, Deserialize)]
 struct OpenAIErrorResponse {
     error: OpenAIError,
@@ -62,9 +62,9 @@ struct OpenAIError {
     code: Option<String>,
 }
 
-/// OpenAI Embedding Provider
+/// Openai Embedding Provider
 ///
-/// Implements embedding generation using OpenAI's API with retry logic.
+/// Implements embedding generation using Openai's API with retry logic.
 pub struct OpenAIProvider {
     /// Provider name
     name: String,
@@ -85,10 +85,10 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    /// Create a new OpenAI provider from configuration
+    /// Create a new Openai provider from configuration
     pub fn new(config: ProviderConfig) -> Result<Self, EmbeddingError> {
         let api_key = config.api_key.ok_or_else(|| {
-            EmbeddingError::NotConfigured("API key is required for OpenAI provider".to_string())
+            EmbeddingError::NotConfigured("API key is required for Openai provider".to_string())
         })?;
 
         let client = Client::builder()
@@ -108,7 +108,7 @@ impl OpenAIProvider {
         })
     }
 
-    /// Create a new OpenAI provider with custom retry configuration
+    /// Create a new Openai provider with custom retry configuration
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
         self
@@ -141,7 +141,7 @@ impl OpenAIProvider {
             provider = %self.name,
             model = %model,
             text_len = text.len(),
-            "Making OpenAI embedding request"
+            "Making Openai embedding request"
         );
 
         let response = self
@@ -209,7 +209,7 @@ impl EmbeddingProvider for OpenAIProvider {
     }
 
     fn provider_type(&self) -> ProviderType {
-        ProviderType::OpenAI
+        ProviderType::Openai
     }
 
     fn dimension(&self) -> usize {
@@ -304,7 +304,7 @@ mod tests {
     fn test_config() -> ProviderConfig {
         ProviderConfig {
             name: "test-openai".to_string(),
-            provider_type: ProviderType::OpenAI,
+            provider_type: ProviderType::Openai,
             endpoint: "https://api.openai.com/v1".to_string(),
             api_key: Some("sk-test-key".to_string()),
             model: "text-embedding-3-small".to_string(),
@@ -319,7 +319,7 @@ mod tests {
         let provider = OpenAIProvider::new(config).unwrap();
 
         assert_eq!(provider.name(), "test-openai");
-        assert_eq!(provider.provider_type(), ProviderType::OpenAI);
+        assert_eq!(provider.provider_type(), ProviderType::Openai);
         assert_eq!(provider.dimension(), 1536);
         assert!(provider.is_enabled());
     }

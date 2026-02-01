@@ -1,6 +1,6 @@
 //! LLM module for Memory Server
 //!
-//! Provides abstraction for LLM providers (OpenAI, Azure, local models like Ollama)
+//! Provides abstraction for LLM providers (Openai, Azure, local models like Ollama)
 //! with support for multiple providers, retry logic, and rate limiting.
 //! Used for memory processing: compression, classification, and tag extraction.
 

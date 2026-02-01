@@ -1,6 +1,6 @@
-//! OpenAI LLM Provider
+//! Openai LLM Provider
 //!
-//! Implements the LlmProvider trait for OpenAI's Chat Completion API.
+//! Implements the LlmProvider trait for Openai's Chat Completion API.
 //! Uses async-openai library with streaming to avoid timeouts.
 
 use async_openai::{
@@ -23,9 +23,9 @@ use super::{
     LlmProviderType, LlmRetryConfig, ResponseFormat, Role,
 };
 
-/// OpenAI LLM Provider
+/// Openai LLM Provider
 ///
-/// Implements chat completion using OpenAI's API with streaming and retry logic.
+/// Implements chat completion using Openai's API with streaming and retry logic.
 pub struct OpenAILlmProvider {
     /// Provider name
     name: String,
@@ -42,13 +42,13 @@ pub struct OpenAILlmProvider {
 }
 
 impl OpenAILlmProvider {
-    /// Create a new OpenAI LLM provider from configuration
+    /// Create a new Openai LLM provider from configuration
     pub fn new(config: LlmProviderConfig) -> Result<Self, LlmError> {
         let api_key = config.api_key.ok_or_else(|| {
-            LlmError::NotConfigured("API key is required for OpenAI LLM provider".to_string())
+            LlmError::NotConfigured("API key is required for Openai LLM provider".to_string())
         })?;
 
-        // Build OpenAI config with custom endpoint if provided
+        // Build Openai config with custom endpoint if provided
         let openai_config = OpenAIConfig::new()
             .with_api_key(&api_key)
             .with_api_base(&config.endpoint);
@@ -65,7 +65,7 @@ impl OpenAILlmProvider {
         })
     }
 
-    /// Create a new OpenAI LLM provider with custom retry configuration
+    /// Create a new Openai LLM provider with custom retry configuration
     pub fn with_retry_config(mut self, retry_config: LlmRetryConfig) -> Self {
         self.retry_config = retry_config;
         self
@@ -76,7 +76,7 @@ impl OpenAILlmProvider {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Convert ChatMessage to OpenAI message format
+    /// Convert ChatMessage to Openai message format
     fn to_openai_message(msg: &ChatMessage) -> Result<ChatCompletionRequestMessage, LlmError> {
         match msg.role {
             Role::System => Ok(ChatCompletionRequestSystemMessageArgs::default()
@@ -116,7 +116,7 @@ impl OpenAILlmProvider {
             message_count = request.messages.len(),
             streaming = true,
             json_mode = matches!(request.response_format, ResponseFormat::JsonObject),
-            "Making OpenAI chat request with streaming"
+            "Making Openai chat request with streaming"
         );
 
         // Build request
@@ -220,7 +220,7 @@ impl LlmProvider for OpenAILlmProvider {
     }
 
     fn provider_type(&self) -> LlmProviderType {
-        LlmProviderType::OpenAI
+        LlmProviderType::Openai
     }
 
     fn model(&self) -> &str {
@@ -310,7 +310,7 @@ mod tests {
     fn test_config() -> LlmProviderConfig {
         LlmProviderConfig {
             name: "test-openai".to_string(),
-            provider_type: LlmProviderType::OpenAI,
+            provider_type: LlmProviderType::Openai,
             endpoint: "https://api.openai.com/v1".to_string(),
             api_key: Some("sk-test-key".to_string()),
             model: "gpt-4o-mini".to_string(),
@@ -324,7 +324,7 @@ mod tests {
         let provider = OpenAILlmProvider::new(config).unwrap();
 
         assert_eq!(provider.name(), "test-openai");
-        assert_eq!(provider.provider_type(), LlmProviderType::OpenAI);
+        assert_eq!(provider.provider_type(), LlmProviderType::Openai);
         assert_eq!(provider.model(), "gpt-4o-mini");
         assert!(provider.is_enabled());
     }

@@ -250,9 +250,9 @@ fn create_llm_provider(config: &AppConfig) -> anyhow::Result<Arc<dyn LlmProvider
     };
 
     match config.llm.provider_type {
-        LlmProviderType::OpenAI | LlmProviderType::Azure => Ok(Arc::new(
+        LlmProviderType::Openai | LlmProviderType::Azure => Ok(Arc::new(
             OpenAILlmProvider::new(llm_config).map_err(|e| {
-                error!(error = %e, "Failed to create OpenAI LLM provider");
+                error!(error = %e, "Failed to create Openai LLM provider");
                 anyhow::anyhow!("LLM provider initialization error: {}", e)
             })?,
         )),
@@ -287,9 +287,9 @@ fn create_embedding_provider(
     };
 
     let provider: Arc<dyn EmbeddingProvider> = match config.embedding.provider_type {
-        ProviderType::OpenAI | ProviderType::Azure => {
+        ProviderType::Openai | ProviderType::Azure => {
             Arc::new(OpenAIProvider::new(embedding_config).map_err(|e| {
-                error!(error = %e, "Failed to create OpenAI Embedding provider");
+                error!(error = %e, "Failed to create Openai Embedding provider");
                 anyhow::anyhow!("Embedding provider initialization error: {}", e)
             })?)
         }

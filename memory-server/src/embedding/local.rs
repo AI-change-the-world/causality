@@ -1,7 +1,7 @@
 //! Local Embedding Provider
 //!
 //! Implements the EmbeddingProvider trait for local embedding models
-//! that expose an OpenAI-compatible API (e.g., BGE, sentence-transformers).
+//! that expose an Openai-compatible API (e.g., BGE, sentence-transformers).
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -15,14 +15,14 @@ use super::{
     ProviderType, RetryConfig,
 };
 
-/// OpenAI-compatible embedding request body
+/// Openai-compatible embedding request body
 #[derive(Debug, Serialize)]
 struct LocalEmbeddingRequest {
     input: String,
     model: String,
 }
 
-/// OpenAI-compatible embedding response
+/// Openai-compatible embedding response
 #[derive(Debug, Deserialize)]
 struct LocalEmbeddingResponse {
     data: Vec<LocalEmbeddingData>,
@@ -48,7 +48,7 @@ struct LocalUsage {
 /// Local Embedding Provider
 ///
 /// Implements embedding generation using a local model server that exposes
-/// an OpenAI-compatible API. This is useful for models like BGE, sentence-transformers,
+/// an Openai-compatible API. This is useful for models like BGE, sentence-transformers,
 /// or any other model served via frameworks like FastAPI, vLLM, or text-embeddings-inference.
 pub struct LocalProvider {
     /// Provider name

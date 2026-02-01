@@ -78,13 +78,13 @@
     - 支持多 provider
     - _Requirements: 5.5, 10.1_
 
-  - [x] 5.2 实现 OpenAI Embedding Provider
+  - [x] 5.2 实现 Openai Embedding Provider
     - HTTP 客户端调用
     - 重试逻辑 (3次指数退避)
     - _Requirements: 5.1, 5.3, 5.4_
 
   - [x] 5.3 实现 Local Embedding Provider
-    - 兼容 OpenAI API 格式
+    - 兼容 Openai API 格式
     - _Requirements: 10.8_
 
   - [x] 5.4 实现 ConfigRepository (Provider 配置持久化)
@@ -230,16 +230,16 @@
 - [x] 13. LLM 记忆处理管道
   - [x] 13.1 定义 LLM Provider trait
     - 抽象 LLM 调用接口
-    - 支持多 provider (OpenAI, Azure, Local)
+    - 支持多 provider (Openai, Azure, Local)
     - _Requirements: 12.8_
 
-  - [x] 13.2 实现 OpenAI LLM Provider
+  - [x] 13.2 实现 Openai LLM Provider
     - Chat Completion API 调用
     - 重试逻辑
     - _Requirements: 12.8_
 
   - [x] 13.3 实现 Local LLM Provider
-    - 兼容 OpenAI API 格式 (Ollama 等)
+    - 兼容 Openai API 格式 (Ollama 等)
     - _Requirements: 12.8_
 
   - [x] 13.4 实现 MemoryProcessor 服务

@@ -57,8 +57,8 @@ Memory Server 是一个独立的上下文记忆治理服务，为 Agent/LLM 应�
             │
 ┌───────────▼───────────┐       ┌───────────────────────────┐
 │   Embedding Provider  │       │      LLM Provider         │
-│  - OpenAI API         │       │  - OpenAI GPT             │
-│  - Azure OpenAI       │       │  - Azure OpenAI           │
+│  - Openai API         │       │  - Openai GPT             │
+│  - Azure Openai       │       │  - Azure Openai           │
 │  - Local (BGE等)      │       │  - Local (Ollama等)       │
 └───────────────────────┘       └───────────────────────────┘
 ```

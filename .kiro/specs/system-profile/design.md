@@ -310,7 +310,7 @@ impl AppState {
 /// 根据配置创建 LLM provider
 fn create_llm_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, AppError> {
     match config.provider_type {
-        ProviderType::OpenAI | ProviderType::Azure => {
+        ProviderType::Openai | ProviderType::Azure => {
             Ok(Arc::new(OpenAILlmProvider::new(config)?))
         }
         ProviderType::Local => {
@@ -325,7 +325,7 @@ fn create_embedding_provider(config: &EmbeddingConfig)
 {
     let name = format!("{}-{}", config.provider_type, config.model);
     let provider: Arc<dyn EmbeddingProvider> = match config.provider_type {
-        ProviderType::OpenAI | ProviderType::Azure => {
+        ProviderType::Openai | ProviderType::Azure => {
             Arc::new(OpenAIProvider::new(config)?)
         }
         ProviderType::Local => {

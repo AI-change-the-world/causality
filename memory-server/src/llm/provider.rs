@@ -1,7 +1,7 @@
 //! LlmProvider trait and related types
 //!
 //! Defines the abstract interface for LLM providers, supporting multiple
-//! provider types (OpenAI, Azure OpenAI, local models like Ollama).
+//! provider types (Openai, Azure Openai, local models like Ollama).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -58,18 +58,18 @@ pub enum LlmError {
 #[sqlx(type_name = "provider_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProviderType {
-    /// OpenAI API
-    OpenAI,
-    /// Azure OpenAI Service
+    /// Openai API
+    Openai,
+    /// Azure Openai Service
     Azure,
-    /// Local LLM (OpenAI-compatible API, e.g., Ollama)
+    /// Local LLM (Openai-compatible API, e.g., Ollama)
     Local,
 }
 
 impl std::fmt::Display for LlmProviderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmProviderType::OpenAI => write!(f, "openai"),
+            LlmProviderType::Openai => write!(f, "openai"),
             LlmProviderType::Azure => write!(f, "azure"),
             LlmProviderType::Local => write!(f, "local"),
         }
@@ -81,7 +81,7 @@ impl std::str::FromStr for LlmProviderType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "openai" => Ok(LlmProviderType::OpenAI),
+            "openai" => Ok(LlmProviderType::Openai),
             "azure" => Ok(LlmProviderType::Azure),
             "local" => Ok(LlmProviderType::Local),
             _ => Err(format!("Unknown LLM provider type: {}", s)),
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_llm_provider_type_display() {
-        assert_eq!(LlmProviderType::OpenAI.to_string(), "openai");
+        assert_eq!(LlmProviderType::Openai.to_string(), "openai");
         assert_eq!(LlmProviderType::Azure.to_string(), "azure");
         assert_eq!(LlmProviderType::Local.to_string(), "local");
     }
@@ -340,11 +340,11 @@ mod tests {
     fn test_llm_provider_type_from_str() {
         assert_eq!(
             "openai".parse::<LlmProviderType>().unwrap(),
-            LlmProviderType::OpenAI
+            LlmProviderType::Openai
         );
         assert_eq!(
             "OPENAI".parse::<LlmProviderType>().unwrap(),
-            LlmProviderType::OpenAI
+            LlmProviderType::Openai
         );
         assert_eq!(
             "azure".parse::<LlmProviderType>().unwrap(),
@@ -447,7 +447,7 @@ mod tests {
     fn test_llm_provider_config_serialization() {
         let config = LlmProviderConfig {
             name: "openai".to_string(),
-            provider_type: LlmProviderType::OpenAI,
+            provider_type: LlmProviderType::Openai,
             endpoint: "https://api.openai.com/v1".to_string(),
             api_key: Some("sk-test".to_string()),
             model: "gpt-4o-mini".to_string(),

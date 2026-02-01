@@ -296,8 +296,8 @@ score = similarity_score * 0.35     // 语义相似度
 ```rust
 // 支持多种 LLM 提供商
 pub enum LlmProviderType {
-    OpenAI,    // GPT-4, GPT-3.5
-    Azure,     // Azure OpenAI
+    Openai,    // GPT-4, GPT-3.5
+    Azure,     // Azure Openai
     Local,     // Ollama, vLLM 等本地模型
 }
 
@@ -361,8 +361,8 @@ CreateMemoryInput {
 | **后端框架**   | Rust + Axum  | 高性能异步 Web 框架        |
 | **数据库**     | PostgreSQL   | 记忆元数据存储             |
 | **向量数据库** | Qdrant       | 语义相似度检索             |
-| **LLM 集成**   | async-openai | 支持 OpenAI/Azure/本地模型 |
-| **嵌入模型**   | 多提供商支持 | OpenAI/本地嵌入模型        |
+| **LLM 集成**   | async-openai | 支持 Openai/Azure/本地模型 |
+| **嵌入模型**   | 多提供商支持 | Openai/本地嵌入模型        |
 | **配置管理**   | YAML         | 灵活的配置系统             |
 
 ## 🚀 快速开始 | Quick Start
@@ -485,7 +485,7 @@ http://localhost:8080/swagger-ui/
 ### 1. 多提供商配置 | Multi-Provider Setup
 
 ```bash
-# 配置 OpenAI 嵌入提供商
+# 配置 Openai 嵌入提供商
 curl -X POST http://localhost:8080/api/v1/config/providers \
   -H "Content-Type: application/json" \
   -d '{
@@ -567,7 +567,7 @@ cargo test --test integration
 ## 🙏 致谢 | Acknowledgments
 
 - [Qdrant](https://qdrant.tech/) - 高性能向量数据库
-- [async-openai](https://github.com/64bit/async-openai) - Rust OpenAI 客户端
+- [async-openai](https://github.com/64bit/async-openai) - Rust Openai 客户端
 - [Axum](https://github.com/tokio-rs/axum) - 现代 Rust Web 框架
 
 ---

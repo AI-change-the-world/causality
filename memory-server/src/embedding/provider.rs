@@ -1,7 +1,7 @@
 //! EmbeddingProvider trait and related types
 //!
 //! Defines the abstract interface for embedding providers, supporting multiple
-//! provider types (OpenAI, Azure OpenAI, local models).
+//! provider types (Openai, Azure Openai, local models).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -56,11 +56,11 @@ pub enum EmbeddingError {
 #[sqlx(type_name = "provider_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderType {
-    /// OpenAI API
-    OpenAI,
-    /// Azure OpenAI Service
+    /// Openai API
+    Openai,
+    /// Azure Openai Service
     Azure,
-    /// Local embedding model (OpenAI-compatible API)
+    /// Local embedding model (Openai-compatible API)
     #[default]
     Local,
 }
@@ -68,7 +68,7 @@ pub enum ProviderType {
 impl std::fmt::Display for ProviderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProviderType::OpenAI => write!(f, "openai"),
+            ProviderType::Openai => write!(f, "openai"),
             ProviderType::Azure => write!(f, "azure"),
             ProviderType::Local => write!(f, "local"),
         }
@@ -80,7 +80,7 @@ impl std::str::FromStr for ProviderType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "openai" => Ok(ProviderType::OpenAI),
+            "openai" => Ok(ProviderType::Openai),
             "azure" => Ok(ProviderType::Azure),
             "local" => Ok(ProviderType::Local),
             _ => Err(format!("Unknown provider type: {}", s)),
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_provider_type_display() {
-        assert_eq!(ProviderType::OpenAI.to_string(), "openai");
+        assert_eq!(ProviderType::Openai.to_string(), "openai");
         assert_eq!(ProviderType::Azure.to_string(), "azure");
         assert_eq!(ProviderType::Local.to_string(), "local");
     }
@@ -254,11 +254,11 @@ mod tests {
     fn test_provider_type_from_str() {
         assert_eq!(
             "openai".parse::<ProviderType>().unwrap(),
-            ProviderType::OpenAI
+            ProviderType::Openai
         );
         assert_eq!(
             "OPENAI".parse::<ProviderType>().unwrap(),
-            ProviderType::OpenAI
+            ProviderType::Openai
         );
         assert_eq!(
             "azure".parse::<ProviderType>().unwrap(),
@@ -336,7 +336,7 @@ mod tests {
     fn test_provider_config_serialization() {
         let config = ProviderConfig {
             name: "openai".to_string(),
-            provider_type: ProviderType::OpenAI,
+            provider_type: ProviderType::Openai,
             endpoint: "https://api.openai.com/v1".to_string(),
             api_key: Some("sk-test".to_string()),
             model: "text-embedding-3-small".to_string(),
