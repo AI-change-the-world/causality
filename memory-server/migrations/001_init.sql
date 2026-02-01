@@ -25,6 +25,29 @@ CREATE TYPE memory_category AS ENUM ('user_preference', 'behavior_pattern', 'bus
 CREATE TYPE event_memory_relation_type AS ENUM ('created_from', 'reinforced_by');
 
 -- ============================================================================
+-- SYSTEM PROFILE TABLE (Multi-tenant) - Must be created first for FK references
+-- ============================================================================
+
+CREATE TABLE system_profiles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    description TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    domain VARCHAR(100) NOT NULL,
+    target_audience VARCHAR(255) NOT NULL,
+    event_categories TEXT[] NOT NULL DEFAULT '{}',
+    memory_focus TEXT[] NOT NULL DEFAULT '{}',
+    boundaries TEXT[] NOT NULL DEFAULT '{}',
+    -- 事件提取 prompt (完整的 prompt 模板)
+    extraction_prompt TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Index for profile name lookup
+CREATE INDEX idx_system_profiles_name ON system_profiles(name);
+
+-- ============================================================================
 -- EVENTS TABLE (Immutable)
 -- ============================================================================
 
@@ -121,29 +144,6 @@ CREATE TABLE event_memory_relations (
     -- Ensure unique event-memory combination
     UNIQUE(event_id, memory_id)
 );
-
--- ============================================================================
--- SYSTEM PROFILE TABLE (Multi-tenant)
--- ============================================================================
-
-CREATE TABLE system_profiles (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL,
-    description TEXT NOT NULL,
-    purpose TEXT NOT NULL,
-    domain VARCHAR(100) NOT NULL,
-    target_audience VARCHAR(255) NOT NULL,
-    event_categories TEXT[] NOT NULL DEFAULT '{}',
-    memory_focus TEXT[] NOT NULL DEFAULT '{}',
-    boundaries TEXT[] NOT NULL DEFAULT '{}',
-    -- 事件提取 prompt (完整的 prompt 模板)
-    extraction_prompt TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Index for profile name lookup
-CREATE INDEX idx_system_profiles_name ON system_profiles(name);
 
 -- ============================================================================
 -- STRUCTURED EVENTS TABLE (六要素 + 两辅助)
