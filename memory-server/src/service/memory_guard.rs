@@ -72,6 +72,9 @@ pub struct EventProcessingContext {
     /// not databse
     /// so only there will be only one llm provider and embedding provider
     pub embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>>,
+    /// Context memories for better relevance judgment and memory updates
+    /// These are same-scope memories + global memories fetched before processing
+    pub context_memories: Vec<crate::domain::Memory>,
 }
 
 /// Request for creating memories from an event

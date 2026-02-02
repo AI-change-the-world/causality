@@ -188,6 +188,17 @@ payload = {
     "profile_id": "fb0d5459-cdb6-4d9b-a5bf-e93851affccb"
 }
 
+payload = {
+    "owner_id": "user_123",
+    "content": "最近中彩票攒了很多钱",
+    "llm_provider": "qwen",
+    "embedding_provider":"ebd",
+    "context": None,
+    "scope_id": "global-1-2-3-4",
+    "source": "diary",
+    "profile_id": "fb0d5459-cdb6-4d9b-a5bf-e93851affccb"
+}
+
 # payload = {
 #     "owner_id": "user_123",
 #     "content": "This is a test content for memory extraction with enough characters",

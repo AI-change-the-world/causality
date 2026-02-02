@@ -270,9 +270,23 @@ async fn process_event_background(
         state.profile_service.clone(),
     );
 
-    // Check event relevance against SystemProfile
+    // Fetch context memories for better relevance judgment
+    let context_memories = state
+        .memory_guard
+        .memory_repo()
+        .find_context_memories(
+            event.profile_id,
+            &event.owner_id,
+            event.scope_id.as_deref(),
+            20, // scope_limit
+            10, // global_limit
+        )
+        .await
+        .unwrap_or_default();
+
+    // Check event relevance against SystemProfile with context memories
     let relevance_result = event_handler
-        .check_relevance_with_profile(&event.content)
+        .check_relevance_with_profile(&event.content, Some(&context_memories))
         .await?;
 
     // If event is not relevant, skip processing
@@ -322,8 +336,10 @@ async fn process_event_background(
         embedding_provider_name,
         qdrant_repo,
         embedding_providers,
+        context_memories,
     };
 
+    // Pass context memories to processing (for potential memory updates)
     state
         .memory_guard
         .process_event_with_context(&event, context, None)
@@ -369,10 +385,30 @@ pub async fn create_event(
         state.profile_service.clone(),
     );
 
-    // Step 1: Check event relevance against SystemProfile
+    // Fetch context memories for better relevance judgment
+    debug!("create_event: fetching context memories");
+    let context_memories = state
+        .memory_guard
+        .memory_repo()
+        .find_context_memories(
+            request.profile_id,
+            &request.owner_id,
+            request.scope_id.as_deref(),
+            20, // scope_limit
+            10, // global_limit
+        )
+        .await
+        .unwrap_or_default();
+
+    debug!(
+        context_memory_count = context_memories.len(),
+        "create_event: fetched context memories"
+    );
+
+    // Step 1: Check event relevance against SystemProfile with context memories
     debug!("create_event: checking event relevance");
     let relevance_result = event_handler
-        .check_relevance_with_profile(&request.content)
+        .check_relevance_with_profile(&request.content, Some(&context_memories))
         .await?;
 
     // If event is not relevant, skip processing and return early
@@ -478,11 +514,13 @@ pub async fn create_event(
         embedding_provider_name,
         qdrant_repo,
         embedding_providers,
+        context_memories,
     };
 
     let service_request: CreateFromEventRequest = request.into();
     debug!("create_event: calling create_from_event_with_context");
 
+    // Pass context memories to processing (for potential memory updates)
     let result = state
         .memory_guard
         .create_from_event_with_context(service_request, context, None)

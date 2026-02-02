@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::domain::{Event, ParsedStructuredEvent, StructuredEvent, SystemProfile};
+use crate::domain::{Event, Memory, ParsedStructuredEvent, StructuredEvent, SystemProfile};
 use crate::error::{AppError, AppResult};
 use crate::llm::{ChatRequest, LlmProvider};
 use crate::service::ProfileService;
@@ -61,7 +61,51 @@ const DEFAULT_EXTRACTION_PROMPT: &str = r#"你是一个事件分析助手。请�
 ```"#;
 
 /// Prompt template for checking event relevance against SystemProfile
-const RELEVANCE_CHECK_PROMPT: &str = r#"你是一个事件相关性判断助手。请判断以下事件内容是否与系统的业务领域相关。
+/// Now includes context memories for better relevance judgment
+const RELEVANCE_CHECK_PROMPT: &str = r#"你是一个事件相关性判断助手。请判断以下事件内容是否与系统的业务领域相关，或者是否与用户的历史记忆有关联。
+
+## 系统信息
+- 系统名称: {system_name}
+- 系统用途: {purpose}
+- 业务领域: {domain}
+- 目标用户: {target_audience}
+- 事件类型: {event_categories}
+- 关注的记忆类型: {memory_focus}
+- 系统边界（不处理的内容）: {boundaries}
+
+## 用户历史记忆（上下文）
+{context_memories}
+
+## 新事件内容
+{content}
+
+## 判断标准
+1. 事件内容是否与业务领域直接相关
+2. 事件是否属于系统定义的事件类型范围
+3. 事件是否在系统边界之内（不在 boundaries 列表中）
+4. **重要**：事件是否与用户的历史记忆有关联（可能是更新、补充或相关信息）
+   - 例如：用户之前说"买不起"，现在说"中彩票有钱了"，虽然表面不直接相关，但实际上是对财务状况的更新
+5. 事件是否可能产生对目标用户有价值的记忆
+
+## 请以 JSON 格式返回判断结果：
+```json
+{
+  "is_relevant": true或false,
+  "relevance_score": 0.0到1.0之间的相关性分数,
+  "reason": "判断理由的简短说明",
+  "matched_categories": ["匹配的事件类型列表，如果有的话"],
+  "related_memory_indices": [与哪些历史记忆相关的索引号，从1开始]
+}
+```
+
+注意：
+- 如果事件与业务领域直接相关，is_relevant 应为 true
+- 如果事件与用户历史记忆有关联（即使表面上与业务领域不直接相关），is_relevant 也应为 true
+- 只有当事件与业务领域完全无关，且与用户历史记忆也没有任何关联时，is_relevant 才应为 false
+- relevance_score 低于 0.3 时，建议 is_relevant 为 false"#;
+
+/// Prompt template for checking event relevance without context memories (fallback)
+const RELEVANCE_CHECK_PROMPT_NO_CONTEXT: &str = r#"你是一个事件相关性判断助手。请判断以下事件内容是否与系统的业务领域相关。
 
 ## 系统信息
 - 系统名称: {system_name}
@@ -107,6 +151,8 @@ pub struct RelevanceCheckResult {
     pub reason: String,
     /// Matched event categories (if any)
     pub matched_categories: Vec<String>,
+    /// Indices of related context memories (1-based)
+    pub related_memory_indices: Vec<usize>,
 }
 
 /// EventHandler service for structuring raw events
@@ -198,10 +244,12 @@ impl EventHandler {
     ///
     /// Uses LLM to determine if the event content matches the system's
     /// business domain, event categories, and is within system boundaries.
+    /// Also considers context memories to detect implicit relationships.
     ///
     /// # Arguments
     /// * `content` - The event content to check
     /// * `profile` - The SystemProfile to check against
+    /// * `context_memories` - Optional context memories for better relevance judgment
     ///
     /// # Returns
     /// * `Ok(RelevanceCheckResult)` - The relevance check result
@@ -210,23 +258,55 @@ impl EventHandler {
         &self,
         content: &str,
         profile: &SystemProfile,
+        context_memories: Option<&[Memory]>,
     ) -> AppResult<RelevanceCheckResult> {
         debug!(
             profile_id = %profile.id,
             content_len = content.len(),
+            context_memory_count = context_memories.map(|m| m.len()).unwrap_or(0),
             "Checking event relevance against SystemProfile"
         );
 
-        // Build the relevance check prompt
-        let prompt = RELEVANCE_CHECK_PROMPT
-            .replace("{system_name}", &profile.name)
-            .replace("{purpose}", &profile.purpose)
-            .replace("{domain}", &profile.domain)
-            .replace("{target_audience}", &profile.target_audience)
-            .replace("{event_categories}", &profile.event_categories.join(", "))
-            .replace("{memory_focus}", &profile.memory_focus.join(", "))
-            .replace("{boundaries}", &profile.boundaries.join(", "))
-            .replace("{content}", content);
+        // Choose prompt template based on whether we have context memories
+        let prompt = if let Some(memories) = context_memories {
+            if memories.is_empty() {
+                // No context memories - use simple prompt
+                RELEVANCE_CHECK_PROMPT_NO_CONTEXT
+                    .replace("{system_name}", &profile.name)
+                    .replace("{purpose}", &profile.purpose)
+                    .replace("{domain}", &profile.domain)
+                    .replace("{target_audience}", &profile.target_audience)
+                    .replace("{event_categories}", &profile.event_categories.join(", "))
+                    .replace("{memory_focus}", &profile.memory_focus.join(", "))
+                    .replace("{boundaries}", &profile.boundaries.join(", "))
+                    .replace("{content}", content)
+            } else {
+                // Format context memories for the prompt
+                let context_memories_text = Self::format_context_memories(memories);
+
+                RELEVANCE_CHECK_PROMPT
+                    .replace("{system_name}", &profile.name)
+                    .replace("{purpose}", &profile.purpose)
+                    .replace("{domain}", &profile.domain)
+                    .replace("{target_audience}", &profile.target_audience)
+                    .replace("{event_categories}", &profile.event_categories.join(", "))
+                    .replace("{memory_focus}", &profile.memory_focus.join(", "))
+                    .replace("{boundaries}", &profile.boundaries.join(", "))
+                    .replace("{context_memories}", &context_memories_text)
+                    .replace("{content}", content)
+            }
+        } else {
+            // No context memories provided - use simple prompt
+            RELEVANCE_CHECK_PROMPT_NO_CONTEXT
+                .replace("{system_name}", &profile.name)
+                .replace("{purpose}", &profile.purpose)
+                .replace("{domain}", &profile.domain)
+                .replace("{target_audience}", &profile.target_audience)
+                .replace("{event_categories}", &profile.event_categories.join(", "))
+                .replace("{memory_focus}", &profile.memory_focus.join(", "))
+                .replace("{boundaries}", &profile.boundaries.join(", "))
+                .replace("{content}", content)
+        };
 
         // Call LLM to check relevance
         let chat_request = ChatRequest::new(prompt)
@@ -245,10 +325,29 @@ impl EventHandler {
             is_relevant = result.is_relevant,
             relevance_score = result.relevance_score,
             reason = %result.reason,
+            related_memory_count = result.related_memory_indices.len(),
             "Event relevance check completed"
         );
 
         Ok(result)
+    }
+
+    /// Format context memories for inclusion in the relevance check prompt
+    fn format_context_memories(memories: &[Memory]) -> String {
+        if memories.is_empty() {
+            return "（无历史记忆）".to_string();
+        }
+
+        memories
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| {
+                let category = m.category.as_deref().unwrap_or("未分类");
+                let global_marker = if m.is_global { " [长期记忆]" } else { "" };
+                format!("{}. [{}{}] {}", idx + 1, category, global_marker, m.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Check relevance using the profile from ProfileService
@@ -258,17 +357,21 @@ impl EventHandler {
     ///
     /// # Arguments
     /// * `content` - The event content to check
+    /// * `context_memories` - Optional context memories for better relevance judgment
     ///
     /// # Returns
     /// * `Ok(RelevanceCheckResult)` - The relevance check result
     pub async fn check_relevance_with_profile(
         &self,
         content: &str,
+        context_memories: Option<&[Memory]>,
     ) -> AppResult<RelevanceCheckResult> {
         if let Some(ref profile_service) = self.profile_service {
             match profile_service.get().await {
                 Ok(profile) => {
-                    return self.check_relevance(content, &profile).await;
+                    return self
+                        .check_relevance(content, &profile, context_memories)
+                        .await;
                 }
                 Err(e) => {
                     debug!(error = %e, "No SystemProfile found, skipping relevance check");
@@ -282,6 +385,7 @@ impl EventHandler {
             relevance_score: 1.0,
             reason: "No SystemProfile configured, accepting all events".to_string(),
             matched_categories: vec![],
+            related_memory_indices: vec![],
         })
     }
 
@@ -312,12 +416,22 @@ impl EventHandler {
                     .collect()
             })
             .unwrap_or_default();
+        let related_memory_indices = parsed["related_memory_indices"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(RelevanceCheckResult {
             is_relevant,
             relevance_score,
             reason,
             matched_categories,
+            related_memory_indices,
         })
     }
 
@@ -665,12 +779,22 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
+        let related_memory_indices = parsed["related_memory_indices"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(RelevanceCheckResult {
             is_relevant,
             relevance_score,
             reason,
             matched_categories,
+            related_memory_indices,
         })
     }
 
@@ -750,5 +874,109 @@ mod tests {
         assert!((result.relevance_score - 1.0).abs() < 0.01);
         assert_eq!(result.reason, "Some reason");
         assert!(result.matched_categories.is_empty());
+    }
+
+    #[test]
+    fn test_parse_relevance_response_with_related_memories() {
+        let response = r#"{
+            "is_relevant": true,
+            "relevance_score": 0.75,
+            "reason": "事件与用户历史记忆相关，可能是财务状况更新",
+            "matched_categories": [],
+            "related_memory_indices": [1, 3, 5]
+        }"#;
+
+        let result = parse_relevance_response_test(response).unwrap();
+
+        assert!(result.is_relevant);
+        assert!((result.relevance_score - 0.75).abs() < 0.01);
+        assert_eq!(result.related_memory_indices, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_format_context_memories_empty() {
+        let memories: Vec<Memory> = vec![];
+        let result = EventHandler::format_context_memories(&memories);
+        assert_eq!(result, "（无历史记忆）");
+    }
+
+    #[test]
+    fn test_format_context_memories_single() {
+        let memory = create_test_memory(
+            "我想买一套海景房，但是价钱太贵了买不起",
+            Some("personal.finance.budget"),
+            false,
+        );
+        let memories = vec![memory];
+        let result = EventHandler::format_context_memories(&memories);
+
+        assert!(result.contains("1."));
+        assert!(result.contains("[personal.finance.budget]"));
+        assert!(result.contains("买不起"));
+        assert!(!result.contains("[长期记忆]"));
+    }
+
+    #[test]
+    fn test_format_context_memories_with_global() {
+        let memory1 = create_test_memory("我喜欢海景房", Some("personal.preference.housing"), true);
+        let memory2 = create_test_memory("预算有限", Some("personal.finance.budget"), false);
+        let memories = vec![memory1, memory2];
+        let result = EventHandler::format_context_memories(&memories);
+
+        assert!(result.contains("1."));
+        assert!(result.contains("2."));
+        assert!(result.contains("[长期记忆]"));
+        assert!(result.contains("海景房"));
+        assert!(result.contains("预算有限"));
+    }
+
+    #[test]
+    fn test_format_context_memories_no_category() {
+        let memory = create_test_memory("一些内容", None, false);
+        let memories = vec![memory];
+        let result = EventHandler::format_context_memories(&memories);
+
+        assert!(result.contains("[未分类]"));
+    }
+
+    /// Helper function to create a test memory
+    fn create_test_memory(content: &str, category: Option<&str>, is_global: bool) -> Memory {
+        Memory {
+            id: uuid::Uuid::new_v4(),
+            profile_id: uuid::Uuid::new_v4(),
+            owner_id: "test_owner".to_string(),
+            scope_id: if is_global {
+                None
+            } else {
+                Some("test_scope".to_string())
+            },
+            content: content.to_string(),
+            category: category.map(|s| s.to_string()),
+            tags: None,
+            importance: 0.5,
+            confidence: 0.8,
+            root_memory_id: None,
+            version_number: 1,
+            is_current_version: true,
+            supersedes: None,
+            superseded_by: None,
+            is_global,
+            hit_count: 0,
+            last_hit_at: None,
+            decay_score: 1.0,
+            source_event_id: None,
+            status: crate::domain::Status::Active,
+            embedding_status: crate::domain::EmbeddingStatus::Pending,
+            embedding_provider: None,
+            processing_status: crate::domain::ProcessingStatus::Pending,
+            llm_provider: None,
+            inference_type: None,
+            inference_confidence: None,
+            inference_reasoning: None,
+            promoted_at: None,
+            promotion_reason: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
     }
 }

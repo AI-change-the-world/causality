@@ -403,6 +403,89 @@ impl MemoryRepository {
         Ok(memories)
     }
 
+    /// Find context memories for event processing
+    ///
+    /// Returns memories that should be used as context when processing a new event:
+    /// 1. Same scope memories (recent, active) - for conversation continuity
+    /// 2. Global memories (long-term) - for persistent preferences/facts
+    ///
+    /// This enables the system to:
+    /// - Recognize implicit relationships (e.g., "won lottery" relates to "can't afford")
+    /// - Make better relevance judgments
+    /// - Decide whether to create new memory or update existing one
+    pub async fn find_context_memories(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+        scope_id: Option<&str>,
+        scope_limit: usize,
+        global_limit: usize,
+    ) -> AppResult<Vec<Memory>> {
+        // If no scope_id, only return global memories
+        if scope_id.is_none() {
+            let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+                r#"
+                SELECT {}
+                FROM memories
+                WHERE profile_id = $1
+                  AND owner_id = $2
+                  AND is_global = true
+                  AND status = 'active'
+                  AND is_current_version = true
+                ORDER BY hit_count DESC, updated_at DESC
+                LIMIT $3
+                "#,
+                MEMORY_COLUMNS
+            ))
+            .bind(profile_id)
+            .bind(owner_id)
+            .bind(global_limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+
+            return Ok(rows.into_iter().map(Into::into).collect());
+        }
+
+        // With scope_id: get both scope memories and global memories
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+            (
+                SELECT {}
+                FROM memories
+                WHERE profile_id = $1
+                  AND owner_id = $2
+                  AND scope_id = $3
+                  AND status = 'active'
+                  AND is_current_version = true
+                ORDER BY updated_at DESC
+                LIMIT $4
+            )
+            UNION ALL
+            (
+                SELECT {}
+                FROM memories
+                WHERE profile_id = $1
+                  AND owner_id = $2
+                  AND is_global = true
+                  AND status = 'active'
+                  AND is_current_version = true
+                ORDER BY hit_count DESC, updated_at DESC
+                LIMIT $5
+            )
+            "#,
+            MEMORY_COLUMNS, MEMORY_COLUMNS
+        ))
+        .bind(profile_id)
+        .bind(owner_id)
+        .bind(scope_id)
+        .bind(scope_limit as i64)
+        .bind(global_limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// Find memories with structured filters for retrieval
     ///
     /// Scope logic:
