@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
+use crate::config::MatchingConfig;
 use crate::domain::Memory;
 use crate::error::AppResult;
 use crate::repository::{MemoryRepository, QdrantRepository, VectorFilter};
@@ -39,6 +40,15 @@ impl Default for MatcherConfig {
         Self {
             similarity_threshold: 0.85,
             max_candidates: 10,
+        }
+    }
+}
+
+impl From<MatchingConfig> for MatcherConfig {
+    fn from(config: MatchingConfig) -> Self {
+        Self {
+            similarity_threshold: config.match_similarity_threshold.clamp(0.0, 1.0),
+            max_candidates: config.max_match_candidates.max(1),
         }
     }
 }
@@ -90,15 +100,17 @@ impl MemoryMatcher {
     ///
     /// # Returns
     /// Vector of MatchResult sorted by similarity score (highest first)
-    #[instrument(skip(self, embedding), fields(owner_id = %owner_id, scope_id = ?scope_id))]
+    #[instrument(skip(self, embedding), fields(profile_id = %profile_id, owner_id = %owner_id, scope_id = ?scope_id))]
     pub async fn find_similar(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         embedding: &[f32],
         provider_name: &str,
     ) -> AppResult<Vec<MatchResult>> {
         self.find_similar_with_threshold(
+            profile_id,
             owner_id,
             scope_id,
             embedding,
@@ -109,9 +121,10 @@ impl MemoryMatcher {
     }
 
     /// Find similar memories with a custom similarity threshold
-    #[instrument(skip(self, embedding), fields(owner_id = %owner_id, scope_id = ?scope_id, threshold = %threshold))]
+    #[instrument(skip(self, embedding), fields(profile_id = %profile_id, owner_id = %owner_id, scope_id = ?scope_id, threshold = %threshold))]
     pub async fn find_similar_with_threshold(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         embedding: &[f32],
@@ -119,9 +132,11 @@ impl MemoryMatcher {
         threshold: f32,
     ) -> AppResult<Vec<MatchResult>> {
         // Build vector filter for Qdrant search
-        // Note: Qdrant filter uses legacy field names, but we filter by status
         let filter = VectorFilter {
+            profile_id: Some(profile_id),
+            owner_id: Some(owner_id.to_string()),
             scope_id: scope_id.map(|s| s.to_string()),
+            include_global: Some(scope_id.is_some()),
             statuses: Some(vec!["active".to_string()]),
             ..Default::default()
         };
@@ -177,6 +192,11 @@ impl MemoryMatcher {
                     return false;
                 }
 
+                // Must stay within the requested business system
+                if m.profile_id != profile_id {
+                    return false;
+                }
+
                 // Must match scope OR be global
                 let scope_matches = match (scope_id, &m.scope_id) {
                     (Some(s), Some(ms)) => s == ms,
@@ -221,31 +241,33 @@ impl MemoryMatcher {
     }
 
     /// Find the best matching memory (highest similarity above threshold)
-    #[instrument(skip(self, embedding), fields(owner_id = %owner_id, scope_id = ?scope_id))]
+    #[instrument(skip(self, embedding), fields(profile_id = %profile_id, owner_id = %owner_id, scope_id = ?scope_id))]
     pub async fn find_best_match(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         embedding: &[f32],
         provider_name: &str,
     ) -> AppResult<Option<MatchResult>> {
         let matches = self
-            .find_similar(owner_id, scope_id, embedding, provider_name)
+            .find_similar(profile_id, owner_id, scope_id, embedding, provider_name)
             .await?;
         Ok(matches.into_iter().next())
     }
 
     /// Check if a similar memory exists (without fetching full details)
-    #[instrument(skip(self, embedding), fields(owner_id = %owner_id, scope_id = ?scope_id))]
+    #[instrument(skip(self, embedding), fields(profile_id = %profile_id, owner_id = %owner_id, scope_id = ?scope_id))]
     pub async fn has_similar(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         embedding: &[f32],
         provider_name: &str,
     ) -> AppResult<bool> {
         let matches = self
-            .find_similar(owner_id, scope_id, embedding, provider_name)
+            .find_similar(profile_id, owner_id, scope_id, embedding, provider_name)
             .await?;
         Ok(!matches.is_empty())
     }

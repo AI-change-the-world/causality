@@ -219,10 +219,15 @@ impl GlobalPromoter {
 
     /// Find and promote all eligible memories for an owner
     #[instrument(skip(self), fields(owner_id = %owner_id))]
-    pub async fn promote_eligible(&self, owner_id: &str) -> AppResult<Vec<Memory>> {
+    pub async fn promote_eligible(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+    ) -> AppResult<Vec<Memory>> {
         let candidates = self
             .memory_repo
             .find_global_promotion_candidates(
+                profile_id,
                 self.criteria.min_scope_diversity,
                 self.criteria.min_reinforcements,
                 self.criteria.min_confidence,

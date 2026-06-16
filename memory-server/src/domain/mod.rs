@@ -17,7 +17,7 @@ mod structured_event;
 
 pub use event::{
     CreateEventInput, CreateEventValidation, Event, EventMemoryRelation, EventMemoryRelationType,
-    PromotionCriteria,
+    EventSource, PromotionCriteria,
 };
 pub use memory::{
     CreateMemoryFromEventInput, CreateMemoryInput, CreateMemoryValidation,

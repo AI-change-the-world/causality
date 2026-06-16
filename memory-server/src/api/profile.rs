@@ -1,9 +1,10 @@
 //! Profile API handlers
 //!
 //! Implements:
-//! - POST /api/v1/system/init - Initialize system profile with LLM parsing
-//! - GET /api/v1/system - Get current system profile
-//! - PUT /api/v1/system - Update system profile (partial or re-parse)
+//! - POST /api/v1/systems - Create a system profile namespace with LLM parsing
+//! - GET /api/v1/systems - List system profiles
+//! - GET /api/v1/systems/{profile_id} - Get a profile by ID
+//! - PUT /api/v1/systems/{profile_id} - Update a profile by ID
 
 use axum::{
     extract::State,
@@ -148,18 +149,18 @@ impl From<UpdateProfileRequest> for UpdateProfileInput {
 /// Create profile routes
 pub fn profile_routes() -> Router<AppState> {
     Router::new()
-        .route("/init", post(initialize_profile))
-        .route("/", get(get_profile))
-        .route("/", put(update_profile))
+        .route("/", post(create_profile))
+        .route("/", get(list_profiles))
+        .route("/{profile_id}", get(get_profile_by_id))
+        .route("/{profile_id}", put(update_profile_by_id))
 }
 
-/// POST /api/v1/system/init - Initialize system profile
+/// POST /api/v1/systems - Create a system profile namespace
 ///
-/// Creates the system profile using LLM to parse the natural language description.
-/// Returns an error if a profile already exists.
+/// Creates a system profile using LLM to parse the natural language description.
 #[utoipa::path(
     post,
-    path = "/api/v1/system/init",
+    path = "/api/v1/systems",
     tag = "system",
     request_body = InitializeProfileRequest,
     responses(
@@ -169,49 +170,72 @@ pub fn profile_routes() -> Router<AppState> {
         (status = 500, description = "Internal server error (LLM parsing failed)", body = crate::error::ErrorResponse)
     )
 )]
-pub async fn initialize_profile(
+pub async fn create_profile(
     State(state): State<AppState>,
     Json(request): Json<InitializeProfileRequest>,
 ) -> AppResult<(StatusCode, Json<ProfileResponse>)> {
-    tracing::info!(name = %request.name, "Initializing system profile");
+    tracing::info!(name = %request.name, "Creating system profile");
 
     let input: CreateProfileInput = request.into();
     let profile = state.profile_service.initialize(input).await?;
 
-    tracing::info!(id = %profile.id, "System profile initialized successfully");
+    tracing::info!(id = %profile.id, "System profile created successfully");
 
     Ok((StatusCode::CREATED, Json(profile.into())))
 }
 
-/// GET /api/v1/system - Get current system profile
-///
-/// Returns the current system profile or 404 if not initialized.
+/// GET /api/v1/systems - List all system profiles
 #[utoipa::path(
     get,
-    path = "/api/v1/system",
+    path = "/api/v1/systems",
     tag = "system",
+    responses(
+        (status = 200, description = "System profiles listed successfully", body = Vec<ProfileResponse>),
+        (status = 500, description = "Internal server error", body = crate::error::ErrorResponse)
+    )
+)]
+pub async fn list_profiles(State(state): State<AppState>) -> AppResult<Json<Vec<ProfileResponse>>> {
+    let profiles = state
+        .profile_service
+        .list()
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+
+    Ok(Json(profiles))
+}
+
+/// GET /api/v1/systems/{profile_id} - Get a specific system profile
+#[utoipa::path(
+    get,
+    path = "/api/v1/systems/{profile_id}",
+    tag = "system",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     responses(
         (status = 200, description = "System profile found", body = ProfileResponse),
         (status = 404, description = "System profile not found", body = crate::error::ErrorResponse)
     )
 )]
-pub async fn get_profile(State(state): State<AppState>) -> AppResult<Json<ProfileResponse>> {
-    tracing::debug!("Getting system profile");
-
-    let profile = state.profile_service.get().await?;
+pub async fn get_profile_by_id(
+    State(state): State<AppState>,
+    axum::extract::Path(profile_id): axum::extract::Path<Uuid>,
+) -> AppResult<Json<ProfileResponse>> {
+    let profile = state.profile_service.get_by_id(profile_id).await?;
 
     Ok(Json(profile.into()))
 }
 
-/// PUT /api/v1/system - Update system profile
-///
-/// Updates the system profile. Supports two modes:
-/// 1. Partial update: Only updates provided fields
-/// 2. Re-parse: If `reparse=true`, uses LLM to re-parse the description
+/// PUT /api/v1/systems/{profile_id} - Update a specific system profile
 #[utoipa::path(
     put,
-    path = "/api/v1/system",
+    path = "/api/v1/systems/{profile_id}",
     tag = "system",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     request_body = UpdateProfileRequest,
     responses(
         (status = 200, description = "System profile updated successfully", body = ProfileResponse),
@@ -220,18 +244,19 @@ pub async fn get_profile(State(state): State<AppState>) -> AppResult<Json<Profil
         (status = 500, description = "Internal server error (LLM parsing failed)", body = crate::error::ErrorResponse)
     )
 )]
-pub async fn update_profile(
+pub async fn update_profile_by_id(
     State(state): State<AppState>,
+    axum::extract::Path(profile_id): axum::extract::Path<Uuid>,
     Json(request): Json<UpdateProfileRequest>,
 ) -> AppResult<Json<ProfileResponse>> {
-    tracing::info!(reparse = request.reparse, "Updating system profile");
+    tracing::info!(profile_id = %profile_id, reparse = request.reparse, "Updating system profile");
 
     let input: UpdateProfileInput = request.into();
-    let profile = state.profile_service.update(input).await?;
+    let updated = state.profile_service.update(profile_id, input).await?;
 
-    tracing::info!(id = %profile.id, "System profile updated successfully");
+    tracing::info!(id = %updated.id, "System profile updated successfully");
 
-    Ok(Json(profile.into()))
+    Ok(Json(updated.into()))
 }
 
 #[cfg(test)]

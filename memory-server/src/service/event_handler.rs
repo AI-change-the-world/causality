@@ -207,7 +207,7 @@ impl EventHandler {
         );
 
         // Get the extraction prompt (from SystemProfile or default)
-        let extraction_prompt = self.get_extraction_prompt().await;
+        let extraction_prompt = self.get_extraction_prompt(event.profile_id).await;
 
         // Build the full prompt with event content
         let prompt = self.build_extraction_prompt(&event.content, &extraction_prompt);
@@ -356,6 +356,7 @@ impl EventHandler {
     /// If no profile exists, returns a default "relevant" result (permissive mode).
     ///
     /// # Arguments
+    /// * `profile_id` - The system profile namespace to check against
     /// * `content` - The event content to check
     /// * `context_memories` - Optional context memories for better relevance judgment
     ///
@@ -363,11 +364,12 @@ impl EventHandler {
     /// * `Ok(RelevanceCheckResult)` - The relevance check result
     pub async fn check_relevance_with_profile(
         &self,
+        profile_id: uuid::Uuid,
         content: &str,
         context_memories: Option<&[Memory]>,
     ) -> AppResult<RelevanceCheckResult> {
         if let Some(ref profile_service) = self.profile_service {
-            match profile_service.get().await {
+            match profile_service.get_by_id(profile_id).await {
                 Ok(profile) => {
                     return self
                         .check_relevance(content, &profile, context_memories)
@@ -436,9 +438,9 @@ impl EventHandler {
     }
 
     /// Get the extraction prompt from SystemProfile or use default
-    async fn get_extraction_prompt(&self) -> String {
+    async fn get_extraction_prompt(&self, profile_id: uuid::Uuid) -> String {
         if let Some(ref profile_service) = self.profile_service {
-            match profile_service.get().await {
+            match profile_service.get_by_id(profile_id).await {
                 Ok(profile) => {
                     if !profile.extraction_prompt.is_empty() {
                         debug!("Using extraction prompt from SystemProfile");
@@ -963,6 +965,8 @@ mod tests {
             is_global,
             hit_count: 0,
             last_hit_at: None,
+            reinforcement_count: 0,
+            last_reinforced_at: None,
             decay_score: 1.0,
             source_event_id: None,
             status: crate::domain::Status::Active,
@@ -973,6 +977,8 @@ mod tests {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            conflict_reason: None,
+            consistency_confidence: None,
             promoted_at: None,
             promotion_reason: None,
             created_at: chrono::Utc::now(),

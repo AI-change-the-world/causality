@@ -11,8 +11,14 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::domain::{Event, EventMemoryRelation, EventMemoryRelationType};
+use crate::domain::{Event, EventMemoryRelation, EventMemoryRelationType, ProcessingStatus};
 use crate::error::{AppError, AppResult};
+
+const EVENT_COLUMNS: &str = r#"
+    id, profile_id, owner_id, scope_id, content, context,
+    summary, source, processing_status, error_message, processed_at,
+    skipped, skip_reason, relevance_score, event_time, created_at
+"#;
 
 /// Repository for Event CRUD operations
 #[derive(Clone)]
@@ -32,12 +38,17 @@ impl EventRepository {
             r#"
             INSERT INTO events (
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processed, event_time, created_at
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $14, $15, $16
+            )
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processed, event_time, created_at
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
         .bind(event.id)
@@ -47,8 +58,13 @@ impl EventRepository {
         .bind(&event.content)
         .bind(&event.context)
         .bind(&event.summary)
-        .bind(&event.source)
-        .bind(event.processed)
+        .bind(event.source.map(|source| source.to_string()))
+        .bind(event.processing_status)
+        .bind(&event.error_message)
+        .bind(event.processed_at)
+        .bind(event.skipped)
+        .bind(&event.skip_reason)
+        .bind(event.relevance_score)
         .bind(event.event_time)
         .bind(event.created_at)
         .fetch_one(&self.pool)
@@ -59,15 +75,14 @@ impl EventRepository {
 
     /// Get an event by ID
     pub async fn get_by_id(&self, id: Uuid) -> AppResult<Event> {
-        let row = sqlx::query_as::<_, EventRow>(
+        let row = sqlx::query_as::<_, EventRow>(&format!(
             r#"
-            SELECT
-                id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processed, event_time, created_at
+            SELECT {}
             FROM events
             WHERE id = $1
             "#,
-        )
+            EVENT_COLUMNS
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -81,11 +96,17 @@ impl EventRepository {
         let row = sqlx::query_as::<_, EventRow>(
             r#"
             UPDATE events
-            SET processed = true, summary = $2
+            SET processing_status = 'completed'::processing_status,
+                summary = $2,
+                error_message = NULL,
+                processed_at = NOW(),
+                skipped = false,
+                skip_reason = NULL
             WHERE id = $1
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processed, event_time, created_at
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
         .bind(id)
@@ -97,19 +118,120 @@ impl EventRepository {
         Ok(row.into())
     }
 
-    /// Find unprocessed events for a given owner
-    pub async fn find_unprocessed(&self, owner_id: &str, limit: i64) -> AppResult<Vec<Event>> {
+    /// Mark an event as skipped with structured skip metadata.
+    pub async fn mark_skipped(
+        &self,
+        id: Uuid,
+        skip_reason: &str,
+        relevance_score: Option<f32>,
+    ) -> AppResult<Event> {
+        let row = sqlx::query_as::<_, EventRow>(
+            r#"
+            UPDATE events
+            SET processing_status = 'skipped'::processing_status,
+                error_message = NULL,
+                processed_at = NOW(),
+                skipped = true,
+                skip_reason = $2,
+                relevance_score = $3
+            WHERE id = $1
+            RETURNING
+                id, profile_id, owner_id, scope_id, content, context,
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
+            "#,
+        )
+        .bind(id)
+        .bind(skip_reason)
+        .bind(relevance_score)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::EventNotFound(id))?;
+
+        Ok(row.into())
+    }
+
+    /// Mark an event as failed and persist the processing error for retry/debugging.
+    pub async fn mark_failed(&self, id: Uuid, error_message: &str) -> AppResult<Event> {
+        let row = sqlx::query_as::<_, EventRow>(
+            r#"
+            UPDATE events
+            SET processing_status = 'failed'::processing_status,
+                error_message = $2,
+                processed_at = NOW(),
+                skipped = false
+            WHERE id = $1
+            RETURNING
+                id, profile_id, owner_id, scope_id, content, context,
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
+            "#,
+        )
+        .bind(id)
+        .bind(error_message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::EventNotFound(id))?;
+
+        Ok(row.into())
+    }
+
+    /// Reset a failed event to pending before retrying it.
+    pub async fn reset_for_retry(&self, profile_id: Uuid, id: Uuid) -> AppResult<Event> {
+        let row = sqlx::query_as::<_, EventRow>(
+            r#"
+            UPDATE events
+            SET processing_status = 'pending'::processing_status,
+                error_message = NULL,
+                processed_at = NULL,
+                skipped = false,
+                skip_reason = NULL,
+                relevance_score = NULL
+            WHERE id = $1
+              AND profile_id = $2
+              AND processing_status = 'failed'::processing_status
+            RETURNING
+                id, profile_id, owner_id, scope_id, content, context,
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
+            "#,
+        )
+        .bind(id)
+        .bind(profile_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            AppError::Validation(
+                "event is not failed or does not belong to the requested system profile"
+                    .to_string(),
+            )
+        })?;
+
+        Ok(row.into())
+    }
+
+    /// Find unprocessed events for a given owner within a system profile.
+    pub async fn find_unprocessed(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+        limit: i64,
+    ) -> AppResult<Vec<Event>> {
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processed, event_time, created_at
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
             FROM events
-            WHERE owner_id = $1 AND processed = false
+            WHERE profile_id = $1
+              AND owner_id = $2
+              AND processing_status = 'pending'::processing_status
             ORDER BY event_time ASC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
+        .bind(profile_id)
         .bind(owner_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -118,9 +240,10 @@ impl EventRepository {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Find events by owner and scope
+    /// Find events by owner and scope within a system profile.
     pub async fn find_by_scope(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         limit: i64,
@@ -130,13 +253,17 @@ impl EventRepository {
                 r#"
                 SELECT
                     id, profile_id, owner_id, scope_id, content, context,
-                    summary, source, processed, event_time, created_at
+                    summary, source, processing_status, error_message, processed_at,
+                    skipped, skip_reason, relevance_score, event_time, created_at
                 FROM events
-                WHERE owner_id = $1 AND scope_id = $2
+                WHERE profile_id = $1
+                  AND owner_id = $2
+                  AND scope_id = $3
                 ORDER BY event_time DESC
-                LIMIT $3
+                LIMIT $4
                 "#,
             )
+            .bind(profile_id)
             .bind(owner_id)
             .bind(scope)
             .bind(limit)
@@ -148,13 +275,17 @@ impl EventRepository {
                 r#"
                 SELECT
                     id, profile_id, owner_id, scope_id, content, context,
-                    summary, source, processed, event_time, created_at
+                    summary, source, processing_status, error_message, processed_at,
+                    skipped, skip_reason, relevance_score, event_time, created_at
                 FROM events
-                WHERE owner_id = $1 AND scope_id IS NULL
+                WHERE profile_id = $1
+                  AND owner_id = $2
+                  AND scope_id IS NULL
                 ORDER BY event_time DESC
-                LIMIT $2
+                LIMIT $3
                 "#,
             )
+            .bind(profile_id)
             .bind(owner_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -164,19 +295,27 @@ impl EventRepository {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Find events by owner (all scopes)
-    pub async fn find_by_owner(&self, owner_id: &str, limit: i64) -> AppResult<Vec<Event>> {
+    /// Find events by owner across all scopes within a system profile.
+    pub async fn find_by_owner(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+        limit: i64,
+    ) -> AppResult<Vec<Event>> {
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processed, event_time, created_at
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
             FROM events
-            WHERE owner_id = $1
+            WHERE profile_id = $1
+              AND owner_id = $2
             ORDER BY event_time DESC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
+        .bind(profile_id)
         .bind(owner_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -286,17 +425,25 @@ impl EventRepository {
     }
 
     /// Get events that support a memory (created_from or reinforced_by)
-    pub async fn get_supporting_events(&self, memory_id: Uuid) -> AppResult<Vec<Event>> {
+    pub async fn get_supporting_events(
+        &self,
+        profile_id: Uuid,
+        memory_id: Uuid,
+    ) -> AppResult<Vec<Event>> {
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
-            SELECT e.id, e.owner_id, e.scope_id, e.content, e.context,
-                   e.summary, e.source, e.processed, e.event_time, e.created_at
+            SELECT e.id, e.profile_id, e.owner_id, e.scope_id, e.content, e.context,
+                   e.summary, e.source, e.processing_status, e.error_message, e.processed_at,
+                   e.skipped, e.skip_reason, e.relevance_score, e.event_time, e.created_at
             FROM events e
             JOIN event_memory_relations emr ON e.id = emr.event_id
-            WHERE emr.memory_id = $1 AND emr.relation_type IN ('created_from', 'reinforced_by')
+            WHERE e.profile_id = $1
+              AND emr.memory_id = $2
+              AND emr.relation_type IN ('created_from', 'reinforced_by')
             ORDER BY e.event_time DESC
             "#,
         )
+        .bind(profile_id)
         .bind(memory_id)
         .fetch_all(&self.pool)
         .await?;
@@ -305,17 +452,25 @@ impl EventRepository {
     }
 
     /// Get the source event for a memory (created_from relation)
-    pub async fn get_source_event(&self, memory_id: Uuid) -> AppResult<Option<Event>> {
+    pub async fn get_source_event(
+        &self,
+        profile_id: Uuid,
+        memory_id: Uuid,
+    ) -> AppResult<Option<Event>> {
         let row = sqlx::query_as::<_, EventRow>(
             r#"
-            SELECT e.id, e.owner_id, e.scope_id, e.content, e.context,
-                   e.summary, e.source, e.processed, e.event_time, e.created_at
+            SELECT e.id, e.profile_id, e.owner_id, e.scope_id, e.content, e.context,
+                   e.summary, e.source, e.processing_status, e.error_message, e.processed_at,
+                   e.skipped, e.skip_reason, e.relevance_score, e.event_time, e.created_at
             FROM events e
             JOIN event_memory_relations emr ON e.id = emr.event_id
-            WHERE emr.memory_id = $1 AND emr.relation_type = 'created_from'
+            WHERE e.profile_id = $1
+              AND emr.memory_id = $2
+              AND emr.relation_type = 'created_from'
             LIMIT 1
             "#,
         )
+        .bind(profile_id)
         .bind(memory_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -335,7 +490,12 @@ struct EventRow {
     context: Option<String>,
     summary: Option<String>,
     source: Option<String>,
-    processed: bool,
+    processing_status: ProcessingStatus,
+    error_message: Option<String>,
+    processed_at: Option<DateTime<Utc>>,
+    skipped: bool,
+    skip_reason: Option<String>,
+    relevance_score: Option<f32>,
     event_time: DateTime<Utc>,
     created_at: DateTime<Utc>,
 }
@@ -350,8 +510,13 @@ impl From<EventRow> for Event {
             content: row.content,
             context: row.context,
             summary: row.summary,
-            source: row.source,
-            processed: row.processed,
+            source: row.source.and_then(|source| source.parse().ok()),
+            processing_status: row.processing_status,
+            error_message: row.error_message,
+            processed_at: row.processed_at,
+            skipped: row.skipped,
+            skip_reason: row.skip_reason,
+            relevance_score: row.relevance_score,
             event_time: row.event_time,
             created_at: row.created_at,
         }

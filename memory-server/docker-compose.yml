@@ -65,7 +65,7 @@ services:
   # Qdrant - Vector Database
   # ============================================
   qdrant:
-    image: qdrant/qdrant:v1.16.3
+    image: qdrant/qdrant:latest
     container_name: memory-qdrant
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334

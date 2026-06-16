@@ -194,7 +194,7 @@ impl RetrievalEngine {
     ///
     /// Process:
     /// 1. Apply structured filters (PostgreSQL)
-    ///    - profile_id (required for multi-tenant)
+    ///    - profile_id (required for system namespace isolation)
     ///    - owner_id (required)
     ///    - scope_id + is_global (when scope_id provided, also includes global memories)
     ///    - is_current_version = true (default)
@@ -243,7 +243,7 @@ impl RetrievalEngine {
             .unwrap_or(self.config.score_weights.fulltext);
 
         // Step 1: Structured filtering (PostgreSQL)
-        // - profile_id (required for multi-tenant)
+        // - profile_id (required for system namespace isolation)
         // - is_current_version = true (default)
         // - status NOT IN ('superseded', 'archived') (default)
         // - scope_id + is_global combined query
@@ -375,7 +375,7 @@ impl RetrievalEngine {
         // Step 7: Load evidence if requested
         if include_evidence {
             for retrieved in &mut scored_memories {
-                if let Ok(evidence) = self.load_evidence(retrieved.memory.id).await {
+                if let Ok(evidence) = self.load_evidence(&retrieved.memory).await {
                     retrieved.evidence = Some(evidence);
                 }
             }
@@ -414,8 +414,11 @@ impl RetrievalEngine {
     }
 
     /// Load evidence (source events) for a memory
-    async fn load_evidence(&self, memory_id: Uuid) -> AppResult<MemoryEvidence> {
-        let events = self.event_repo.get_supporting_events(memory_id).await?;
+    async fn load_evidence(&self, memory: &Memory) -> AppResult<MemoryEvidence> {
+        let events = self
+            .event_repo
+            .get_supporting_events(memory.profile_id, memory.id)
+            .await?;
         let total_count = events.len();
         Ok(MemoryEvidence {
             events,
@@ -513,6 +516,7 @@ impl RetrievalEngine {
         if self.audit_enabled {
             self.audit_repo
                 .create(
+                    updated.profile_id,
                     memory_id,
                     AuditOperation::Hit,
                     actor_id,
@@ -634,6 +638,8 @@ mod tests {
             is_global: false,
             hit_count: 0,
             last_hit_at: None,
+            reinforcement_count: 0,
+            last_reinforced_at: None,
             decay_score: 1.0,
             // Source
             source_event_id: None,
@@ -648,6 +654,8 @@ mod tests {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            conflict_reason: None,
+            consistency_confidence: None,
             // Promotion
             promoted_at: None,
             promotion_reason: None,

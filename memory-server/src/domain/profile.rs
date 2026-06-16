@@ -2,7 +2,7 @@
 //!
 //! SystemProfile is the core configuration entity for the Memory System,
 //! defining business boundaries, target audience, and behavior guidelines.
-//! It is a singleton - only one profile can exist per system instance.
+//! Each profile is a business-system namespace for memories and events.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ pub const MAX_NAME_LENGTH: usize = 100;
 
 /// SystemProfile entity representing the system's configuration and boundaries
 ///
-/// This is a singleton entity - only one profile can exist per system instance.
+/// Each profile represents one business system's memory namespace.
 /// It guides LLM processing for memory extraction and event classification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SystemProfile {

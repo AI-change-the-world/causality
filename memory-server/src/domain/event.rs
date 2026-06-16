@@ -12,8 +12,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Type;
 use std::fmt;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::ProcessingStatus;
 use crate::error::AppError;
 
 /// Relation type between an event and a memory
@@ -48,6 +50,49 @@ impl std::str::FromStr for EventMemoryRelationType {
     }
 }
 
+/// Recommended source classification for incoming events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSource {
+    /// Conversation or chat message.
+    Conversation,
+    /// Explicit user action such as click, submit, or preference update.
+    UserAction,
+    /// Internal system event or automation signal.
+    SystemEvent,
+    /// Manual operator or admin input.
+    Manual,
+    /// Generic API ingestion.
+    Api,
+}
+
+impl fmt::Display for EventSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EventSource::Conversation => write!(f, "conversation"),
+            EventSource::UserAction => write!(f, "user_action"),
+            EventSource::SystemEvent => write!(f, "system_event"),
+            EventSource::Manual => write!(f, "manual"),
+            EventSource::Api => write!(f, "api"),
+        }
+    }
+}
+
+impl std::str::FromStr for EventSource {
+    type Err = String;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        match source.to_ascii_lowercase().as_str() {
+            "conversation" => Ok(EventSource::Conversation),
+            "user_action" => Ok(EventSource::UserAction),
+            "system_event" => Ok(EventSource::SystemEvent),
+            "manual" => Ok(EventSource::Manual),
+            "api" => Ok(EventSource::Api),
+            _ => Err(format!("Unknown event source: {}", source)),
+        }
+    }
+}
+
 /// Event entity representing a raw occurrence (completely immutable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -65,10 +110,20 @@ pub struct Event {
     pub context: Option<String>,
     /// LLM-generated summary of the event
     pub summary: Option<String>,
-    /// Event source (e.g., "user_created", "api", "conversation")
-    pub source: Option<String>,
-    /// Whether the event has been processed
-    pub processed: bool,
+    /// Recommended event source classification.
+    pub source: Option<EventSource>,
+    /// Current event processing status
+    pub processing_status: ProcessingStatus,
+    /// Processing error message when status is failed
+    pub error_message: Option<String>,
+    /// When processing reached a terminal status
+    pub processed_at: Option<DateTime<Utc>>,
+    /// Whether processing intentionally skipped this event
+    pub skipped: bool,
+    /// Structured skip reason when skipped
+    pub skip_reason: Option<String>,
+    /// Relevance score used by the skip decision
+    pub relevance_score: Option<f32>,
     /// When the event occurred
     pub event_time: DateTime<Utc>,
     /// When the event record was created
@@ -88,17 +143,51 @@ impl Event {
             context: input.context,
             summary: None,
             source: input.source,
-            processed: false,
+            processing_status: ProcessingStatus::Pending,
+            error_message: None,
+            processed_at: None,
+            skipped: false,
+            skip_reason: None,
+            relevance_score: None,
             event_time: input.event_time.unwrap_or(now),
             created_at: now,
         }
     }
 
     /// Mark the event as processed with a summary
-    /// Note: This is the only mutable operation allowed on an Event
     pub fn mark_processed(&mut self, summary: String) {
         self.summary = Some(summary);
-        self.processed = true;
+        self.processing_status = ProcessingStatus::Completed;
+        self.error_message = None;
+        self.processed_at = Some(Utc::now());
+        self.skipped = false;
+        self.skip_reason = None;
+    }
+
+    /// Mark the event as skipped by relevance checks.
+    pub fn mark_skipped(&mut self, skip_reason: String, relevance_score: Option<f32>) {
+        self.processing_status = ProcessingStatus::Skipped;
+        self.error_message = None;
+        self.processed_at = Some(Utc::now());
+        self.skipped = true;
+        self.skip_reason = Some(skip_reason);
+        self.relevance_score = relevance_score;
+    }
+
+    /// Mark the event as failed.
+    pub fn mark_failed(&mut self, error_message: String) {
+        self.processing_status = ProcessingStatus::Failed;
+        self.error_message = Some(error_message);
+        self.processed_at = Some(Utc::now());
+        self.skipped = false;
+    }
+
+    /// Whether the event reached a terminal processing status.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.processing_status,
+            ProcessingStatus::Completed | ProcessingStatus::Failed | ProcessingStatus::Skipped
+        )
     }
 }
 
@@ -115,8 +204,8 @@ pub struct CreateEventInput {
     pub content: String,
     /// Optional context
     pub context: Option<String>,
-    /// Event source (e.g., "user_created", "api", "conversation")
-    pub source: Option<String>,
+    /// Recommended event source classification.
+    pub source: Option<EventSource>,
     /// When the event occurred (defaults to now)
     pub event_time: Option<DateTime<Utc>>,
 }
@@ -217,7 +306,7 @@ mod tests {
             scope_id: Some("scope456".to_string()),
             content: "User clicked dark mode button".to_string(),
             context: Some("Settings page".to_string()),
-            source: Some("user_action".to_string()),
+            source: Some(EventSource::UserAction),
             event_time: None,
         }
     }
@@ -233,8 +322,10 @@ mod tests {
         assert_eq!(event.scope_id, Some("scope456".to_string()));
         assert_eq!(event.content, "User clicked dark mode button");
         assert_eq!(event.context, Some("Settings page".to_string()));
-        assert_eq!(event.source, Some("user_action".to_string()));
-        assert!(!event.processed);
+        assert_eq!(event.source, Some(EventSource::UserAction));
+        assert_eq!(event.processing_status, ProcessingStatus::Pending);
+        assert!(!event.skipped);
+        assert!(event.processed_at.is_none());
         assert!(event.summary.is_none());
     }
 
@@ -261,11 +352,38 @@ mod tests {
 
         event.mark_processed("User changed theme preference".to_string());
 
-        assert!(event.processed);
+        assert_eq!(event.processing_status, ProcessingStatus::Completed);
+        assert!(event.processed_at.is_some());
         assert_eq!(
             event.summary,
             Some("User changed theme preference".to_string())
         );
+    }
+
+    #[test]
+    fn test_event_mark_skipped() {
+        let input = valid_event_input();
+        let mut event = Event::new(input);
+
+        event.mark_skipped("not relevant".to_string(), Some(0.12));
+
+        assert_eq!(event.processing_status, ProcessingStatus::Skipped);
+        assert!(event.skipped);
+        assert_eq!(event.skip_reason, Some("not relevant".to_string()));
+        assert_eq!(event.relevance_score, Some(0.12));
+        assert!(event.processed_at.is_some());
+    }
+
+    #[test]
+    fn test_event_mark_failed() {
+        let input = valid_event_input();
+        let mut event = Event::new(input);
+
+        event.mark_failed("llm timeout".to_string());
+
+        assert_eq!(event.processing_status, ProcessingStatus::Failed);
+        assert_eq!(event.error_message, Some("llm timeout".to_string()));
+        assert!(event.processed_at.is_some());
     }
 
     #[test]
@@ -314,6 +432,22 @@ mod tests {
             EventMemoryRelationType::ReinforcedBy
         );
         assert!("unknown".parse::<EventMemoryRelationType>().is_err());
+    }
+
+    #[test]
+    fn test_event_source_display_and_parse() {
+        assert_eq!(EventSource::Conversation.to_string(), "conversation");
+        assert_eq!(EventSource::UserAction.to_string(), "user_action");
+        assert_eq!(EventSource::SystemEvent.to_string(), "system_event");
+        assert_eq!(EventSource::Manual.to_string(), "manual");
+        assert_eq!(EventSource::Api.to_string(), "api");
+
+        assert_eq!("api".parse::<EventSource>().unwrap(), EventSource::Api);
+        assert_eq!(
+            "system_event".parse::<EventSource>().unwrap(),
+            EventSource::SystemEvent
+        );
+        assert!("user_created".parse::<EventSource>().is_err());
     }
 
     #[test]

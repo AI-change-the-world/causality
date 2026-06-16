@@ -22,6 +22,8 @@ const COLLECTION_PREFIX: &str = "memories_";
 
 /// Payload field names
 const FIELD_MEMORY_ID: &str = "memory_id";
+const FIELD_PROFILE_ID: &str = "profile_id";
+const FIELD_OWNER_ID: &str = "owner_id";
 const FIELD_SCOPE_ID: &str = "scope_id";
 const FIELD_CATEGORY: &str = "category";
 const FIELD_IS_GLOBAL: &str = "is_global";
@@ -395,6 +397,8 @@ impl QdrantRepository {
 /// Payload stored with each vector
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorPayload {
+    pub profile_id: Uuid,
+    pub owner_id: String,
     pub memory_id: Uuid,
     pub scope_id: Option<String>,
     pub category: Option<String>,
@@ -408,6 +412,18 @@ impl VectorPayload {
         use qdrant_client::qdrant::{value::Kind, Value};
 
         let mut payload: HashMap<String, Value> = HashMap::new();
+        payload.insert(
+            FIELD_PROFILE_ID.to_string(),
+            Value {
+                kind: Some(Kind::StringValue(self.profile_id.to_string())),
+            },
+        );
+        payload.insert(
+            FIELD_OWNER_ID.to_string(),
+            Value {
+                kind: Some(Kind::StringValue(self.owner_id.clone())),
+            },
+        );
         payload.insert(
             FIELD_MEMORY_ID.to_string(),
             Value {
@@ -450,9 +466,12 @@ impl VectorPayload {
 /// Filter for vector search
 #[derive(Debug, Clone, Default)]
 pub struct VectorFilter {
+    pub profile_id: Option<Uuid>,
+    pub owner_id: Option<String>,
     pub scope_id: Option<String>,
     pub category_prefix: Option<String>,
     pub is_global: Option<bool>,
+    pub include_global: Option<bool>,
     pub statuses: Option<Vec<String>>,
 }
 
@@ -461,8 +480,25 @@ impl VectorFilter {
     fn to_qdrant_filter(&self) -> Filter {
         let mut must: Vec<Condition> = Vec::new();
 
+        if let Some(profile_id) = self.profile_id {
+            must.push(Condition::matches(FIELD_PROFILE_ID, profile_id.to_string()));
+        }
+
+        if let Some(ref owner_id) = self.owner_id {
+            must.push(Condition::matches(FIELD_OWNER_ID, owner_id.clone()));
+        }
+
         if let Some(ref scope_id) = self.scope_id {
-            must.push(Condition::matches(FIELD_SCOPE_ID, scope_id.clone()));
+            if self.include_global.unwrap_or(false) {
+                let scope_match =
+                    Filter::must(vec![Condition::matches(FIELD_SCOPE_ID, scope_id.clone())]);
+                let global_match = Filter::must(vec![Condition::matches(FIELD_IS_GLOBAL, true)]);
+                must.push(Filter::should(vec![scope_match.into(), global_match.into()]).into());
+            } else {
+                must.push(Condition::matches(FIELD_SCOPE_ID, scope_id.clone()));
+            }
+        } else if self.include_global.unwrap_or(false) {
+            must.push(Condition::matches(FIELD_IS_GLOBAL, true));
         }
 
         if let Some(ref category_prefix) = self.category_prefix {
@@ -526,6 +562,8 @@ mod tests {
     #[test]
     fn test_vector_payload_creation() {
         let payload = VectorPayload {
+            profile_id: Uuid::new_v4(),
+            owner_id: "owner123".to_string(),
             memory_id: Uuid::new_v4(),
             scope_id: Some("scope123".to_string()),
             category: Some("work.code".to_string()),

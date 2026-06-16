@@ -46,9 +46,11 @@ pub struct MemoryRepository {
 const MEMORY_COLUMNS: &str = r#"
     id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
     root_memory_id, version_number, is_current_version, supersedes, superseded_by,
-    is_global, hit_count, last_hit_at, decay_score, source_event_id,
+    is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
+    decay_score, source_event_id,
     status, embedding_status, embedding_provider, processing_status, llm_provider,
     inference_type, inference_confidence, inference_reasoning,
+    conflict_reason, consistency_confidence,
     promoted_at, promotion_reason, created_at, updated_at
 "#;
 
@@ -68,12 +70,19 @@ impl MemoryRepository {
                 INSERT INTO memories (
                     id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
                     root_memory_id, version_number, is_current_version, supersedes, superseded_by,
-                    is_global, hit_count, last_hit_at, decay_score, source_event_id,
+                    is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
+                    decay_score, source_event_id,
                     status, embedding_status, embedding_provider, processing_status, llm_provider,
                     inference_type, inference_confidence, inference_reasoning,
+                    conflict_reason, consistency_confidence,
                     promoted_at, promotion_reason, created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
+                    $31, $32, $33, $34, $35
+                )
                 RETURNING {}
                 "#,
                 MEMORY_COLUMNS
@@ -96,6 +105,8 @@ impl MemoryRepository {
         .bind(memory.is_global)
         .bind(memory.hit_count)
         .bind(memory.last_hit_at)
+        .bind(memory.reinforcement_count)
+        .bind(memory.last_reinforced_at)
         .bind(memory.decay_score)
         .bind(memory.source_event_id)
         .bind(&memory.status)
@@ -106,6 +117,8 @@ impl MemoryRepository {
         .bind(&inference_type_str)
         .bind(memory.inference_confidence)
         .bind(&memory.inference_reasoning)
+        .bind(&memory.conflict_reason)
+        .bind(memory.consistency_confidence)
         .bind(memory.promoted_at)
         .bind(&memory.promotion_reason)
         .bind(memory.created_at)
@@ -326,17 +339,23 @@ impl MemoryRepository {
     }
 
     /// Find memories that should transition to cooldown (LFU eviction)
-    pub async fn find_cooldown_candidates(&self, threshold_days: i64) -> AppResult<Vec<Memory>> {
+    pub async fn find_cooldown_candidates(
+        &self,
+        profile_id: Option<Uuid>,
+        threshold_days: i64,
+    ) -> AppResult<Vec<Memory>> {
         let rows = sqlx::query_as::<_, MemoryRow>(&format!(
             r#"
                 SELECT {}
                 FROM memories
-                WHERE status = 'active'
+                WHERE ($1::uuid IS NULL OR profile_id = $1)
+                  AND status = 'active'
                   AND is_current_version = true
-                  AND COALESCE(last_hit_at, created_at) < NOW() - INTERVAL '1 day' * $1
+                  AND COALESCE(last_hit_at, created_at) < NOW() - INTERVAL '1 day' * $2
                 "#,
             MEMORY_COLUMNS
         ))
+        .bind(profile_id)
         .bind(threshold_days as f64)
         .fetch_all(&self.pool)
         .await?;
@@ -344,11 +363,11 @@ impl MemoryRepository {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Find memories with structured filters for retrieval (with profile_id for multi-tenant)
+    /// Find memories with structured filters for retrieval within a system namespace.
     ///
     /// Scope logic:
-    /// - profile_id is required for multi-tenant isolation
-    /// - If scope_id is NULL: returns all memories for this owner (no scope filter)
+    /// - profile_id is required for system namespace isolation
+    /// - If scope_id is NULL: returns global memories only
     /// - If scope_id is provided: returns matching scope_id OR global (if include_global is true)
     pub async fn find_for_retrieval_by_profile(
         &self,
@@ -486,61 +505,6 @@ impl MemoryRepository {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Find memories with structured filters for retrieval
-    ///
-    /// Scope logic:
-    /// - If scope_id is NULL: returns all memories for this owner (no scope filter)
-    /// - If scope_id is provided: returns matching scope_id OR global (if include_global is true)
-    pub async fn find_for_retrieval(
-        &self,
-        owner_id: &str,
-        scope_id: Option<&str>,
-        category_prefix: Option<&str>,
-        tags: Option<&[String]>,
-        include_global: bool,
-    ) -> AppResult<Vec<Memory>> {
-        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
-            r#"
-                SELECT {}
-                FROM memories
-                WHERE owner_id = $1
-                  AND is_current_version = true
-                  AND status NOT IN ('superseded', 'archived')
-                  AND (
-                    $2::text IS NULL
-                    OR scope_id = $2
-                    OR ($3 = true AND is_global = true)
-                  )
-                  AND ($4::text IS NULL OR category LIKE $4 || '%')
-                ORDER BY decay_score DESC, updated_at DESC
-                LIMIT 1000
-                "#,
-            MEMORY_COLUMNS
-        ))
-        .bind(owner_id)
-        .bind(scope_id)
-        .bind(include_global)
-        .bind(category_prefix)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut memories: Vec<Memory> = rows.into_iter().map(Into::into).collect();
-
-        // Apply tags filter in memory
-        if let Some(tag_filter) = tags {
-            if !tag_filter.is_empty() {
-                memories.retain(|m| {
-                    m.tags
-                        .as_ref()
-                        .map(|memory_tags| tag_filter.iter().any(|t| memory_tags.contains(t)))
-                        .unwrap_or(false)
-                });
-            }
-        }
-
-        Ok(memories)
-    }
-
     /// Get memories by a list of IDs
     pub async fn get_by_ids(&self, ids: &[Uuid]) -> AppResult<Vec<Memory>> {
         if ids.is_empty() {
@@ -561,6 +525,7 @@ impl MemoryRepository {
     /// Perform full-text search on memory content
     pub async fn fulltext_search(
         &self,
+        profile_id: Uuid,
         query: &str,
         owner_id: &str,
         scope_id: Option<&str>,
@@ -576,31 +541,35 @@ impl MemoryRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, owner_id, scope_id, content, category, tags, importance, confidence,
+                id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
                 root_memory_id, version_number, is_current_version, supersedes, superseded_by,
-                is_global, hit_count, last_hit_at, decay_score, source_event_id,
+                is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
+                decay_score, source_event_id,
                 status, embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                conflict_reason, consistency_confidence,
                 promoted_at, promotion_reason, created_at, updated_at,
-                ts_rank(content_tsv, plainto_tsquery('simple', $1)) as rank,
-                CASE WHEN $5 THEN
-                    ts_headline('simple', content, plainto_tsquery('simple', $1),
+                ts_rank(content_tsv, plainto_tsquery('simple', $2)) as rank,
+                CASE WHEN $6 THEN
+                    ts_headline('simple', content, plainto_tsquery('simple', $2),
                         'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15, MaxFragments=3')
                 ELSE NULL END as headline
             FROM memories
-            WHERE content_tsv @@ plainto_tsquery('simple', $1)
-              AND owner_id = $2
+            WHERE profile_id = $1
+              AND content_tsv @@ plainto_tsquery('simple', $2)
+              AND owner_id = $3
               AND is_current_version = true
               AND status NOT IN ('superseded', 'archived')
               AND (
-                ($3::text IS NULL AND is_global = true)
-                OR scope_id = $3
-                OR ($6 = true AND is_global = true)
+                ($4::text IS NULL AND is_global = true)
+                OR scope_id = $4
+                OR ($7 = true AND is_global = true)
               )
             ORDER BY rank DESC
-            LIMIT $4
+            LIMIT $5
             "#,
         )
+        .bind(profile_id)
         .bind(query)
         .bind(owner_id)
         .bind(scope_id)
@@ -631,6 +600,8 @@ impl MemoryRepository {
                 is_global: row.get("is_global"),
                 hit_count: row.get("hit_count"),
                 last_hit_at: row.get("last_hit_at"),
+                reinforcement_count: row.get("reinforcement_count"),
+                last_reinforced_at: row.get("last_reinforced_at"),
                 decay_score: row.get("decay_score"),
                 source_event_id: row.get("source_event_id"),
                 status: row.get("status"),
@@ -641,6 +612,8 @@ impl MemoryRepository {
                 inference_type: row.get("inference_type"),
                 inference_confidence: row.get("inference_confidence"),
                 inference_reasoning: row.get("inference_reasoning"),
+                conflict_reason: row.get("conflict_reason"),
+                consistency_confidence: row.get("consistency_confidence"),
                 promoted_at: row.get("promoted_at"),
                 promotion_reason: row.get("promotion_reason"),
                 created_at: row.get("created_at"),
@@ -780,6 +753,7 @@ impl MemoryRepository {
     /// Find memories eligible for promotion to global
     pub async fn find_global_promotion_candidates(
         &self,
+        profile_id: Uuid,
         min_scope_diversity: i32,
         min_reinforcements: i32,
         min_confidence: f32,
@@ -789,29 +763,32 @@ impl MemoryRepository {
             r#"
                 SELECT {}
                 FROM memories m
-                WHERE m.is_global = false
+                WHERE m.profile_id = $1
+                  AND m.is_global = false
                   AND m.is_current_version = true
                   AND m.promoted_at IS NULL
                   AND m.status = 'active'
-                  AND m.confidence >= $3
-                  AND m.created_at < NOW() - INTERVAL '1 hour' * $4
+                  AND m.confidence >= $4
+                  AND m.created_at < NOW() - INTERVAL '1 hour' * $5
                   AND (
                     SELECT COUNT(DISTINCT e.scope_id)
                     FROM event_memory_relations emr
                     JOIN events e ON emr.event_id = e.id
                     WHERE emr.memory_id = m.id
+                      AND e.profile_id = m.profile_id
                       AND emr.relation_type = 'reinforced_by'
-                  ) >= $1
+                  ) >= $2
                   AND (
                     SELECT COUNT(*)
                     FROM event_memory_relations emr
                     WHERE emr.memory_id = m.id
                       AND emr.relation_type = 'reinforced_by'
-                  ) >= $2
+                  ) >= $3
                 ORDER BY m.confidence DESC, m.hit_count DESC
                 "#,
             MEMORY_COLUMNS
         ))
+        .bind(profile_id)
         .bind(min_scope_diversity as i64)
         .bind(min_reinforcements as i64)
         .bind(min_confidence)
@@ -825,6 +802,7 @@ impl MemoryRepository {
     /// Find similar memories by content for deduplication/reinforcement
     pub async fn find_similar_by_content(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         content: &str,
@@ -838,27 +816,31 @@ impl MemoryRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, owner_id, scope_id, content, category, tags, importance, confidence,
+                id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
                 root_memory_id, version_number, is_current_version, supersedes, superseded_by,
-                is_global, hit_count, last_hit_at, decay_score, source_event_id,
+                is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
+                decay_score, source_event_id,
                 status, embedding_status, embedding_provider, processing_status, llm_provider,
                 inference_type, inference_confidence, inference_reasoning,
+                conflict_reason, consistency_confidence,
                 promoted_at, promotion_reason, created_at, updated_at,
-                ts_rank(content_tsv, plainto_tsquery('simple', $2)) as rank
+                ts_rank(content_tsv, plainto_tsquery('simple', $3)) as rank
             FROM memories
-            WHERE owner_id = $1
+            WHERE profile_id = $1
+              AND owner_id = $2
               AND is_current_version = true
               AND status NOT IN ('superseded', 'archived')
-              AND content_tsv @@ plainto_tsquery('simple', $2)
+              AND content_tsv @@ plainto_tsquery('simple', $3)
               AND (
-                ($3::text IS NULL AND is_global = true)
-                OR scope_id = $3
-                OR ($4 = true AND is_global = true)
+                ($4::text IS NULL AND is_global = true)
+                OR scope_id = $4
+                OR ($5 = true AND is_global = true)
               )
             ORDER BY rank DESC
-            LIMIT $5
+            LIMIT $6
             "#,
         )
+        .bind(profile_id)
         .bind(owner_id)
         .bind(content)
         .bind(scope_id)
@@ -887,6 +869,8 @@ impl MemoryRepository {
                 is_global: row.get("is_global"),
                 hit_count: row.get("hit_count"),
                 last_hit_at: row.get("last_hit_at"),
+                reinforcement_count: row.get("reinforcement_count"),
+                last_reinforced_at: row.get("last_reinforced_at"),
                 decay_score: row.get("decay_score"),
                 source_event_id: row.get("source_event_id"),
                 status: row.get("status"),
@@ -897,6 +881,8 @@ impl MemoryRepository {
                 inference_type: row.get("inference_type"),
                 inference_confidence: row.get("inference_confidence"),
                 inference_reasoning: row.get("inference_reasoning"),
+                conflict_reason: row.get("conflict_reason"),
+                consistency_confidence: row.get("consistency_confidence"),
                 promoted_at: row.get("promoted_at"),
                 promotion_reason: row.get("promotion_reason"),
                 created_at: row.get("created_at"),
@@ -912,6 +898,7 @@ impl MemoryRepository {
     /// Update decay scores for memories belonging to an owner
     pub async fn update_decay_scores(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         decay_half_life_days: f32,
         hit_boost_factor: f32,
@@ -924,11 +911,13 @@ impl MemoryRepository {
                             * exp(-EXTRACT(EPOCH FROM (NOW() - COALESCE(last_hit_at, created_at))) / 86400.0 / $3)
                             * CASE WHEN is_global THEN $4 ELSE 1.0 END,
                 updated_at = NOW()
-            WHERE owner_id = $1
+            WHERE profile_id = $1
+              AND owner_id = $2
               AND is_current_version = true
               AND status NOT IN ('superseded', 'archived')
             "#,
         )
+        .bind(profile_id)
         .bind(owner_id)
         .bind(hit_boost_factor)
         .bind(decay_half_life_days)
@@ -942,6 +931,7 @@ impl MemoryRepository {
     /// Find memories with low decay scores (eviction candidates)
     pub async fn find_eviction_candidates(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         decay_threshold: f32,
         limit: i64,
@@ -950,15 +940,17 @@ impl MemoryRepository {
             r#"
                 SELECT {}
                 FROM memories
-                WHERE owner_id = $1
+                WHERE profile_id = $1
+                  AND owner_id = $2
                   AND is_current_version = true
                   AND status IN ('active', 'cooldown', 'candidate')
-                  AND decay_score < $2
+                  AND decay_score < $3
                 ORDER BY decay_score ASC
-                LIMIT $3
+                LIMIT $4
                 "#,
             MEMORY_COLUMNS
         ))
+        .bind(profile_id)
         .bind(owner_id)
         .bind(decay_threshold)
         .bind(limit)
@@ -976,6 +968,8 @@ impl MemoryRepository {
                 SET confidence = LEAST(confidence + $2, 1.0),
                     hit_count = hit_count + 1,
                     last_hit_at = NOW(),
+                    reinforcement_count = reinforcement_count + 1,
+                    last_reinforced_at = NOW(),
                     status = CASE WHEN status = 'cooldown' THEN 'active'::status ELSE status END,
                     updated_at = NOW()
                 WHERE id = $1
@@ -992,6 +986,34 @@ impl MemoryRepository {
         Ok(row.into())
     }
 
+    /// Store conflict metadata on a superseding memory version.
+    pub async fn update_conflict_metadata(
+        &self,
+        id: Uuid,
+        conflict_reason: &str,
+        consistency_confidence: f32,
+    ) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                UPDATE memories
+                SET conflict_reason = $2,
+                    consistency_confidence = $3,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .bind(conflict_reason)
+        .bind(consistency_confidence)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
+    }
+
     /// Find all memories for an owner/scope, grouped by embedding_provider
     ///
     /// Returns memories that are:
@@ -1000,9 +1022,10 @@ impl MemoryRepository {
     /// - Have completed embedding
     /// - Matching the owner_id
     /// - If scope_id is provided: matching scope_id OR global (if include_global is true)
-    /// - If scope_id is NULL: all memories for this owner (no scope filter)
+    /// - If scope_id is NULL: global memories only
     pub async fn find_by_owner_scope_grouped_by_provider(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
         include_global: bool,
@@ -1011,20 +1034,22 @@ impl MemoryRepository {
             r#"
                 SELECT {}
                 FROM memories
-                WHERE owner_id = $1
+                WHERE profile_id = $1
+                  AND owner_id = $2
                   AND is_current_version = true
                   AND status NOT IN ('superseded', 'archived')
                   AND embedding_status = 'completed'
                   AND embedding_provider IS NOT NULL
                   AND (
-                    $2::text IS NULL
-                    OR scope_id = $2
-                    OR ($3 = true AND is_global = true)
+                    ($3::text IS NULL AND is_global = true)
+                    OR scope_id = $3
+                    OR ($4 = true AND is_global = true)
                   )
                 ORDER BY embedding_provider, decay_score DESC
                 "#,
             MEMORY_COLUMNS
         ))
+        .bind(profile_id)
         .bind(owner_id)
         .bind(scope_id)
         .bind(include_global)
@@ -1067,6 +1092,8 @@ struct MemoryRow {
     is_global: bool,
     hit_count: i64,
     last_hit_at: Option<DateTime<Utc>>,
+    reinforcement_count: i64,
+    last_reinforced_at: Option<DateTime<Utc>>,
     decay_score: f32,
     // Source
     source_event_id: Option<Uuid>,
@@ -1081,6 +1108,8 @@ struct MemoryRow {
     inference_type: Option<InferenceType>,
     inference_confidence: Option<f32>,
     inference_reasoning: Option<String>,
+    conflict_reason: Option<String>,
+    consistency_confidence: Option<f32>,
     // Promotion
     promoted_at: Option<DateTime<Utc>>,
     promotion_reason: Option<String>,
@@ -1109,6 +1138,8 @@ impl From<MemoryRow> for Memory {
             is_global: row.is_global,
             hit_count: row.hit_count,
             last_hit_at: row.last_hit_at,
+            reinforcement_count: row.reinforcement_count,
+            last_reinforced_at: row.last_reinforced_at,
             decay_score: row.decay_score,
             source_event_id: row.source_event_id,
             status: row.status,
@@ -1119,6 +1150,8 @@ impl From<MemoryRow> for Memory {
             inference_type: row.inference_type,
             inference_confidence: row.inference_confidence,
             inference_reasoning: row.inference_reasoning,
+            conflict_reason: row.conflict_reason,
+            consistency_confidence: row.consistency_confidence,
             promoted_at: row.promoted_at,
             promotion_reason: row.promotion_reason,
             created_at: row.created_at,

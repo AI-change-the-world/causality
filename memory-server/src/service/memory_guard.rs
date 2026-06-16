@@ -9,21 +9,22 @@
 //! Requirements: 2.1, 3.1, 3.2, 3.3, 3.4
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::domain::{CreateEventInput, CreateMemoryInput, CreateMemoryValidation, Event, Memory};
+use crate::domain::{
+    CreateEventInput, CreateMemoryInput, CreateMemoryValidation, Event, EventSource, Memory,
+};
 use crate::embedding::{EmbeddingProvider, EmbeddingRequest};
 use crate::error::{AppError, AppResult};
 use crate::repository::{
     AuditOperation, AuditRepository, EventRepository, MemoryRepository, QdrantRepository,
-    VectorFilter,
+    StructuredEventRepository,
 };
 
 use super::{
-    ConsistencyChecker, ExtractFromEventRequest, ExtractedMemory, MatchResult, MemoryProcessor,
+    ConsistencyChecker, ExtractFromEventRequest, ExtractedMemory, MemoryMatcher, MemoryProcessor,
     MemoryReconciler, ReconcileOutcome, RetrievalEngine, RetrieveRequest, RetrieveResponse,
 };
 
@@ -48,11 +49,8 @@ pub struct ProcessEventResult {
 
 /// Context for event processing containing all required providers
 ///
-/// This struct holds all the dynamically created providers needed for
-/// processing an event. The providers are created based on:
-/// - User-specified LLM provider in the API request
-/// - User-specified embedding provider for new memories
-/// - Embedding providers determined by querying existing memories
+/// This struct holds the globally configured providers and repositories needed
+/// by the event-driven memory processing pipeline.
 pub struct EventProcessingContext {
     /// Memory processor for LLM-driven extraction
     pub memory_processor: Arc<MemoryProcessor>,
@@ -60,21 +58,45 @@ pub struct EventProcessingContext {
     pub event_handler: Option<Arc<super::EventHandler>>,
     /// LLM provider for consistency checking
     pub llm_provider: Arc<dyn crate::llm::LlmProvider>,
-    /// Embedding provider for new memories (from request)
+    /// Embedding provider for new memories
     pub embedding_provider: Arc<dyn EmbeddingProvider>,
     /// Name of the embedding provider for new memories
     pub embedding_provider_name: String,
     /// Qdrant repository for vector operations
     pub qdrant_repo: QdrantRepository,
-    /// Map of embedding provider name -> provider instance (for existing memories)
-    /// This is populated based on what providers are used by existing memories
-    /// TODO remove later because embedding and llm are provided by config
-    /// not databse
-    /// so only there will be only one llm provider and embedding provider
-    pub embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>>,
+    /// Matcher for finding existing memories during event reconciliation
+    pub memory_matcher: Arc<MemoryMatcher>,
+    /// Structured event repository for persisting LLM-parsed event elements
+    pub structured_event_repo: StructuredEventRepository,
     /// Context memories for better relevance judgment and memory updates
     /// These are same-scope memories + global memories fetched before processing
     pub context_memories: Vec<crate::domain::Memory>,
+}
+
+impl EventProcessingContext {
+    pub fn new(
+        memory_processor: Arc<MemoryProcessor>,
+        event_handler: Arc<super::EventHandler>,
+        llm_provider: Arc<dyn crate::llm::LlmProvider>,
+        embedding_provider: Arc<dyn EmbeddingProvider>,
+        embedding_provider_name: String,
+        qdrant_repo: QdrantRepository,
+        memory_matcher: Arc<MemoryMatcher>,
+        structured_event_repo: StructuredEventRepository,
+        context_memories: Vec<crate::domain::Memory>,
+    ) -> Self {
+        Self {
+            memory_processor,
+            event_handler: Some(event_handler),
+            llm_provider,
+            embedding_provider,
+            embedding_provider_name,
+            qdrant_repo,
+            memory_matcher,
+            structured_event_repo,
+            context_memories,
+        }
+    }
 }
 
 /// Request for creating memories from an event
@@ -91,8 +113,8 @@ pub struct CreateFromEventRequest {
     pub context: Option<String>,
     /// Scope identifier for created memories (optional, null = global context)
     pub scope_id: Option<String>,
-    /// Event source (e.g., "user_created", "api", "conversation")
-    pub source: Option<String>,
+    /// Event source. Recommended values: conversation, user_action, system_event, manual, api.
+    pub source: Option<EventSource>,
 }
 
 /// Result of creating memories from an event
@@ -110,6 +132,10 @@ pub struct CreateFromEventResult {
     pub memories_superseded: usize,
     /// IDs of created memories
     pub created_memory_ids: Vec<Uuid>,
+    /// IDs of reinforced memories
+    pub reinforced_memory_ids: Vec<Uuid>,
+    /// IDs of superseded memories (old versions)
+    pub superseded_memory_ids: Vec<Uuid>,
 }
 
 /// Request for updating a memory's mutable metadata
@@ -256,6 +282,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             let new_value = serde_json::to_value(&created).ok();
             self.audit_repo
                 .create(
+                    created.profile_id,
                     created.id,
                     AuditOperation::Create,
                     actor_id,
@@ -309,6 +336,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             let new_value = serde_json::to_value(&updated).ok();
             self.audit_repo
                 .create(
+                    updated.profile_id,
                     id,
                     AuditOperation::Update,
                     actor_id,
@@ -346,6 +374,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             let new_value = serde_json::to_value(&deleted).ok();
             self.audit_repo
                 .create(
+                    deleted.profile_id,
                     id,
                     AuditOperation::Delete,
                     actor_id,
@@ -373,7 +402,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
     ///    c. If match found in any group → reinforce/supersede
     ///    d. If no match in any group → create new memory with default embedding_provider
     ///
-    /// The context parameter provides all dynamically created providers.
+    /// The context parameter provides globally configured providers.
     ///
     /// Requirements: 2.1, 3.1, 3.2, 3.3, 3.4, 6.9-6.10, 8.1-8.4
     pub async fn process_event_with_context(
@@ -393,12 +422,20 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         let structured_event = if let Some(ref event_handler) = context.event_handler {
             match event_handler.structure_event(event).await {
                 Ok(structured) => {
+                    let stored = match context
+                        .structured_event_repo
+                        .get_by_event_id(structured.event_id)
+                        .await?
+                    {
+                        Some(existing) => existing,
+                        None => context.structured_event_repo.create(&structured).await?,
+                    };
                     debug!(
                         event_id = %event.id,
-                        structured_event_id = %structured.id,
+                        structured_event_id = %stored.id,
                         "Event structured into six-element format"
                     );
-                    Some(structured)
+                    Some(stored)
                 }
                 Err(e) => {
                     warn!(
@@ -448,21 +485,6 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             "Extracted memories from event successfully"
         );
 
-        // Query existing memories grouped by embedding_provider
-        let memories_by_provider = self
-            .memory_repo
-            .find_by_owner_scope_grouped_by_provider(
-                &event.owner_id,
-                event.scope_id.as_deref(),
-                true, // include_global
-            )
-            .await?;
-
-        debug!(
-            provider_count = memories_by_provider.len(),
-            "Found existing memories grouped by provider"
-        );
-
         // Track results
         let mut created_memory_ids = Vec::new();
         let mut reinforced_memory_ids = Vec::new();
@@ -482,82 +504,28 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                 inference_reasoning: extracted.reasoning.clone(),
             };
 
-            // Try to find matches across all provider groups
-            let mut all_matches: Vec<MatchResult> = Vec::new();
+            let embedding_request = EmbeddingRequest::new(&extracted.content);
+            let embedding_response = context
+                .embedding_provider
+                .embed(embedding_request)
+                .await
+                .map_err(|e| AppError::Internal(format!("Embedding generation failed: {}", e)))?;
 
-            for (provider_name, memories) in &memories_by_provider {
-                // Get the embedding provider for this group
-                let embedding_provider = match context.embedding_providers.get(provider_name) {
-                    Some(provider) => provider.clone(),
-                    None => {
-                        warn!(
-                            provider_name = %provider_name,
-                            "Embedding provider not found in context, skipping group"
-                        );
-                        continue;
-                    }
-                };
+            let matches = context
+                .memory_matcher
+                .find_similar(
+                    event.profile_id,
+                    &event.owner_id,
+                    event.scope_id.as_deref(),
+                    &embedding_response.embedding,
+                    &context.embedding_provider_name,
+                )
+                .await?;
 
-                // Generate embedding for the extracted content using this provider
-                let embedding_request = EmbeddingRequest::new(&extracted.content);
-                let embedding_response = match embedding_provider.embed(embedding_request).await {
-                    Ok(response) => response,
-                    Err(e) => {
-                        warn!(
-                            provider_name = %provider_name,
-                            error = %e,
-                            "Failed to generate embedding, skipping group"
-                        );
-                        continue;
-                    }
-                };
-
-                // Search for similar vectors in Qdrant for this provider's collection
-                let filter = VectorFilter {
-                    scope_id: event.scope_id.clone(),
-                    statuses: Some(vec!["active".to_string()]),
-                    ..Default::default()
-                };
-
-                let vector_results = context
-                    .qdrant_repo
-                    .search(
-                        provider_name,
-                        embedding_response.embedding.clone(),
-                        10, // max candidates
-                        Some(filter),
-                    )
-                    .await?;
-
-                // Build score map from vector search results
-                let score_map: std::collections::HashMap<Uuid, f32> = vector_results
-                    .iter()
-                    .map(|r| (r.memory_id, r.score))
-                    .collect();
-
-                // Filter memories that match our criteria
-                for memory in memories {
-                    if let Some(&score) = score_map.get(&memory.id) {
-                        // Check similarity threshold (0.70 - lower to catch related but potentially conflicting content)
-                        if score >= 0.70
-                            && memory.is_current_version
-                            && memory.status == crate::domain::Status::Active
-                        {
-                            all_matches.push(MatchResult {
-                                memory: memory.clone(),
-                                similarity_score: score,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Sort all matches by similarity score (highest first)
-            all_matches.sort_by(|a, b| {
-                b.similarity_score
-                    .partial_cmp(&a.similarity_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            debug!(
+                match_count = matches.len(),
+                "Found memory matches for extracted memory"
+            );
 
             // Reconcile: decide whether to create, reinforce, or supersede
             // Use LLM-based consistency checking with the context's LLM provider
@@ -566,7 +534,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                 .reconcile_with_llm(
                     event,
                     &extracted_memory,
-                    all_matches,
+                    matches,
                     context.llm_provider.clone(),
                 )
                 .await?;
@@ -582,7 +550,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         .await
                         .unwrap_or(memory);
 
-                    // Generate embedding with the user-specified provider
+                    // Generate embedding with the configured provider
                     let embedding_request = EmbeddingRequest::new(&memory.content);
                     let embedding_response = context
                         .embedding_provider
@@ -594,6 +562,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
                     // Store in Qdrant
                     let payload = crate::repository::VectorPayload {
+                        profile_id: memory.profile_id,
+                        owner_id: memory.owner_id.clone(),
                         memory_id: memory.id,
                         scope_id: memory.scope_id.clone(),
                         category: memory.category.clone(),
@@ -633,6 +603,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         let new_value = serde_json::to_value(&memory).ok();
                         self.audit_repo
                             .create(
+                                memory.profile_id,
                                 memory.id,
                                 AuditOperation::Create,
                                 actor_id.clone(),
@@ -661,6 +632,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     if self.audit_enabled {
                         self.audit_repo
                             .create(
+                                event.profile_id,
                                 memory_id,
                                 AuditOperation::Update,
                                 actor_id.clone(),
@@ -681,22 +653,9 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     superseded_id,
                     ..
                 } => {
-                    // For superseding memories, generate embedding with the same provider as the old memory
-                    // or use default if not available
-                    let old_memory = self.memory_repo.get_by_id(superseded_id).await?;
-                    let provider_name = old_memory
-                        .embedding_provider
-                        .as_ref()
-                        .unwrap_or(&context.embedding_provider_name);
-
-                    let embedding_provider = context
-                        .embedding_providers
-                        .get(provider_name)
-                        .cloned()
-                        .unwrap_or_else(|| context.embedding_provider.clone());
-
                     let embedding_request = EmbeddingRequest::new(&new_memory.content);
-                    let embedding_response = embedding_provider
+                    let embedding_response = context
+                        .embedding_provider
                         .embed(embedding_request)
                         .await
                         .map_err(|e| {
@@ -705,6 +664,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
                     // Store in Qdrant
                     let payload = crate::repository::VectorPayload {
+                        profile_id: new_memory.profile_id,
+                        owner_id: new_memory.owner_id.clone(),
                         memory_id: new_memory.id,
                         scope_id: new_memory.scope_id.clone(),
                         category: new_memory.category.clone(),
@@ -715,7 +676,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     context
                         .qdrant_repo
                         .upsert_vector(
-                            provider_name,
+                            &context.embedding_provider_name,
                             new_memory.id,
                             embedding_response.embedding,
                             payload,
@@ -728,7 +689,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         .update_embedding_status_and_provider(
                             new_memory.id,
                             crate::domain::EmbeddingStatus::Completed,
-                            Some(provider_name),
+                            Some(&context.embedding_provider_name),
                         )
                         .await?;
 
@@ -745,6 +706,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         let new_value = serde_json::to_value(&new_memory).ok();
                         self.audit_repo
                             .create(
+                                new_memory.profile_id,
                                 new_memory.id,
                                 AuditOperation::Create,
                                 actor_id.clone(),
@@ -760,6 +722,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         // Log for superseded memory
                         self.audit_repo
                             .create(
+                                event.profile_id,
                                 superseded_id,
                                 AuditOperation::Update,
                                 actor_id.clone(),
@@ -804,10 +767,9 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         })
     }
 
-    /// Process an event and create/reinforce/supersede memories (legacy method)
+    /// Process an event and create/reinforce/supersede memories.
     ///
-    /// This method is kept for backward compatibility but requires the MemoryGuard
-    /// to have a configured memory_processor. For new code, use process_event_with_context.
+    /// Use `process_event_with_context` so provider/repository dependencies are explicit.
     ///
     /// Requirements: 2.1, 3.1, 3.2, 3.3, 3.4
     pub async fn process_event(
@@ -816,8 +778,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         _memory_processor: Option<Arc<MemoryProcessor>>,
         _actor_id: Option<String>,
     ) -> AppResult<ProcessEventResult> {
-        // This legacy method cannot work without a full context
-        // Return an error indicating the new method should be used
+        // This method cannot work without a full context.
         Err(AppError::Internal(
             "process_event requires EventProcessingContext. Use process_event_with_context instead, \
              or ensure the API layer builds the context properly.".to_string()
@@ -870,20 +831,21 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             memories_reinforced: result.memories_reinforced,
             memories_superseded: result.memories_superseded,
             created_memory_ids: result.created_memory_ids,
+            reinforced_memory_ids: result.reinforced_memory_ids,
+            superseded_memory_ids: result.superseded_memory_ids,
         })
     }
 
-    /// Create memories from an event (legacy method)
+    /// Create memories from an event.
     ///
-    /// Creates an event from the request and processes it.
-    /// This method is kept for backward compatibility but requires proper context setup.
+    /// Use `create_from_event_with_context` so provider/repository dependencies are explicit.
     pub async fn create_from_event(
         &self,
         _request: CreateFromEventRequest,
         _memory_processor: Option<Arc<MemoryProcessor>>,
         _actor_id: Option<String>,
     ) -> AppResult<CreateFromEventResult> {
-        // This legacy method cannot work without a full context
+        // This method cannot work without a full context.
         Err(AppError::Internal(
             "create_from_event requires EventProcessingContext. Use create_from_event_with_context instead.".to_string()
         ))

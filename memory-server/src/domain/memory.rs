@@ -59,6 +59,10 @@ pub struct Memory {
     pub hit_count: i64,
     /// Last time this memory was retrieved
     pub last_hit_at: Option<DateTime<Utc>>,
+    /// Number of times this memory was reinforced
+    pub reinforcement_count: i64,
+    /// Last time this memory was reinforced
+    pub last_reinforced_at: Option<DateTime<Utc>>,
     /// Decay score for LFU eviction (higher = more valuable)
     pub decay_score: f32,
 
@@ -87,6 +91,10 @@ pub struct Memory {
     pub inference_confidence: Option<f32>,
     /// Reasoning for the inference
     pub inference_reasoning: Option<String>,
+    /// Reason why this memory superseded another one, if any
+    pub conflict_reason: Option<String>,
+    /// Confidence of the consistency decision that led to the current state
+    pub consistency_confidence: Option<f32>,
 
     // === Promotion tracking ===
     /// When the memory was promoted to global
@@ -288,6 +296,8 @@ impl Memory {
             is_global: input.is_global,
             hit_count: 0,
             last_hit_at: None,
+            reinforcement_count: 0,
+            last_reinforced_at: None,
             decay_score: 1.0,
             // Source
             source_event_id: None,
@@ -302,6 +312,8 @@ impl Memory {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            conflict_reason: None,
+            consistency_confidence: None,
             // Promotion
             promoted_at: None,
             promotion_reason: None,
@@ -339,6 +351,8 @@ impl Memory {
             is_global: false, // Can be promoted later
             hit_count: 0,
             last_hit_at: None,
+            reinforcement_count: 0,
+            last_reinforced_at: None,
             decay_score: 1.0,
             // Source
             source_event_id: Some(input.source_event_id),
@@ -353,6 +367,8 @@ impl Memory {
             inference_type: Some(input.inference_type),
             inference_confidence: Some(input.inference_confidence),
             inference_reasoning: Some(input.inference_reasoning),
+            conflict_reason: None,
+            consistency_confidence: None,
             // Promotion
             promoted_at: None,
             promotion_reason: None,
@@ -387,6 +403,8 @@ impl Memory {
             is_global: input.is_global,
             hit_count: 0,
             last_hit_at: None,
+            reinforcement_count: 0,
+            last_reinforced_at: None,
             decay_score: 1.0,
             // Source
             source_event_id: Some(input.source_event_id),
@@ -401,6 +419,8 @@ impl Memory {
             inference_type: Some(input.inference_type),
             inference_confidence: Some(input.inference_confidence),
             inference_reasoning: Some(input.inference_reasoning),
+            conflict_reason: None,
+            consistency_confidence: None,
             // Promotion
             promoted_at: None,
             promotion_reason: None,
@@ -434,7 +454,16 @@ impl Memory {
     pub fn reinforce(&mut self, confidence_delta: f32) {
         // Weighted average to increase confidence
         self.confidence = (self.confidence + confidence_delta).min(1.0);
+        self.reinforcement_count += 1;
+        self.last_reinforced_at = Some(Utc::now());
         self.record_hit();
+    }
+
+    /// Record conflict metadata for a superseding memory.
+    pub fn record_conflict(&mut self, reason: String, confidence: f32) {
+        self.conflict_reason = Some(reason);
+        self.consistency_confidence = Some(confidence);
+        self.updated_at = Utc::now();
     }
 
     /// Promote this memory to global
@@ -619,6 +648,8 @@ mod tests {
         assert_eq!(memory.status, Status::Active);
         assert_eq!(memory.hit_count, 0);
         assert!(memory.last_hit_at.is_none());
+        assert_eq!(memory.reinforcement_count, 0);
+        assert!(memory.last_reinforced_at.is_none());
         assert_eq!(memory.embedding_status, EmbeddingStatus::Pending);
         assert_eq!(memory.processing_status, ProcessingStatus::Skipped);
         // Version chain
@@ -631,6 +662,8 @@ mod tests {
         assert!(memory.inference_type.is_none());
         assert!(memory.inference_confidence.is_none());
         assert!(memory.inference_reasoning.is_none());
+        assert!(memory.conflict_reason.is_none());
+        assert!(memory.consistency_confidence.is_none());
     }
 
     #[test]
@@ -735,6 +768,22 @@ mod tests {
 
         assert!(memory.confidence > initial_confidence);
         assert_eq!(memory.hit_count, 1);
+        assert_eq!(memory.reinforcement_count, 1);
+        assert!(memory.last_reinforced_at.is_some());
+    }
+
+    #[test]
+    fn test_memory_record_conflict() {
+        let input = valid_input();
+        let mut memory = Memory::new(input);
+
+        memory.record_conflict("Conflicts with prior preference".to_string(), 0.86);
+
+        assert_eq!(
+            memory.conflict_reason,
+            Some("Conflicts with prior preference".to_string())
+        );
+        assert_eq!(memory.consistency_confidence, Some(0.86));
     }
 
     #[test]

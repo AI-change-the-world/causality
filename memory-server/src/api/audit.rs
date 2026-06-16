@@ -1,10 +1,10 @@
 //! Audit API handlers
 //!
 //! Implements:
-//! - GET /api/v1/audit - Query audit logs
+//! - GET /api/v1/systems/{profile_id}/audit - Query audit logs
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -34,15 +34,16 @@ pub struct AuditQueryRequest {
     pub offset: Option<i64>,
 }
 
-impl From<AuditQueryRequest> for AuditQueryParams {
-    fn from(req: AuditQueryRequest) -> Self {
+impl AuditQueryRequest {
+    fn into_query_params(self, profile_id: Uuid) -> AuditQueryParams {
         AuditQueryParams {
-            memory_id: req.memory_id,
-            start_time: req.start_time,
-            end_time: req.end_time,
-            operation: req.operation.and_then(|op| AuditOperation::from_str(&op)),
-            limit: req.limit,
-            offset: req.offset,
+            profile_id,
+            memory_id: self.memory_id,
+            start_time: self.start_time,
+            end_time: self.end_time,
+            operation: self.operation.and_then(|op| AuditOperation::from_str(&op)),
+            limit: self.limit,
+            offset: self.offset,
         }
     }
 }
@@ -52,6 +53,8 @@ impl From<AuditQueryRequest> for AuditQueryParams {
 pub struct AuditLogEntryResponse {
     /// Unique identifier
     pub id: Uuid,
+    /// System profile ID this audit entry belongs to
+    pub profile_id: Uuid,
     /// Memory ID this audit entry relates to
     pub memory_id: Uuid,
     /// Operation type
@@ -72,6 +75,7 @@ impl From<AuditLogEntry> for AuditLogEntryResponse {
     fn from(entry: AuditLogEntry) -> Self {
         AuditLogEntryResponse {
             id: entry.id,
+            profile_id: entry.profile_id,
             memory_id: entry.memory_id,
             operation: entry.operation,
             actor_id: entry.actor_id,
@@ -97,7 +101,7 @@ pub fn audit_routes() -> Router<AppState> {
     Router::new().route("/", get(query_audit_logs))
 }
 
-/// GET /api/v1/audit - Query audit logs
+/// GET /api/v1/systems/{profile_id}/audit - Query audit logs
 ///
 /// Retrieves audit logs with optional filters:
 /// - memory_id: Filter by specific memory
@@ -106,18 +110,22 @@ pub fn audit_routes() -> Router<AppState> {
 /// - limit/offset: Pagination
 #[utoipa::path(
     get,
-    path = "/api/v1/audit",
+    path = "/api/v1/systems/{profile_id}/audit",
     tag = "audit",
-    params(AuditQueryRequest),
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
+        AuditQueryRequest
+    ),
     responses(
         (status = 200, description = "Audit logs retrieved", body = AuditQueryResponse)
     )
 )]
 pub async fn query_audit_logs(
     State(state): State<AppState>,
+    Path(profile_id): Path<Uuid>,
     Query(request): Query<AuditQueryRequest>,
 ) -> AppResult<Json<AuditQueryResponse>> {
-    let params: AuditQueryParams = request.into();
+    let params = request.into_query_params(profile_id);
 
     let entries = state.lifecycle_manager.query_audit_logs(&params).await?;
     let total = state.lifecycle_manager.count_audit_logs(&params).await?;
@@ -145,8 +153,10 @@ mod tests {
             offset: Some(10),
         };
 
-        let params: AuditQueryParams = request.clone().into();
+        let profile_id = Uuid::new_v4();
+        let params = request.clone().into_query_params(profile_id);
 
+        assert_eq!(params.profile_id, profile_id);
         assert_eq!(params.memory_id, request.memory_id);
         assert_eq!(params.start_time, request.start_time);
         assert_eq!(params.end_time, request.end_time);
@@ -166,8 +176,10 @@ mod tests {
             offset: None,
         };
 
-        let params: AuditQueryParams = request.into();
+        let profile_id = Uuid::new_v4();
+        let params = request.into_query_params(profile_id);
 
+        assert_eq!(params.profile_id, profile_id);
         assert!(params.memory_id.is_none());
         assert!(params.start_time.is_none());
         assert!(params.end_time.is_none());
@@ -180,6 +192,7 @@ mod tests {
     fn test_audit_log_entry_conversion() {
         let entry = AuditLogEntry {
             id: Uuid::new_v4(),
+            profile_id: Uuid::new_v4(),
             memory_id: Uuid::new_v4(),
             operation: "create".to_string(),
             actor_id: Some("user123".to_string()),
@@ -192,6 +205,7 @@ mod tests {
         let response: AuditLogEntryResponse = entry.clone().into();
 
         assert_eq!(response.id, entry.id);
+        assert_eq!(response.profile_id, entry.profile_id);
         assert_eq!(response.memory_id, entry.memory_id);
         assert_eq!(response.operation, entry.operation);
         assert_eq!(response.actor_id, entry.actor_id);

@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
+use uuid::Uuid;
 
 use crate::domain::{Memory, Status};
 use crate::error::AppResult;
@@ -103,24 +104,28 @@ impl EvictionManager {
     /// 2. Transition Cooldown → Candidate for very stale memories
     /// 3. Archive Candidate memories that exceed thresholds
     /// 4. Enforce capacity limits if needed
-    #[instrument(skip(self), fields(owner_id = %owner_id))]
-    pub async fn run_eviction(&self, owner_id: &str) -> AppResult<EvictionResult> {
+    #[instrument(skip(self), fields(profile_id = %profile_id, owner_id = %owner_id))]
+    pub async fn run_eviction(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+    ) -> AppResult<EvictionResult> {
         let mut result = EvictionResult::empty();
 
         // Step 1: Active → Cooldown
-        let cooldown_count = self.transition_to_cooldown(owner_id).await?;
+        let cooldown_count = self.transition_to_cooldown(profile_id, owner_id).await?;
         result.cooldown_count = cooldown_count;
 
         // Step 2: Cooldown → Candidate (based on decay score)
-        let candidate_count = self.transition_to_candidate(owner_id).await?;
+        let candidate_count = self.transition_to_candidate(profile_id, owner_id).await?;
         result.candidate_count = candidate_count;
 
         // Step 3: Archive candidates that exceed threshold
-        let archived_count = self.archive_candidates(owner_id).await?;
+        let archived_count = self.archive_candidates(profile_id, owner_id).await?;
         result.archived_count = archived_count;
 
         // Step 4: Check and enforce capacity limits
-        let capacity_archived = self.enforce_capacity_limit(owner_id).await?;
+        let capacity_archived = self.enforce_capacity_limit(profile_id, owner_id).await?;
         if capacity_archived > 0 {
             result.archived_count += capacity_archived;
             result.capacity_limit_reached = true;
@@ -139,10 +144,10 @@ impl EvictionManager {
     }
 
     /// Transition Active memories to Cooldown status
-    async fn transition_to_cooldown(&self, owner_id: &str) -> AppResult<usize> {
+    async fn transition_to_cooldown(&self, profile_id: Uuid, owner_id: &str) -> AppResult<usize> {
         let candidates = self
             .memory_repo
-            .find_cooldown_candidates(self.config.cooldown_threshold_days)
+            .find_cooldown_candidates(Some(profile_id), self.config.cooldown_threshold_days)
             .await?;
 
         // Filter by owner
@@ -172,10 +177,15 @@ impl EvictionManager {
     }
 
     /// Transition Cooldown memories to Candidate status based on decay score
-    async fn transition_to_candidate(&self, owner_id: &str) -> AppResult<usize> {
+    async fn transition_to_candidate(&self, profile_id: Uuid, owner_id: &str) -> AppResult<usize> {
         let candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, self.config.decay_score_threshold, 1000)
+            .find_eviction_candidates(
+                profile_id,
+                owner_id,
+                self.config.decay_score_threshold,
+                1000,
+            )
             .await?;
 
         // Filter for Cooldown status only
@@ -205,10 +215,15 @@ impl EvictionManager {
     }
 
     /// Archive Candidate memories that exceed the archive threshold
-    async fn archive_candidates(&self, owner_id: &str) -> AppResult<usize> {
+    async fn archive_candidates(&self, profile_id: Uuid, owner_id: &str) -> AppResult<usize> {
         let candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, self.config.decay_score_threshold, 1000)
+            .find_eviction_candidates(
+                profile_id,
+                owner_id,
+                self.config.decay_score_threshold,
+                1000,
+            )
             .await?;
 
         // Filter for Candidate status and check age
@@ -241,11 +256,11 @@ impl EvictionManager {
     }
 
     /// Enforce capacity limits by archiving lowest decay score memories
-    async fn enforce_capacity_limit(&self, owner_id: &str) -> AppResult<usize> {
+    async fn enforce_capacity_limit(&self, profile_id: Uuid, owner_id: &str) -> AppResult<usize> {
         // Get count of active memories
         let all_memories = self
             .memory_repo
-            .find_for_retrieval(owner_id, None, None, None, true)
+            .find_for_retrieval_by_profile(profile_id, owner_id, None, None, None, true)
             .await?;
 
         let active_count = all_memories.len() as i64;
@@ -268,7 +283,7 @@ impl EvictionManager {
         // Get lowest decay score memories
         let candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, f32::MAX, excess as i64 * 2)
+            .find_eviction_candidates(profile_id, owner_id, f32::MAX, excess as i64 * 2)
             .await?;
 
         let mut count = 0;
@@ -296,11 +311,21 @@ impl EvictionManager {
     }
 
     /// Get eviction candidates for an owner (for preview/dry-run)
-    #[instrument(skip(self), fields(owner_id = %owner_id))]
-    pub async fn get_candidates(&self, owner_id: &str, limit: usize) -> AppResult<Vec<Memory>> {
+    #[instrument(skip(self), fields(profile_id = %profile_id, owner_id = %owner_id))]
+    pub async fn get_candidates(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<Memory>> {
         let candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, self.config.decay_score_threshold, limit as i64)
+            .find_eviction_candidates(
+                profile_id,
+                owner_id,
+                self.config.decay_score_threshold,
+                limit as i64,
+            )
             .await?;
 
         Ok(candidates)

@@ -1,8 +1,8 @@
 //! Retrieval API handlers
 //!
 //! Implements:
-//! - POST /api/v1/memories/retrieve - Retrieve memories based on query and filters
-//! - POST /api/v1/memories/retrieve/auto - Auto retrieve with query parsing and formatted output
+//! - POST /api/v1/systems/{profile_id}/memories/retrieve - Retrieve memories
+//! - POST /api/v1/systems/{profile_id}/memories/retrieve/auto - Auto retrieve
 //!
 //! New architecture:
 //! - Removed scope_type, layer, scene, event_source_prefix filters
@@ -10,7 +10,11 @@
 //! - Added include_evidence and include_history options
 //! - owner_id is now required
 
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::post,
+    Json, Router,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -18,23 +22,33 @@ use uuid::Uuid;
 
 use crate::api::memory::GetMemoryResponse;
 use crate::api::AppState;
-use crate::domain::{Event, Memory};
+use crate::domain::{Event, EventSource, Memory};
 use crate::error::AppResult;
 use crate::service::RetrieveRequest;
 
 /// Request body for memory retrieval
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RetrieveApiRequest {
-    /// System profile ID - which business system to retrieve from (required)
-    pub profile_id: Uuid,
     /// Query text for semantic search and full-text search
     pub query: String,
     /// Owner ID - the unique identifier of the memory owner (required)
     pub owner_id: String,
-    /// Filter by scope ID (when provided, also includes global memories)
+    /// Filter by scope ID. Null means retrieve global memories only.
     pub scope_id: Option<String>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
+    /// Advanced retrieval controls. Omit for the standard recall path.
+    #[serde(default)]
+    pub options: RetrieveOptions,
+}
+
+/// Advanced retrieval options for callers that need scoring/debug controls.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct RetrieveOptions {
+    /// Filter by category prefix (e.g. "work.code" matches "work.code.eslint")
+    pub category_prefix: Option<String>,
+    /// Filter by tags
+    pub tags: Option<Vec<String>>,
     /// Minimum score threshold
     pub min_score: Option<f32>,
     /// Minimum confidence threshold
@@ -55,24 +69,25 @@ pub struct RetrieveApiRequest {
     pub include_history: Option<bool>,
 }
 
-impl From<RetrieveApiRequest> for RetrieveRequest {
-    fn from(req: RetrieveApiRequest) -> Self {
+impl RetrieveApiRequest {
+    fn into_service_request(self, profile_id: Uuid) -> RetrieveRequest {
+        let options = self.options;
         RetrieveRequest {
-            profile_id: req.profile_id,
-            query: req.query,
-            owner_id: req.owner_id,
-            scope_id: req.scope_id,
-            category_prefix: None,
-            tags: None,
-            top_k: req.top_k,
-            min_score: req.min_score,
-            min_confidence: req.min_confidence,
-            use_fulltext: req.use_fulltext,
-            use_vector: req.use_vector,
-            fulltext_weight: req.fulltext_weight,
-            highlight: req.highlight,
-            include_evidence: req.include_evidence,
-            include_history: req.include_history,
+            profile_id,
+            query: self.query,
+            owner_id: self.owner_id,
+            scope_id: self.scope_id,
+            category_prefix: options.category_prefix,
+            tags: options.tags,
+            top_k: self.top_k,
+            min_score: options.min_score,
+            min_confidence: options.min_confidence,
+            use_fulltext: options.use_fulltext,
+            use_vector: options.use_vector,
+            fulltext_weight: options.fulltext_weight,
+            highlight: options.highlight,
+            include_evidence: options.include_evidence,
+            include_history: options.include_history,
         }
     }
 }
@@ -99,9 +114,9 @@ pub struct EventResponse {
     /// Event summary
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Event source
+    /// Event source.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: Option<EventSource>,
     /// Event time
     pub event_time: DateTime<Utc>,
 }
@@ -194,8 +209,6 @@ pub struct RetrieveApiResponse {
 /// Request body for auto retrieval
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AutoRetrieveApiRequest {
-    /// System profile ID - which business system to retrieve from (required)
-    pub profile_id: Uuid,
     /// User query text (will be parsed by LLM to extract search intent)
     pub query: String,
     /// Owner ID - the unique identifier of the memory owner (required)
@@ -203,7 +216,7 @@ pub struct AutoRetrieveApiRequest {
     /// Optional context to help LLM better understand the query
     #[serde(default)]
     pub context: Option<String>,
-    /// Filter by scope ID
+    /// Filter by scope ID. Null means retrieve global memories only.
     pub scope_id: Option<String>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
@@ -250,7 +263,7 @@ pub fn retrieval_routes() -> Router<AppState> {
         .route("/retrieve/auto", post(auto_retrieve_memories))
 }
 
-/// POST /api/v1/memories/retrieve - Retrieve memories
+/// POST /api/v1/systems/{profile_id}/memories/retrieve - Retrieve memories
 ///
 /// Retrieves memories based on query and filters:
 /// 1. For memories with embedding_provider: vector search + fulltext search
@@ -261,8 +274,11 @@ pub fn retrieval_routes() -> Router<AppState> {
 /// 6. Optionally loads evidence and history
 #[utoipa::path(
     post,
-    path = "/api/v1/memories/retrieve",
+    path = "/api/v1/systems/{profile_id}/memories/retrieve",
     tag = "retrieval",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     request_body = RetrieveApiRequest,
     responses(
         (status = 200, description = "Memories retrieved successfully", body = RetrieveApiResponse),
@@ -272,42 +288,28 @@ pub fn retrieval_routes() -> Router<AppState> {
 )]
 pub async fn retrieve_memories(
     State(state): State<AppState>,
+    Path(profile_id): Path<Uuid>,
     Json(request): Json<RetrieveApiRequest>,
 ) -> AppResult<Json<RetrieveApiResponse>> {
     use crate::embedding::EmbeddingRequest;
+    use crate::repository::VectorFilter;
     use tracing::{debug, warn};
 
     debug!(
-        profile_id = %request.profile_id,
+        profile_id = %profile_id,
         query = %request.query,
         owner_id = %request.owner_id,
         scope_id = ?request.scope_id,
         "retrieve_memories: starting request"
     );
 
-    let include_global = request.scope_id.is_some();
+    let include_global = true;
     let top_k = request.top_k.unwrap_or(10);
-    let use_vector = request.use_vector.unwrap_or(true);
+    let use_vector = request.options.use_vector.unwrap_or(true);
     let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
 
     // Step 1: Try vector search if enabled
     if use_vector {
-        // Query memories grouped by embedding_provider (only those with embeddings)
-        let memories_by_provider = state
-            .memory_guard
-            .memory_repo()
-            .find_by_owner_scope_grouped_by_provider(
-                &request.owner_id,
-                request.scope_id.as_deref(),
-                include_global,
-            )
-            .await?;
-
-        debug!(
-            provider_count = memories_by_provider.len(),
-            "retrieve_memories: found memories with embeddings grouped by provider"
-        );
-
         // Use global embedding provider for query embedding
         let embedding_provider_name = &state.embedding_provider_name;
 
@@ -315,6 +317,15 @@ pub async fn retrieve_memories(
         let embedding_request = EmbeddingRequest::new(&request.query);
         match state.embedding_provider.embed(embedding_request).await {
             Ok(query_embedding) => {
+                let filter = VectorFilter {
+                    profile_id: Some(profile_id),
+                    owner_id: Some(request.owner_id.clone()),
+                    scope_id: request.scope_id.clone(),
+                    include_global: Some(include_global),
+                    statuses: Some(vec!["active".to_string()]),
+                    ..Default::default()
+                };
+
                 // Search in the global provider's Qdrant collection
                 let search_results = match state
                     .qdrant_repo
@@ -322,7 +333,7 @@ pub async fn retrieve_memories(
                         embedding_provider_name,
                         query_embedding.embedding,
                         top_k * 2, // Get more candidates for filtering
-                        None,
+                        Some(filter),
                     )
                     .await
                 {
@@ -355,7 +366,7 @@ pub async fn retrieve_memories(
         "retrieve_memories: combined all vector search results"
     );
 
-    let mut retrieve_request: RetrieveRequest = request.into();
+    let mut retrieve_request = request.into_service_request(profile_id);
 
     // If no vector results, disable vector search in the request
     let has_vector_results = !all_similarities.is_empty();
@@ -412,7 +423,7 @@ pub async fn retrieve_memories(
     Ok(Json(response))
 }
 
-/// POST /api/v1/memories/retrieve/auto - Auto retrieve with query parsing
+/// POST /api/v1/systems/{profile_id}/memories/retrieve/auto - Auto retrieve with query parsing
 ///
 /// Automatically retrieves memories by:
 /// 1. For memories with embedding_provider: vector search + fulltext search
@@ -420,8 +431,11 @@ pub async fn retrieve_memories(
 /// 3. Merges results and returns formatted markdown output
 #[utoipa::path(
     post,
-    path = "/api/v1/memories/retrieve/auto",
+    path = "/api/v1/systems/{profile_id}/memories/retrieve/auto",
     tag = "retrieval",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     request_body = AutoRetrieveApiRequest,
     responses(
         (status = 200, description = "Memories retrieved successfully", body = AutoRetrieveApiResponse),
@@ -431,38 +445,24 @@ pub async fn retrieve_memories(
 )]
 pub async fn auto_retrieve_memories(
     State(state): State<AppState>,
+    Path(profile_id): Path<Uuid>,
     Json(request): Json<AutoRetrieveApiRequest>,
 ) -> AppResult<Json<AutoRetrieveApiResponse>> {
     use crate::embedding::EmbeddingRequest;
+    use crate::repository::VectorFilter;
     use tracing::{debug, warn};
 
     debug!(
-        profile_id = %request.profile_id,
+        profile_id = %profile_id,
         query = %request.query,
         owner_id = %request.owner_id,
         scope_id = ?request.scope_id,
         "auto_retrieve_memories: starting request"
     );
 
-    let include_global = request.scope_id.is_some();
+    let include_global = true;
     let top_k = request.top_k.unwrap_or(10);
     let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
-
-    // Step 1: Try vector search for memories with embeddings
-    let memories_by_provider = state
-        .memory_guard
-        .memory_repo()
-        .find_by_owner_scope_grouped_by_provider(
-            &request.owner_id,
-            request.scope_id.as_deref(),
-            include_global,
-        )
-        .await?;
-
-    debug!(
-        provider_count = memories_by_provider.len(),
-        "auto_retrieve_memories: found memories with embeddings grouped by provider"
-    );
 
     // Use global embedding provider for query embedding
     let embedding_provider_name = &state.embedding_provider_name;
@@ -471,6 +471,15 @@ pub async fn auto_retrieve_memories(
     let embedding_request = EmbeddingRequest::new(&request.query);
     match state.embedding_provider.embed(embedding_request).await {
         Ok(query_embedding) => {
+            let filter = VectorFilter {
+                profile_id: Some(profile_id),
+                owner_id: Some(request.owner_id.clone()),
+                scope_id: request.scope_id.clone(),
+                include_global: Some(include_global),
+                statuses: Some(vec!["active".to_string()]),
+                ..Default::default()
+            };
+
             // Search in the global provider's Qdrant collection
             let search_results = match state
                 .qdrant_repo
@@ -478,7 +487,7 @@ pub async fn auto_retrieve_memories(
                     embedding_provider_name,
                     query_embedding.embedding,
                     top_k * 2,
-                    None,
+                    Some(filter),
                 )
                 .await
             {
@@ -507,7 +516,7 @@ pub async fn auto_retrieve_memories(
     // Build retrieve request - use_vector depends on whether we have vector results
     let has_vector_results = !all_similarities.is_empty();
     let retrieve_request = RetrieveRequest {
-        profile_id: request.profile_id,
+        profile_id,
         query: request.query.clone(),
         owner_id: request.owner_id.clone(),
         scope_id: request.scope_id,
@@ -613,47 +622,58 @@ mod tests {
     fn test_retrieve_request_conversion() {
         let profile_id = Uuid::new_v4();
         let api_request = RetrieveApiRequest {
-            profile_id,
             query: "test query".to_string(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             top_k: Some(20),
-            min_score: Some(0.5),
-            min_confidence: Some(0.7),
-            use_fulltext: Some(true),
-            use_vector: Some(true),
-            fulltext_weight: Some(0.2),
-            highlight: Some(true),
-            include_evidence: Some(true),
-            include_history: Some(false),
+            options: RetrieveOptions {
+                category_prefix: Some("preference".to_string()),
+                tags: Some(vec!["ui".to_string()]),
+                min_score: Some(0.5),
+                min_confidence: Some(0.7),
+                use_fulltext: Some(true),
+                use_vector: Some(true),
+                fulltext_weight: Some(0.2),
+                highlight: Some(true),
+                include_evidence: Some(true),
+                include_history: Some(false),
+            },
         };
 
-        let retrieve_request: RetrieveRequest = api_request.clone().into();
+        let retrieve_request = api_request.clone().into_service_request(profile_id);
 
         assert_eq!(retrieve_request.profile_id, profile_id);
         assert_eq!(retrieve_request.query, api_request.query);
         assert_eq!(retrieve_request.owner_id, api_request.owner_id);
         assert_eq!(retrieve_request.scope_id, api_request.scope_id);
-        // category_prefix and tags are set to None in conversion (internal use only)
-        assert!(retrieve_request.category_prefix.is_none());
-        assert!(retrieve_request.tags.is_none());
+        assert_eq!(
+            retrieve_request.category_prefix,
+            Some("preference".to_string())
+        );
+        assert_eq!(retrieve_request.tags, Some(vec!["ui".to_string()]));
         assert_eq!(retrieve_request.top_k, api_request.top_k);
-        assert_eq!(retrieve_request.min_score, api_request.min_score);
-        assert_eq!(retrieve_request.min_confidence, api_request.min_confidence);
-        assert_eq!(retrieve_request.use_fulltext, api_request.use_fulltext);
-        assert_eq!(retrieve_request.use_vector, api_request.use_vector);
+        assert_eq!(retrieve_request.min_score, api_request.options.min_score);
+        assert_eq!(
+            retrieve_request.min_confidence,
+            api_request.options.min_confidence
+        );
+        assert_eq!(
+            retrieve_request.use_fulltext,
+            api_request.options.use_fulltext
+        );
+        assert_eq!(retrieve_request.use_vector, api_request.options.use_vector);
         assert_eq!(
             retrieve_request.fulltext_weight,
-            api_request.fulltext_weight
+            api_request.options.fulltext_weight
         );
-        assert_eq!(retrieve_request.highlight, api_request.highlight);
+        assert_eq!(retrieve_request.highlight, api_request.options.highlight);
         assert_eq!(
             retrieve_request.include_evidence,
-            api_request.include_evidence
+            api_request.options.include_evidence
         );
         assert_eq!(
             retrieve_request.include_history,
-            api_request.include_history
+            api_request.options.include_history
         );
     }
 
@@ -661,22 +681,14 @@ mod tests {
     fn test_retrieve_request_minimal() {
         let profile_id = Uuid::new_v4();
         let api_request = RetrieveApiRequest {
-            profile_id,
             query: "simple query".to_string(),
             owner_id: "owner123".to_string(),
             scope_id: None,
             top_k: None,
-            min_score: None,
-            min_confidence: None,
-            use_fulltext: None,
-            use_vector: None,
-            fulltext_weight: None,
-            highlight: None,
-            include_evidence: None,
-            include_history: None,
+            options: RetrieveOptions::default(),
         };
 
-        let retrieve_request: RetrieveRequest = api_request.into();
+        let retrieve_request = api_request.into_service_request(profile_id);
 
         assert_eq!(retrieve_request.profile_id, profile_id);
         assert_eq!(retrieve_request.query, "simple query");
@@ -698,7 +710,6 @@ mod tests {
     #[test]
     fn test_retrieve_request_parsing() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "query": "test query",
             "owner_id": "owner123"
         }"#;
@@ -711,7 +722,6 @@ mod tests {
     #[test]
     fn test_auto_retrieve_request_parsing() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "query": "用户喜欢什么颜色",
             "owner_id": "owner123",
             "scope_id": "user123",
@@ -729,7 +739,6 @@ mod tests {
     #[test]
     fn test_auto_retrieve_request_minimal() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "query": "test query",
             "owner_id": "owner456"
         }"#;

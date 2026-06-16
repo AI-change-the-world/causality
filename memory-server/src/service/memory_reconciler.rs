@@ -71,13 +71,43 @@ pub enum ReconcileOutcome {
     },
 }
 
-/// Result of LLM consistency check
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsistencyResult {
+/// Consistency decision from semantic comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsistencyDecision {
     /// Content is semantically consistent (can reinforce)
     Consistent,
     /// Content conflicts (should supersede)
     Conflicting,
+}
+
+/// Structured result of a consistency check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsistencyResult {
+    /// Whether the new content is consistent or conflicting.
+    pub decision: ConsistencyDecision,
+    /// Short explanation of the semantic relationship.
+    pub reason: String,
+    /// Confidence of this consistency decision (0.0 - 1.0).
+    pub confidence: f32,
+}
+
+impl ConsistencyResult {
+    pub fn consistent(reason: impl Into<String>, confidence: f32) -> Self {
+        Self {
+            decision: ConsistencyDecision::Consistent,
+            reason: reason.into(),
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn conflicting(reason: impl Into<String>, confidence: f32) -> Self {
+        Self {
+            decision: ConsistencyDecision::Conflicting,
+            reason: reason.into(),
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
 }
 
 /// Trait for checking semantic consistency between memories
@@ -181,24 +211,24 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
             .check_consistency(&best_match.memory.content, &extracted.content)
             .await?;
 
-        match consistency {
+        match consistency.decision {
             // Case B: Consistent - reinforce existing memory
-            ConsistencyResult::Consistent => {
+            ConsistencyDecision::Consistent => {
                 debug!("Content is consistent, reinforcing memory");
                 self.reinforce(event, &best_match.memory).await
             }
             // Case C: Conflicting - create new version (supersede)
-            ConsistencyResult::Conflicting => {
+            ConsistencyDecision::Conflicting => {
                 debug!("Content conflicts, creating new version");
-                self.supersede(event, extracted, &best_match.memory).await
+                self.supersede(event, extracted, &best_match.memory, &consistency)
+                    .await
             }
         }
     }
 
-    /// Reconcile an extracted memory with existing matches using a dynamic LLM provider
+    /// Reconcile an extracted memory with existing matches using the configured LLM provider.
     ///
-    /// This method allows passing an LLM provider at runtime for consistency checking,
-    /// which is useful when the LLM provider is determined by the request context.
+    /// This keeps the consistency check explicit while avoiding hidden provider state.
     #[instrument(skip(self, event, extracted, matches, llm_provider), fields(event_id = %event.id))]
     pub async fn reconcile_with_llm(
         &self,
@@ -227,16 +257,17 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
             .check_consistency(&best_match.memory.content, &extracted.content)
             .await?;
 
-        match consistency {
+        match consistency.decision {
             // Case B: Consistent - reinforce existing memory
-            ConsistencyResult::Consistent => {
+            ConsistencyDecision::Consistent => {
                 debug!("Content is consistent (LLM), reinforcing memory");
                 self.reinforce(event, &best_match.memory).await
             }
             // Case C: Conflicting - create new version (supersede)
-            ConsistencyResult::Conflicting => {
+            ConsistencyDecision::Conflicting => {
                 debug!("Content conflicts (LLM), creating new version");
-                self.supersede(event, extracted, &best_match.memory).await
+                self.supersede(event, extracted, &best_match.memory, &consistency)
+                    .await
             }
         }
     }
@@ -315,6 +346,7 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
         event: &Event,
         extracted: &ExtractedMemory,
         old_memory: &Memory,
+        consistency: &ConsistencyResult,
     ) -> AppResult<ReconcileOutcome> {
         // Determine root_memory_id for the version chain
         let root_id = old_memory.root_memory_id.unwrap_or(old_memory.id);
@@ -345,6 +377,10 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
         // Create the new version
         let new_memory = Memory::new_superseding(input);
         let created = self.memory_repo.create(&new_memory).await?;
+        let created = self
+            .memory_repo
+            .update_conflict_metadata(created.id, &consistency.reason, consistency.confidence)
+            .await?;
 
         // Update the old memory to mark it as superseded
         self.memory_repo
@@ -383,7 +419,10 @@ impl ConsistencyChecker for AlwaysConsistentChecker {
         _existing_content: &str,
         _new_content: &str,
     ) -> AppResult<ConsistencyResult> {
-        Ok(ConsistencyResult::Consistent)
+        Ok(ConsistencyResult::consistent(
+            "Default checker treats all matches as consistent",
+            1.0,
+        ))
     }
 }
 
@@ -398,7 +437,10 @@ impl ConsistencyChecker for AlwaysConflictingChecker {
         _existing_content: &str,
         _new_content: &str,
     ) -> AppResult<ConsistencyResult> {
-        Ok(ConsistencyResult::Conflicting)
+        Ok(ConsistencyResult::conflicting(
+            "Default checker treats all matches as conflicting",
+            1.0,
+        ))
     }
 }
 
@@ -443,29 +485,76 @@ Consider:
 - If the new information adds detail without contradiction, it's CONSISTENT
 - If the new information reinforces the same viewpoint, it's CONSISTENT
 
-Respond with ONLY one word: "CONSISTENT" or "CONFLICTING""#,
+Respond with ONLY valid JSON in this shape:
+{{
+  "result": "consistent" | "conflicting",
+  "reason": "short explanation, max 30 words",
+  "confidence": 0.0-1.0
+}}"#,
             existing_content, new_content
         );
 
-        let request = ChatRequest::new(prompt);
+        let request = ChatRequest::new(prompt).with_json_response();
 
         let response = self.llm_provider.chat(request).await.map_err(|e| {
             crate::error::AppError::Internal(format!("LLM consistency check failed: {}", e))
         })?;
 
-        let result = response.content.trim().to_uppercase();
+        let result = Self::parse_response(&response.content);
 
         tracing::debug!(
             existing = %existing_content,
             new = %new_content,
-            result = %result,
+            decision = ?result.decision,
+            confidence = result.confidence,
+            reason = %result.reason,
             "LLM consistency check result"
         );
 
-        if result.contains("CONFLICTING") {
-            Ok(ConsistencyResult::Conflicting)
+        Ok(result)
+    }
+}
+
+impl LlmConsistencyChecker {
+    fn parse_response(content: &str) -> ConsistencyResult {
+        #[derive(Deserialize)]
+        struct LlmConsistencyResponse {
+            result: Option<String>,
+            decision: Option<String>,
+            reason: Option<String>,
+            confidence: Option<f32>,
+        }
+
+        let trimmed = content.trim();
+        if let Ok(parsed) = serde_json::from_str::<LlmConsistencyResponse>(trimmed) {
+            let reason = parsed
+                .reason
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "LLM did not provide a reason".to_string());
+            let confidence = parsed.confidence.unwrap_or(0.5);
+            let result = parsed
+                .result
+                .or(parsed.decision)
+                .unwrap_or_else(|| "consistent".to_string());
+
+            if result.eq_ignore_ascii_case("conflicting") {
+                return ConsistencyResult::conflicting(reason, confidence);
+            }
+
+            return ConsistencyResult::consistent(reason, confidence);
+        }
+
+        let upper = trimmed.to_uppercase();
+        if upper.contains("CONFLICTING") {
+            ConsistencyResult::conflicting(
+                "LLM returned legacy CONFLICTING response without structured reason",
+                0.5,
+            )
         } else {
-            Ok(ConsistencyResult::Consistent)
+            ConsistencyResult::consistent(
+                "LLM returned legacy CONSISTENT response without structured reason",
+                0.5,
+            )
         }
     }
 }
@@ -500,10 +589,33 @@ mod tests {
 
     #[test]
     fn test_consistency_result() {
-        assert_eq!(ConsistencyResult::Consistent, ConsistencyResult::Consistent);
-        assert_ne!(
-            ConsistencyResult::Consistent,
-            ConsistencyResult::Conflicting
+        assert_eq!(
+            ConsistencyDecision::Consistent,
+            ConsistencyDecision::Consistent
         );
+        assert_ne!(
+            ConsistencyDecision::Consistent,
+            ConsistencyDecision::Conflicting
+        );
+    }
+
+    #[test]
+    fn test_parse_structured_consistency_response() {
+        let result = LlmConsistencyChecker::parse_response(
+            r#"{"result":"conflicting","reason":"New preference reverses the old one","confidence":0.82}"#,
+        );
+
+        assert_eq!(result.decision, ConsistencyDecision::Conflicting);
+        assert_eq!(result.reason, "New preference reverses the old one");
+        assert!((result.confidence - 0.82).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_legacy_consistency_response() {
+        let result = LlmConsistencyChecker::parse_response("CONFLICTING");
+
+        assert_eq!(result.decision, ConsistencyDecision::Conflicting);
+        assert!((result.confidence - 0.5).abs() < f32::EPSILON);
+        assert!(result.reason.contains("legacy"));
     }
 }

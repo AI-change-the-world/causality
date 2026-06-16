@@ -13,6 +13,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
+use uuid::Uuid;
 
 use crate::domain::Memory;
 use crate::error::AppResult;
@@ -101,11 +102,12 @@ impl DecayCalculator {
     ///
     /// This updates the decay_score field in the database for all
     /// current version, non-archived memories.
-    #[instrument(skip(self), fields(owner_id = %owner_id))]
-    pub async fn update_batch(&self, owner_id: &str) -> AppResult<usize> {
+    #[instrument(skip(self), fields(profile_id = %profile_id, owner_id = %owner_id))]
+    pub async fn update_batch(&self, profile_id: Uuid, owner_id: &str) -> AppResult<usize> {
         let updated = self
             .memory_repo
             .update_decay_scores(
+                profile_id,
                 owner_id,
                 self.config.decay_half_life_days,
                 self.config.hit_boost_factor,

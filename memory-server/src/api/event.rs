@@ -1,14 +1,14 @@
 //! Event Processing API handlers
 //!
 //! Implements:
-//! - POST /api/v1/events - Create and process an event, extracting memories
-//! - GET /api/v1/events/{id} - Get event details with related memories
+//! - POST /api/v1/systems/{profile_id}/events - Create and process an event
+//! - GET /api/v1/systems/{profile_id}/events/{id} - Get event details
 //!
 //! New architecture:
 //! - Events are immutable after creation
 //! - Returns memories_created and memories_reinforced counts
 //! - Supports scope_id and source fields
-//! - Dynamically creates embedding providers based on existing memories
+//! - Uses global LLM and embedding providers configured for the service
 
 use axum::{
     extract::{Path, State},
@@ -18,16 +18,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::debug;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::embedding::EmbeddingProvider;
+use crate::domain::{EventSource, ProcessingStatus};
 use crate::error::AppResult;
-use crate::service::{CreateFromEventRequest, EventProcessingContext};
+use crate::service::{CreateFromEventRequest, EventIngestionResult};
 
 /// Request body for creating an event
 ///
@@ -39,8 +36,6 @@ use crate::service::{CreateFromEventRequest, EventProcessingContext};
 /// no need to specify them per request.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateEventApiRequest {
-    /// System profile ID - which business system this event belongs to
-    pub profile_id: Uuid,
     /// Owner ID - the unique identifier of the memory owner
     pub owner_id: String,
     /// Event content (any form: click description, conversation history, operation log, etc.)
@@ -51,20 +46,41 @@ pub struct CreateEventApiRequest {
     /// Scope identifier for created memories (optional, null = global context)
     #[serde(default)]
     pub scope_id: Option<String>,
-    /// Event source (e.g., "user_created", "api", "conversation")
+    /// Event source. Recommended values: conversation, user_action, system_event, manual, api.
     #[serde(default)]
-    pub source: Option<String>,
+    pub source: Option<EventSource>,
 }
 
-impl From<CreateEventApiRequest> for CreateFromEventRequest {
-    fn from(req: CreateEventApiRequest) -> Self {
+impl CreateEventApiRequest {
+    fn into_service_request(self, profile_id: Uuid) -> CreateFromEventRequest {
         CreateFromEventRequest {
-            profile_id: req.profile_id,
-            owner_id: req.owner_id,
-            content: req.content,
-            context: req.context,
-            scope_id: req.scope_id,
-            source: req.source,
+            profile_id,
+            owner_id: self.owner_id,
+            content: self.content,
+            context: self.context,
+            scope_id: self.scope_id,
+            source: self.source,
+        }
+    }
+}
+
+impl From<EventIngestionResult> for CreateEventApiResponse {
+    fn from(result: EventIngestionResult) -> Self {
+        CreateEventApiResponse {
+            event_id: result.event.id,
+            processing_status: result.event.processing_status,
+            error_message: result.event.error_message,
+            processed_at: result.event.processed_at,
+            event_summary: result.event.summary,
+            memories_created: result.memories_created,
+            memories_reinforced: result.memories_reinforced,
+            memories_superseded: result.memories_superseded,
+            created_memory_ids: result.created_memory_ids,
+            reinforced_memory_ids: result.reinforced_memory_ids,
+            superseded_memory_ids: result.superseded_memory_ids,
+            skipped: result.skipped,
+            skip_reason: result.skip_reason,
+            relevance_score: result.relevance_score,
         }
     }
 }
@@ -76,8 +92,14 @@ impl From<CreateEventApiRequest> for CreateFromEventRequest {
 pub struct CreateEventApiResponse {
     /// The created event ID
     pub event_id: Uuid,
-    /// Whether the event has been processed
-    pub processed: bool,
+    /// Current processing status
+    pub processing_status: ProcessingStatus,
+    /// Error message when processing failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// When processing reached a terminal status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processed_at: Option<DateTime<Utc>>,
     /// Event summary (LLM-generated understanding of the event)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_summary: Option<String>,
@@ -91,12 +113,16 @@ pub struct CreateEventApiResponse {
     pub created_memory_ids: Vec<Uuid>,
     /// IDs of reinforced memories
     pub reinforced_memory_ids: Vec<Uuid>,
-    /// Whether the event was skipped due to irrelevance (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skipped: Option<bool>,
+    /// IDs of superseded memories (old versions)
+    pub superseded_memory_ids: Vec<Uuid>,
+    /// Whether the event was skipped due to irrelevance
+    pub skipped: bool,
     /// Reason for skipping (if skipped)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+    /// Relevance score used by the skip decision
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance_score: Option<f32>,
 }
 
 /// Response for getting an event
@@ -117,11 +143,25 @@ pub struct GetEventApiResponse {
     /// Event summary
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Event source
+    /// Event source.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Whether the event has been processed
-    pub processed: bool,
+    pub source: Option<EventSource>,
+    /// Current processing status
+    pub processing_status: ProcessingStatus,
+    /// Error message when processing failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// When processing reached a terminal status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processed_at: Option<DateTime<Utc>>,
+    /// Whether the event was skipped due to irrelevance
+    pub skipped: bool,
+    /// Reason for skipping (if skipped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    /// Relevance score used by the skip decision
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance_score: Option<f32>,
     /// When the event occurred
     pub event_time: DateTime<Utc>,
     /// When the event was created
@@ -147,6 +187,7 @@ pub fn event_routes() -> Router<AppState> {
     Router::new()
         .route("/", post(create_event))
         .route("/{id}", get(get_event))
+        .route("/{id}/retry", post(retry_event))
 }
 
 /// Create async event processing routes
@@ -156,27 +197,30 @@ pub fn event_async_routes() -> Router<AppState> {
 
 /// Response for async event creation
 ///
-/// Returns immediately with event_id. Use GET /api/v1/events/{id} to check status.
+/// Returns immediately with event_id. Use GET /api/v1/systems/{profile_id}/events/{id} to check status.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreateEventAsyncResponse {
     /// The created event ID
     pub event_id: Uuid,
-    /// Event status (always "pending" for async creation)
-    pub status: String,
+    /// Event processing status
+    pub status: ProcessingStatus,
     /// Message indicating how to check status
     pub message: String,
 }
 
-/// POST /api/v1/events-async - Create an event and process asynchronously
+/// POST /api/v1/systems/{profile_id}/events-async - Create an event and process asynchronously
 ///
 /// Creates an event and starts background processing. Returns immediately with event_id.
-/// Use GET /api/v1/events/{id} to check processing status and results.
+/// Use GET /api/v1/systems/{profile_id}/events/{id} to check processing status and results.
 ///
 /// This is useful for long-running LLM processing to avoid HTTP timeouts.
 #[utoipa::path(
     post,
-    path = "/api/v1/events-async",
+    path = "/api/v1/systems/{profile_id}/events-async",
     tag = "events",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     request_body = CreateEventApiRequest,
     responses(
         (status = 202, description = "Event created, processing started", body = CreateEventAsyncResponse),
@@ -185,6 +229,7 @@ pub struct CreateEventAsyncResponse {
     )
 )]
 pub async fn create_event_async(
+    Path(profile_id): Path<Uuid>,
     State(state): State<AppState>,
     Json(request): Json<CreateEventApiRequest>,
 ) -> AppResult<(StatusCode, Json<CreateEventAsyncResponse>)> {
@@ -193,27 +238,11 @@ pub async fn create_event_async(
         "create_event_async: starting async request"
     );
 
-    // Create the event first (unprocessed)
-    let event_input = crate::domain::CreateEventInput {
-        profile_id: request.profile_id,
-        owner_id: request.owner_id.clone(),
-        scope_id: request.scope_id.clone(),
-        content: request.content.clone(),
-        context: request.context.clone(),
-        source: request.source.clone(),
-        event_time: None,
-    };
-
-    let event = crate::domain::Event::new(event_input);
+    let event = state
+        .event_ingestion_service
+        .create_pending_event(request.into_service_request(profile_id))
+        .await?;
     let event_id = event.id;
-
-    // Store the event (unprocessed)
-    state
-        .memory_guard
-        .event_repo()
-        .create(&event)
-        .await
-        .map_err(|e| crate::error::AppError::Internal(format!("Failed to create event: {}", e)))?;
 
     // Clone what we need for the background task
     let state_clone = state.clone();
@@ -225,13 +254,12 @@ pub async fn create_event_async(
             "Background task: starting event processing"
         );
 
-        if let Err(e) = process_event_background(state_clone, event_id).await {
+        if let Err(e) = process_event_background(state_clone, profile_id, event_id).await {
             tracing::error!(
                 event_id = %event_id,
                 error = %e,
                 "Background task: event processing failed"
             );
-            // TODO: Could update event with error status if we add that field
         } else {
             tracing::info!(
                 event_id = %event_id,
@@ -242,10 +270,10 @@ pub async fn create_event_async(
 
     let response = CreateEventAsyncResponse {
         event_id,
-        status: "pending".to_string(),
+        status: event.processing_status,
         message: format!(
-            "Event created. Check status at GET /api/v1/events/{}",
-            event_id
+            "Event created. Check status at GET /api/v1/systems/{}/events/{}",
+            profile_id, event_id
         ),
     };
 
@@ -256,99 +284,45 @@ pub async fn create_event_async(
 /// Uses global LLM and Embedding providers from AppState (configured in config.yaml)
 async fn process_event_background(
     state: AppState,
+    profile_id: Uuid,
     event_id: Uuid,
 ) -> Result<(), crate::error::AppError> {
-    // Get the event we created
-    let event = state.retrieval_engine.get_event(event_id).await?;
-
-    // Use global LLM provider from AppState
-    let llm_provider = state.llm_provider.clone();
-
-    // Create EventHandler with ProfileService for relevance checking
-    let event_handler = crate::service::EventHandler::with_profile_service(
-        llm_provider.clone(),
-        state.profile_service.clone(),
-    );
-
-    // Fetch context memories for better relevance judgment
-    let context_memories = state
-        .memory_guard
-        .memory_repo()
-        .find_context_memories(
-            event.profile_id,
-            &event.owner_id,
-            event.scope_id.as_deref(),
-            20, // scope_limit
-            10, // global_limit
-        )
-        .await
-        .unwrap_or_default();
-
-    // Check event relevance against SystemProfile with context memories
-    let relevance_result = event_handler
-        .check_relevance_with_profile(&event.content, Some(&context_memories))
-        .await?;
-
-    // If event is not relevant, skip processing
-    if !relevance_result.is_relevant {
-        tracing::info!(
-            event_id = %event_id,
-            relevance_score = relevance_result.relevance_score,
-            reason = %relevance_result.reason,
-            "Background task: event skipped due to irrelevance"
-        );
-
-        // Mark as processed with skip reason in summary
-        let skip_summary = format!(
-            "[SKIPPED] 事件与系统业务领域不相关。相关性分数: {:.2}, 原因: {}",
-            relevance_result.relevance_score, relevance_result.reason
-        );
-        state
-            .memory_guard
-            .event_repo()
-            .mark_processed(event_id, &skip_summary)
-            .await?;
-
-        return Ok(());
-    }
-
-    let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
-
-    // Wrap EventHandler in Arc for context
-    let event_handler = Some(Arc::new(event_handler));
-
-    // Use global Embedding provider from AppState
-    let embedding_provider = state.embedding_provider.clone();
-    let embedding_provider_name = state.embedding_provider_name.clone();
-
-    // Get Qdrant repository
-    let qdrant_repo = state.qdrant_repo.clone();
-
-    // Empty map - we only use the global embedding provider now
-    let embedding_providers = HashMap::new();
-
-    // Build context and process
-    let context = EventProcessingContext {
-        memory_processor,
-        event_handler,
-        llm_provider,
-        embedding_provider,
-        embedding_provider_name,
-        qdrant_repo,
-        embedding_providers,
-        context_memories,
-    };
-
-    // Pass context memories to processing (for potential memory updates)
     state
-        .memory_guard
-        .process_event_with_context(&event, context, None)
+        .event_ingestion_service
+        .process_existing_event(profile_id, event_id)
         .await?;
 
     Ok(())
 }
 
-/// POST /api/v1/events - Create and process an event
+/// POST /api/v1/systems/{profile_id}/events/{id}/retry - Retry a failed event
+#[utoipa::path(
+    post,
+    path = "/api/v1/systems/{profile_id}/events/{id}/retry",
+    tag = "events",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
+        ("id" = Uuid, Path, description = "Event ID")
+    ),
+    responses(
+        (status = 200, description = "Event retried", body = CreateEventApiResponse),
+        (status = 400, description = "Event is not retryable", body = crate::error::ErrorResponse),
+        (status = 404, description = "Event not found", body = crate::error::ErrorResponse)
+    )
+)]
+pub async fn retry_event(
+    State(state): State<AppState>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
+) -> AppResult<Json<CreateEventApiResponse>> {
+    let result = state
+        .event_ingestion_service
+        .retry_event(profile_id, id)
+        .await?;
+
+    Ok(Json(CreateEventApiResponse::from(result)))
+}
+
+/// POST /api/v1/systems/{profile_id}/events - Create and process an event
 ///
 /// Creates an event and extracts memories from raw event content using LLM processing.
 /// Returns the event details along with memory processing results.
@@ -356,8 +330,11 @@ async fn process_event_background(
 /// The handler uses global LLM and Embedding providers configured in config.yaml.
 #[utoipa::path(
     post,
-    path = "/api/v1/events",
+    path = "/api/v1/systems/{profile_id}/events",
     tag = "events",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     request_body = CreateEventApiRequest,
     responses(
         (status = 201, description = "Event created and processed successfully", body = CreateEventApiResponse),
@@ -366,6 +343,7 @@ async fn process_event_background(
     )
 )]
 pub async fn create_event(
+    Path(profile_id): Path<Uuid>,
     State(state): State<AppState>,
     Json(request): Json<CreateEventApiRequest>,
 ) -> AppResult<(StatusCode, Json<CreateEventApiResponse>)> {
@@ -374,182 +352,30 @@ pub async fn create_event(
         "create_event: starting request"
     );
 
-    // Use global LLM provider from AppState
-    debug!("create_event: using global LLM provider from AppState");
-    let llm_provider = state.llm_provider.clone();
-
-    // Create EventHandler with ProfileService for relevance checking
-    debug!("create_event: creating EventHandler with ProfileService");
-    let event_handler = crate::service::EventHandler::with_profile_service(
-        llm_provider.clone(),
-        state.profile_service.clone(),
-    );
-
-    // Fetch context memories for better relevance judgment
-    debug!("create_event: fetching context memories");
-    let context_memories = state
-        .memory_guard
-        .memory_repo()
-        .find_context_memories(
-            request.profile_id,
-            &request.owner_id,
-            request.scope_id.as_deref(),
-            20, // scope_limit
-            10, // global_limit
-        )
-        .await
-        .unwrap_or_default();
-
-    debug!(
-        context_memory_count = context_memories.len(),
-        "create_event: fetched context memories"
-    );
-
-    // Step 1: Check event relevance against SystemProfile with context memories
-    debug!("create_event: checking event relevance");
-    let relevance_result = event_handler
-        .check_relevance_with_profile(&request.content, Some(&context_memories))
-        .await?;
-
-    // If event is not relevant, skip processing and return early
-    if !relevance_result.is_relevant {
-        tracing::info!(
-            owner_id = %request.owner_id,
-            relevance_score = relevance_result.relevance_score,
-            reason = %relevance_result.reason,
-            "create_event: event skipped due to irrelevance"
-        );
-
-        // Still create the event record but mark it as processed (skipped)
-        let event_input = crate::domain::CreateEventInput {
-            profile_id: request.profile_id,
-            owner_id: request.owner_id.clone(),
-            scope_id: request.scope_id.clone(),
-            content: request.content.clone(),
-            context: request.context.clone(),
-            source: request.source.clone(),
-            event_time: None,
-        };
-
-        let event = crate::domain::Event::new(event_input);
-        let stored_event = state.memory_guard.event_repo().create(&event).await?;
-
-        // Mark as processed with skip reason in summary
-        let skip_summary = format!(
-            "[SKIPPED] 事件与系统业务领域不相关。相关性分数: {:.2}, 原因: {}",
-            relevance_result.relevance_score, relevance_result.reason
-        );
-        let _ = state
-            .memory_guard
-            .event_repo()
-            .mark_processed(stored_event.id, &skip_summary)
-            .await;
-
-        let response = CreateEventApiResponse {
-            event_id: stored_event.id,
-            processed: true,
-            event_summary: Some(skip_summary),
-            memories_created: 0,
-            memories_reinforced: 0,
-            memories_superseded: 0,
-            created_memory_ids: vec![],
-            reinforced_memory_ids: vec![],
-            skipped: Some(true),
-            skip_reason: Some(relevance_result.reason),
-        };
-
-        return Ok((StatusCode::OK, Json(response)));
-    }
-
-    debug!(
-        "create_event: event is relevant (score: {:.2}), proceeding with processing",
-        relevance_result.relevance_score
-    );
-
-    // Create MemoryProcessor with the global LLM provider
-    let memory_processor = Arc::new(crate::service::MemoryProcessor::new(llm_provider.clone()));
-    debug!("create_event: MemoryProcessor created");
-
-    // Wrap EventHandler in Arc for context
-    let event_handler = Some(Arc::new(event_handler));
-
-    // Use global Embedding provider from AppState
-    debug!("create_event: using global Embedding provider from AppState");
-    let embedding_provider = state.embedding_provider.clone();
-    let embedding_provider_name = state.embedding_provider_name.clone();
-
-    // Query existing memories (for potential future use, but we only use global provider now)
-    debug!("create_event: querying existing memories by provider");
-    let memories_by_provider = state
-        .memory_guard
-        .memory_repo()
-        .find_by_owner_scope_grouped_by_provider(
-            &request.owner_id,
-            request.scope_id.as_deref(),
-            true, // include_global
-        )
-        .await?;
-
-    debug!(
-        provider_count = memories_by_provider.len(),
-        "create_event: found existing memories grouped by provider"
-    );
-
-    // Empty map - we only use the global embedding provider now
-    let embedding_providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
-
-    // Get Qdrant repository
-    debug!("create_event: getting Qdrant repository");
-    let qdrant_repo = state.qdrant_repo.clone();
-    debug!("create_event: got Qdrant repository");
-
-    // Build EventProcessingContext with global providers
-    debug!("create_event: building EventProcessingContext");
-
-    let context = EventProcessingContext {
-        memory_processor,
-        event_handler,
-        llm_provider,
-        embedding_provider,
-        embedding_provider_name,
-        qdrant_repo,
-        embedding_providers,
-        context_memories,
-    };
-
-    let service_request: CreateFromEventRequest = request.into();
-    debug!("create_event: calling create_from_event_with_context");
-
-    // Pass context memories to processing (for potential memory updates)
     let result = state
-        .memory_guard
-        .create_from_event_with_context(service_request, context, None)
+        .event_ingestion_service
+        .ingest_event_sync(request.into_service_request(profile_id))
         .await?;
 
-    let response = CreateEventApiResponse {
-        event_id: result.event.id,
-        processed: result.event.processed,
-        event_summary: result.event.summary,
-        memories_created: result.memories_created,
-        memories_reinforced: result.memories_reinforced,
-        memories_superseded: result.memories_superseded,
-        created_memory_ids: result.created_memory_ids.clone(),
-        reinforced_memory_ids: vec![], // TODO: Add to CreateFromEventResult if needed
-        skipped: None,
-        skip_reason: None,
+    let status = if result.skipped {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
     };
+    let response = CreateEventApiResponse::from(result);
 
-    Ok((StatusCode::CREATED, Json(response)))
+    Ok((status, Json(response)))
 }
 
-/// GET /api/v1/events/{id} - Get event details
+/// GET /api/v1/systems/{profile_id}/events/{id} - Get event details
 ///
 /// Returns the event details including related memories.
 #[utoipa::path(
     get,
-    path = "/api/v1/events/{id}",
+    path = "/api/v1/systems/{profile_id}/events/{id}",
     tag = "events",
     params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
         ("id" = Uuid, Path, description = "Event ID")
     ),
     responses(
@@ -559,10 +385,15 @@ pub async fn create_event(
 )]
 pub async fn get_event(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<GetEventApiResponse>> {
     // Get event from repository
     let event = state.retrieval_engine.get_event(id).await?;
+    if event.profile_id != profile_id {
+        return Err(crate::error::AppError::Validation(
+            "event does not belong to the requested system profile".to_string(),
+        ));
+    }
 
     // Get related memories
     let relations = state
@@ -591,7 +422,12 @@ pub async fn get_event(
         context: event.context,
         summary: event.summary,
         source: event.source,
-        processed: event.processed,
+        processing_status: event.processing_status,
+        error_message: event.error_message,
+        processed_at: event.processed_at,
+        skipped: event.skipped,
+        skip_reason: event.skip_reason,
+        relevance_score: event.relevance_score,
         event_time: event.event_time,
         created_at: event.created_at,
         related_memories: if related_memories.is_empty() {
@@ -610,17 +446,18 @@ mod tests {
 
     #[test]
     fn test_create_event_request_conversion() {
+        let profile_id = Uuid::new_v4();
         let api_request = CreateEventApiRequest {
-            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             content: "User clicked the dark mode button".to_string(),
             context: Some("Settings page".to_string()),
             scope_id: Some("user123".to_string()),
-            source: Some("api".to_string()),
+            source: Some(EventSource::Api),
         };
 
-        let service_request: CreateFromEventRequest = api_request.clone().into();
+        let service_request = api_request.clone().into_service_request(profile_id);
 
+        assert_eq!(service_request.profile_id, profile_id);
         assert_eq!(service_request.owner_id, api_request.owner_id);
         assert_eq!(service_request.content, api_request.content);
         assert_eq!(service_request.context, api_request.context);
@@ -631,7 +468,6 @@ mod tests {
     #[test]
     fn test_create_event_request_defaults() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Test event content"
         }"#;
@@ -648,7 +484,6 @@ mod tests {
     #[test]
     fn test_create_event_request_with_all_fields() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Test event content",
             "context": "Test context",
@@ -662,7 +497,20 @@ mod tests {
         assert_eq!(api_request.content, "Test event content");
         assert_eq!(api_request.context, Some("Test context".to_string()));
         assert_eq!(api_request.scope_id, Some("scope456".to_string()));
-        assert_eq!(api_request.source, Some("api".to_string()));
+        assert_eq!(api_request.source, Some(EventSource::Api));
+    }
+
+    #[test]
+    fn test_create_event_request_rejects_unknown_source() {
+        let json = r#"{
+            "owner_id": "owner123",
+            "content": "Test event content",
+            "source": "user_created"
+        }"#;
+
+        let result = serde_json::from_str::<CreateEventApiRequest>(json);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -670,20 +518,24 @@ mod tests {
         let id = Uuid::new_v4();
         let response = CreateEventApiResponse {
             skip_reason: None,
-            skipped: None,
+            relevance_score: None,
+            skipped: false,
             event_id: id,
-            processed: true,
+            processing_status: ProcessingStatus::Completed,
+            error_message: None,
+            processed_at: None,
             event_summary: Some("User changed theme settings".to_string()),
             memories_created: 2,
             memories_reinforced: 1,
             memories_superseded: 0,
             created_memory_ids: vec![Uuid::new_v4()],
             reinforced_memory_ids: vec![Uuid::new_v4()],
+            superseded_memory_ids: vec![],
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains(&id.to_string()));
-        assert!(json.contains("\"processed\":true"));
+        assert!(json.contains("\"processing_status\":\"completed\""));
         assert!(json.contains("\"memories_created\":2"));
         assert!(json.contains("\"memories_reinforced\":1"));
     }
@@ -692,15 +544,19 @@ mod tests {
     fn test_create_event_response_without_summary() {
         let response = CreateEventApiResponse {
             skip_reason: None,
-            skipped: None,
+            relevance_score: None,
+            skipped: false,
             event_id: Uuid::new_v4(),
-            processed: false,
+            processing_status: ProcessingStatus::Pending,
+            error_message: None,
+            processed_at: None,
             event_summary: None,
             memories_created: 0,
             memories_reinforced: 0,
             memories_superseded: 0,
             created_memory_ids: vec![],
             reinforced_memory_ids: vec![],
+            superseded_memory_ids: vec![],
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -716,8 +572,13 @@ mod tests {
             content: "Test event content".to_string(),
             context: Some("Test context".to_string()),
             summary: Some("Test summary".to_string()),
-            source: Some("api".to_string()),
-            processed: true,
+            source: Some(EventSource::Api),
+            processing_status: ProcessingStatus::Completed,
+            error_message: None,
+            processed_at: None,
+            skipped: false,
+            skip_reason: None,
+            relevance_score: None,
             event_time: Utc::now(),
             created_at: Utc::now(),
             related_memories: None,
@@ -725,7 +586,7 @@ mod tests {
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"owner_id\":\"owner123\""));
-        assert!(json.contains("\"processed\":true"));
+        assert!(json.contains("\"processing_status\":\"completed\""));
         assert!(!json.contains("related_memories")); // Should be skipped when None
     }
 

@@ -29,9 +29,11 @@ use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
 use crate::llm::LlmProvider;
-use crate::repository::QdrantRepository;
+use crate::repository::{QdrantRepository, StructuredEventRepository};
 use crate::service::AlwaysConsistentChecker;
-use crate::service::{LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine};
+use crate::service::{
+    EventIngestionService, LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine,
+};
 
 /// Application state shared across all handlers
 /// Uses AlwaysConsistentChecker as the default consistency checker
@@ -40,6 +42,7 @@ pub struct AppState {
     pub memory_guard: Arc<MemoryGuard<AlwaysConsistentChecker>>,
     pub retrieval_engine: RetrievalEngine,
     pub lifecycle_manager: LifecycleManager,
+    pub event_ingestion_service: EventIngestionService,
     pub profile_service: ProfileService,
     /// Global LLM provider instance (from config.yaml)
     pub llm_provider: Arc<dyn LlmProvider>,
@@ -49,6 +52,8 @@ pub struct AppState {
     pub embedding_provider_name: String,
     /// Qdrant repository for vector operations
     pub qdrant_repo: QdrantRepository,
+    /// Structured event repository
+    pub structured_event_repo: StructuredEventRepository,
 }
 
 /// OpenAPI documentation
@@ -82,6 +87,7 @@ pub struct AppState {
         event::create_event,
         event::create_event_async,
         event::get_event,
+        event::retry_event,
         retrieval::retrieve_memories,
         retrieval::auto_retrieve_memories,
         admin::run_eviction,
@@ -89,9 +95,10 @@ pub struct AppState {
         audit::query_audit_logs,
         health::health_check,
         health::metrics,
-        profile::initialize_profile,
-        profile::get_profile,
-        profile::update_profile,
+        profile::create_profile,
+        profile::list_profiles,
+        profile::get_profile_by_id,
+        profile::update_profile_by_id,
     ),
     components(schemas(
         // Memory types
@@ -109,8 +116,10 @@ pub struct AppState {
         event::CreateEventAsyncResponse,
         event::GetEventApiResponse,
         event::RelatedMemoryResponse,
+        crate::domain::EventSource,
         // Retrieval types
         retrieval::RetrieveApiRequest,
+        retrieval::RetrieveOptions,
         retrieval::RetrieveApiResponse,
         retrieval::RetrievedMemoryResponse,
         retrieval::AutoRetrieveApiRequest,
@@ -118,7 +127,6 @@ pub struct AppState {
         retrieval::AutoRetrieveRecord,
         // Admin types
         admin::EvictionRequest,
-        admin::EvictionConfigRequest,
         admin::EvictionResponse,
         admin::DecayUpdateRequest,
         admin::DecayConfigRequest,
@@ -156,14 +164,17 @@ pub struct ApiDoc;
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .nest("/api/v1/memories", memory_routes())
-        .nest("/api/v1/memories", retrieval_routes())
-        .nest("/api/v1/events", event_routes())
-        .nest("/api/v1/events-async", event_async_routes())
-        .nest("/api/v1/admin", admin_routes())
+        .nest("/api/v1/systems", profile_routes())
+        .nest("/api/v1/systems/{profile_id}/memories", memory_routes())
+        .nest("/api/v1/systems/{profile_id}/memories", retrieval_routes())
+        .nest("/api/v1/systems/{profile_id}/events", event_routes())
+        .nest(
+            "/api/v1/systems/{profile_id}/events-async",
+            event_async_routes(),
+        )
+        .nest("/api/v1/systems/{profile_id}/admin", admin_routes())
+        .nest("/api/v1/systems/{profile_id}/audit", audit_routes())
         .nest("/api/v1/config", config_routes())
-        .nest("/api/v1/audit", audit_routes())
-        .nest("/api/v1/system", profile_routes())
         .merge(health_routes())
         .with_state(state)
 }

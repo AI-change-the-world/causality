@@ -56,6 +56,8 @@ impl AuditOperation {
 pub struct AuditLogEntry {
     /// Unique identifier
     pub id: Uuid,
+    /// System profile ID this audit entry belongs to
+    pub profile_id: Uuid,
     /// Memory ID this audit entry relates to
     pub memory_id: Uuid,
     /// Operation type
@@ -75,6 +77,8 @@ pub struct AuditLogEntry {
 /// Query parameters for audit log retrieval
 #[derive(Debug, Clone, Default)]
 pub struct AuditQueryParams {
+    /// Filter by system profile ID
+    pub profile_id: Uuid,
     /// Filter by memory ID
     pub memory_id: Option<Uuid>,
     /// Filter by start time
@@ -104,6 +108,7 @@ impl AuditRepository {
     /// Create a new audit log entry
     pub async fn create(
         &self,
+        profile_id: Uuid,
         memory_id: Uuid,
         operation: AuditOperation,
         actor_id: Option<String>,
@@ -113,11 +118,12 @@ impl AuditRepository {
     ) -> AppResult<AuditLogEntry> {
         let row = sqlx::query_as::<_, AuditLogRow>(
             r#"
-            INSERT INTO audit_logs (memory_id, operation, actor_id, old_value, new_value, reason)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, memory_id, operation, actor_id, old_value, new_value, reason, created_at
+            INSERT INTO audit_logs (profile_id, memory_id, operation, actor_id, old_value, new_value, reason)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, profile_id, memory_id, operation, actor_id, old_value, new_value, reason, created_at
             "#,
         )
+        .bind(profile_id)
         .bind(memory_id)
         .bind(operation.to_string())
         .bind(&actor_id)
@@ -138,17 +144,19 @@ impl AuditRepository {
 
         let rows = sqlx::query_as::<_, AuditLogRow>(
             r#"
-            SELECT id, memory_id, operation, actor_id, old_value, new_value, reason, created_at
+            SELECT id, profile_id, memory_id, operation, actor_id, old_value, new_value, reason, created_at
             FROM audit_logs
-            WHERE ($1::uuid IS NULL OR memory_id = $1)
-              AND ($2::timestamptz IS NULL OR created_at >= $2)
-              AND ($3::timestamptz IS NULL OR created_at <= $3)
-              AND ($4::text IS NULL OR operation = $4)
+            WHERE profile_id = $1
+              AND ($2::uuid IS NULL OR memory_id = $2)
+              AND ($3::timestamptz IS NULL OR created_at >= $3)
+              AND ($4::timestamptz IS NULL OR created_at <= $4)
+              AND ($5::text IS NULL OR operation = $5)
             ORDER BY created_at DESC
-            LIMIT $5
-            OFFSET $6
+            LIMIT $6
+            OFFSET $7
             "#,
         )
+        .bind(params.profile_id)
         .bind(params.memory_id)
         .bind(params.start_time)
         .bind(params.end_time)
@@ -165,7 +173,7 @@ impl AuditRepository {
     pub async fn get_by_memory_id(&self, memory_id: Uuid) -> AppResult<Vec<AuditLogEntry>> {
         let rows = sqlx::query_as::<_, AuditLogRow>(
             r#"
-            SELECT id, memory_id, operation, actor_id, old_value, new_value, reason, created_at
+            SELECT id, profile_id, memory_id, operation, actor_id, old_value, new_value, reason, created_at
             FROM audit_logs
             WHERE memory_id = $1
             ORDER BY created_at DESC
@@ -186,12 +194,14 @@ impl AuditRepository {
             r#"
             SELECT COUNT(*)
             FROM audit_logs
-            WHERE ($1::uuid IS NULL OR memory_id = $1)
-              AND ($2::timestamptz IS NULL OR created_at >= $2)
-              AND ($3::timestamptz IS NULL OR created_at <= $3)
-              AND ($4::text IS NULL OR operation = $4)
+            WHERE profile_id = $1
+              AND ($2::uuid IS NULL OR memory_id = $2)
+              AND ($3::timestamptz IS NULL OR created_at >= $3)
+              AND ($4::timestamptz IS NULL OR created_at <= $4)
+              AND ($5::text IS NULL OR operation = $5)
             "#,
         )
+        .bind(params.profile_id)
         .bind(params.memory_id)
         .bind(params.start_time)
         .bind(params.end_time)
@@ -207,6 +217,7 @@ impl AuditRepository {
 #[derive(Debug, FromRow)]
 struct AuditLogRow {
     id: Uuid,
+    profile_id: Uuid,
     memory_id: Uuid,
     operation: String,
     actor_id: Option<String>,
@@ -220,6 +231,7 @@ impl From<AuditLogRow> for AuditLogEntry {
     fn from(row: AuditLogRow) -> Self {
         AuditLogEntry {
             id: row.id,
+            profile_id: row.profile_id,
             memory_id: row.memory_id,
             operation: row.operation,
             actor_id: row.actor_id,

@@ -21,8 +21,12 @@ use causality::llm::{
 };
 use causality::repository::{
     AuditRepository, EventRepository, MemoryRepository, ProfileRepository, QdrantRepository,
+    StructuredEventRepository,
 };
-use causality::service::{LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine};
+use causality::service::{
+    EventIngestionService, LifecycleManager, MatcherConfig, MemoryGuard, MemoryMatcher,
+    ProfileService, RetrievalEngine,
+};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -156,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let event_repo = EventRepository::new(pool.clone());
     let audit_repo = AuditRepository::new(pool.clone());
     let profile_repo = ProfileRepository::new(pool.clone());
+    let structured_event_repo = StructuredEventRepository::new(pool.clone());
 
     // Create services
     let memory_guard = MemoryGuard::new_basic(
@@ -179,20 +184,38 @@ async fn main() -> anyhow::Result<()> {
         config.lifecycle.clone(),
         config.audit.enabled,
     );
+    let memory_matcher = Arc::new(MemoryMatcher::new(
+        memory_repo.clone(),
+        Arc::new(qdrant_repo.clone()),
+        MatcherConfig::from(config.matching.clone()),
+    ));
 
     // Create ProfileService with global LLM provider
     let profile_service = ProfileService::new(profile_repo, llm_provider.clone());
+    let memory_guard = Arc::new(memory_guard);
+    let event_ingestion_service = EventIngestionService::new(
+        memory_guard.clone(),
+        profile_service.clone(),
+        llm_provider.clone(),
+        embedding_provider.clone(),
+        embedding_provider_name.clone(),
+        qdrant_repo.clone(),
+        memory_matcher,
+        structured_event_repo.clone(),
+    );
 
     // Create application state
     let app_state = AppState {
-        memory_guard: Arc::new(memory_guard),
+        memory_guard,
         retrieval_engine,
         lifecycle_manager,
+        event_ingestion_service,
         profile_service,
         llm_provider,
         embedding_provider,
         embedding_provider_name,
         qdrant_repo,
+        structured_event_repo,
     };
 
     // Create router with middleware

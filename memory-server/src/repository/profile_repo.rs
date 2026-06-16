@@ -1,7 +1,7 @@
 //! Profile Repository implementation
 //!
-//! Provides CRUD operations for SystemProfile entity with PostgreSQL.
-//! SystemProfile is a singleton - only one profile can exist per system instance.
+//! Provides CRUD operations for SystemProfile entities with PostgreSQL.
+//! Each SystemProfile is a business-system namespace for memories and events.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -22,9 +22,7 @@ impl ProfileRepository {
         Self { pool }
     }
 
-    /// Create a new system profile
-    ///
-    /// Returns an error if a profile already exists.
+    /// Create a new system profile namespace.
     pub async fn create(&self, profile: &SystemProfile) -> AppResult<SystemProfile> {
         let row = sqlx::query_as::<_, ProfileRow>(
             r#"
@@ -55,7 +53,7 @@ impl ProfileRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            // Check for unique constraint violation (singleton)
+            // Check for unique constraint violation on the human-readable system name.
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.constraint() == Some("idx_system_profiles_name") {
                     return AppError::Validation(
@@ -69,9 +67,10 @@ impl ProfileRepository {
         Ok(row.into())
     }
 
-    /// Get the system profile (singleton)
+    /// Get the first system profile.
     ///
-    /// Returns None if no profile exists.
+    /// Prefer `get_by_id` when handling memory/event data so system namespace
+    /// boundaries stay explicit.
     pub async fn get(&self) -> AppResult<Option<SystemProfile>> {
         let row = sqlx::query_as::<_, ProfileRow>(
             r#"
@@ -87,6 +86,64 @@ impl ProfileRepository {
         .await?;
 
         Ok(row.map(Into::into))
+    }
+
+    /// Get a system profile by ID.
+    pub async fn get_by_id(&self, id: Uuid) -> AppResult<Option<SystemProfile>> {
+        let row = sqlx::query_as::<_, ProfileRow>(
+            r#"
+            SELECT
+                id, name, description, purpose, domain, target_audience,
+                event_categories, memory_focus, boundaries, extraction_prompt,
+                created_at, updated_at
+            FROM system_profiles
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// Get a system profile by name.
+    pub async fn get_by_name(&self, name: &str) -> AppResult<Option<SystemProfile>> {
+        let row = sqlx::query_as::<_, ProfileRow>(
+            r#"
+            SELECT
+                id, name, description, purpose, domain, target_audience,
+                event_categories, memory_focus, boundaries, extraction_prompt,
+                created_at, updated_at
+            FROM system_profiles
+            WHERE name = $1
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// List all system profiles.
+    pub async fn list(&self) -> AppResult<Vec<SystemProfile>> {
+        let rows = sqlx::query_as::<_, ProfileRow>(
+            r#"
+            SELECT
+                id, name, description, purpose, domain, target_audience,
+                event_categories, memory_focus, boundaries, extraction_prompt,
+                created_at, updated_at
+            FROM system_profiles
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// Update the system profile
@@ -133,7 +190,10 @@ impl ProfileRepository {
         Ok(row.into())
     }
 
-    /// Check if a system profile exists
+    /// Check if any system profile exists.
+    ///
+    /// This is a convenience check for management flows. Namespace-aware code
+    /// should query by profile ID.
     pub async fn exists(&self) -> AppResult<bool> {
         let count = sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM system_profiles"#)
             .fetch_one(&self.pool)

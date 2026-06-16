@@ -1,10 +1,10 @@
 //! Memory CRUD API handlers
 //!
 //! Implements:
-//! - POST /api/v1/memories - Create a new memory
-//! - GET /api/v1/memories/{id} - Get a memory by ID
-//! - PUT /api/v1/memories/{id} - Update a memory (metadata only)
-//! - DELETE /api/v1/memories/{id} - Delete (archive) a memory
+//! - POST /api/v1/systems/{profile_id}/memories - Create a new memory
+//! - GET /api/v1/systems/{profile_id}/memories/{id} - Get a memory by ID
+//! - PUT /api/v1/systems/{profile_id}/memories/{id} - Update a memory
+//! - DELETE /api/v1/systems/{profile_id}/memories/{id} - Archive a memory
 //!
 //! New architecture:
 //! - Removed layer, scope_type, scene, ttl_seconds, expires_at, event_source, event_time
@@ -32,11 +32,10 @@ use crate::service::UpdateMemoryRequest;
 /// Request body for creating a new memory
 ///
 /// This endpoint is for direct memory creation where the user provides all fields.
-/// For LLM-assisted memory extraction from events, use POST /api/v1/events instead.
+/// For LLM-assisted memory extraction from events, use POST
+/// /api/v1/systems/{profile_id}/events instead.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateMemoryApiRequest {
-    /// System profile ID - which business system this memory belongs to
-    pub profile_id: Uuid,
     /// Owner ID - the unique identifier of the memory owner
     pub owner_id: String,
     /// Scope identifier (null = global memory)
@@ -58,19 +57,19 @@ pub struct CreateMemoryApiRequest {
     pub embedding_provider: Option<String>,
 }
 
-impl From<CreateMemoryApiRequest> for CreateMemoryInput {
-    fn from(req: CreateMemoryApiRequest) -> Self {
+impl CreateMemoryApiRequest {
+    fn into_domain_input(self, profile_id: Uuid) -> CreateMemoryInput {
         CreateMemoryInput {
-            profile_id: req.profile_id,
-            owner_id: req.owner_id,
-            scope_id: req.scope_id,
-            content: req.content,
-            category: req.category,
-            tags: req.tags,
-            importance: req.importance,
-            confidence: req.confidence,
-            is_global: req.is_global,
-            embedding_provider: req.embedding_provider,
+            profile_id,
+            owner_id: self.owner_id,
+            scope_id: self.scope_id,
+            content: self.content,
+            category: self.category,
+            tags: self.tags,
+            importance: self.importance,
+            confidence: self.confidence,
+            is_global: self.is_global,
+            embedding_provider: self.embedding_provider,
             // Direct creation never uses LLM processing
             process_with_llm: false,
             llm_provider: None,
@@ -114,6 +113,8 @@ pub struct GetMemoryResponse {
     pub is_global: bool,
     pub hit_count: i64,
     pub last_hit_at: Option<DateTime<Utc>>,
+    pub reinforcement_count: i64,
+    pub last_reinforced_at: Option<DateTime<Utc>>,
     pub decay_score: f32,
     // Source
     pub source_event_id: Option<Uuid>,
@@ -124,6 +125,9 @@ pub struct GetMemoryResponse {
     pub embedding_provider: Option<String>,
     pub processing_status: ProcessingStatus,
     pub llm_provider: Option<String>,
+    // Inference / reconciliation metadata
+    pub conflict_reason: Option<String>,
+    pub consistency_confidence: Option<f32>,
     // Timestamps
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -148,6 +152,8 @@ impl From<Memory> for GetMemoryResponse {
             is_global: m.is_global,
             hit_count: m.hit_count,
             last_hit_at: m.last_hit_at,
+            reinforcement_count: m.reinforcement_count,
+            last_reinforced_at: m.last_reinforced_at,
             decay_score: m.decay_score,
             source_event_id: m.source_event_id,
             status: m.status,
@@ -155,6 +161,8 @@ impl From<Memory> for GetMemoryResponse {
             embedding_provider: m.embedding_provider,
             processing_status: m.processing_status,
             llm_provider: m.llm_provider,
+            conflict_reason: m.conflict_reason,
+            consistency_confidence: m.consistency_confidence,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
@@ -266,15 +274,18 @@ pub fn memory_routes() -> Router<AppState> {
         .route("/{id}/promote", post(promote_memory))
 }
 
-/// POST /api/v1/memories - Create a new memory
+/// POST /api/v1/systems/{profile_id}/memories - Create a new memory
 ///
 /// Creates a new memory with the specified parameters.
 /// If an embedding provider is configured, the memory content will be embedded
 /// and stored in the vector database for semantic search.
 #[utoipa::path(
     post,
-    path = "/api/v1/memories",
+    path = "/api/v1/systems/{profile_id}/memories",
     tag = "memories",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID")
+    ),
     request_body = CreateMemoryApiRequest,
     responses(
         (status = 201, description = "Memory created successfully", body = CreateMemoryResponse),
@@ -284,15 +295,18 @@ pub fn memory_routes() -> Router<AppState> {
 )]
 pub async fn create_memory(
     State(state): State<AppState>,
+    Path(profile_id): Path<Uuid>,
     Json(request): Json<CreateMemoryApiRequest>,
 ) -> AppResult<(StatusCode, Json<CreateMemoryResponse>)> {
     use crate::repository::VectorPayload;
 
-    let input: CreateMemoryInput = request.into();
+    let input = request.into_domain_input(profile_id);
 
     let mut memory = state.memory_guard.create_memory(input, None).await?;
 
     let payload = VectorPayload {
+        profile_id: memory.profile_id,
+        owner_id: memory.owner_id.clone(),
         memory_id: memory.id,
         scope_id: memory.scope_id.clone(),
         category: memory.category.clone(),
@@ -373,14 +387,15 @@ pub async fn create_memory(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// GET /api/v1/memories/{id} - Get a memory by ID
+/// GET /api/v1/systems/{profile_id}/memories/{id} - Get a memory by ID
 ///
 /// Returns the complete memory record including all metadata.
 #[utoipa::path(
     get,
-    path = "/api/v1/memories/{id}",
+    path = "/api/v1/systems/{profile_id}/memories/{id}",
     tag = "memories",
     params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
         ("id" = Uuid, Path, description = "Memory ID")
     ),
     responses(
@@ -390,21 +405,23 @@ pub async fn create_memory(
 )]
 pub async fn get_memory(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<GetMemoryResponse>> {
     let memory = state.memory_guard.get_memory(id).await?;
+    ensure_memory_profile(&memory, profile_id)?;
     Ok(Json(GetMemoryResponse::from(memory)))
 }
 
-/// PUT /api/v1/memories/{id} - Update a memory (metadata only)
+/// PUT /api/v1/systems/{profile_id}/memories/{id} - Update a memory (metadata only)
 ///
 /// Updates memory metadata. Content is immutable in the new architecture.
 /// To change content, create a new version via event processing.
 #[utoipa::path(
     put,
-    path = "/api/v1/memories/{id}",
+    path = "/api/v1/systems/{profile_id}/memories/{id}",
     tag = "memories",
     params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
         ("id" = Uuid, Path, description = "Memory ID")
     ),
     request_body = UpdateMemoryApiRequest,
@@ -416,10 +433,13 @@ pub async fn get_memory(
 )]
 pub async fn update_memory(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateMemoryApiRequest>,
 ) -> AppResult<Json<GetMemoryResponse>> {
     let update_request: UpdateMemoryRequest = request.into();
+
+    let existing = state.memory_guard.get_memory(id).await?;
+    ensure_memory_profile(&existing, profile_id)?;
 
     let memory = state
         .memory_guard
@@ -428,15 +448,16 @@ pub async fn update_memory(
     Ok(Json(GetMemoryResponse::from(memory)))
 }
 
-/// DELETE /api/v1/memories/{id} - Delete (archive) a memory
+/// DELETE /api/v1/systems/{profile_id}/memories/{id} - Delete (archive) a memory
 ///
 /// Performs soft delete by setting status to 'archived'.
 /// Content is preserved for audit purposes.
 #[utoipa::path(
     delete,
-    path = "/api/v1/memories/{id}",
+    path = "/api/v1/systems/{profile_id}/memories/{id}",
     tag = "memories",
     params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
         ("id" = Uuid, Path, description = "Memory ID")
     ),
     responses(
@@ -446,21 +467,25 @@ pub async fn update_memory(
 )]
 pub async fn delete_memory(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<GetMemoryResponse>> {
+    let existing = state.memory_guard.get_memory(id).await?;
+    ensure_memory_profile(&existing, profile_id)?;
+
     let memory = state.memory_guard.delete_memory(id, None).await?;
     Ok(Json(GetMemoryResponse::from(memory)))
 }
 
-/// GET /api/v1/memories/{id}/history - Get memory version history
+/// GET /api/v1/systems/{profile_id}/memories/{id}/history - Get memory version history
 ///
 /// Returns the complete version history of a memory, including all versions
 /// and their associated source events.
 #[utoipa::path(
     get,
-    path = "/api/v1/memories/{id}/history",
+    path = "/api/v1/systems/{profile_id}/memories/{id}/history",
     tag = "memories",
     params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
         ("id" = Uuid, Path, description = "Memory ID (any version in the chain)")
     ),
     responses(
@@ -470,10 +495,11 @@ pub async fn delete_memory(
 )]
 pub async fn get_memory_history(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<MemoryHistoryResponse>> {
     // Get the memory to find its root_memory_id
     let memory = state.memory_guard.get_memory(id).await?;
+    ensure_memory_profile(&memory, profile_id)?;
     let root_id = memory.root_memory_id.unwrap_or(memory.id);
 
     // Get all versions in the chain
@@ -528,15 +554,16 @@ pub async fn get_memory_history(
     Ok(Json(response))
 }
 
-/// POST /api/v1/memories/{id}/promote - Promote memory to global status
+/// POST /api/v1/systems/{profile_id}/memories/{id}/promote - Promote memory to global status
 ///
 /// Manually promotes a memory to global status, making it accessible
 /// across all scopes for the same owner.
 #[utoipa::path(
     post,
-    path = "/api/v1/memories/{id}/promote",
+    path = "/api/v1/systems/{profile_id}/memories/{id}/promote",
     tag = "memories",
     params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
         ("id" = Uuid, Path, description = "Memory ID")
     ),
     request_body = PromoteMemoryRequest,
@@ -548,11 +575,12 @@ pub async fn get_memory_history(
 )]
 pub async fn promote_memory(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
     Json(request): Json<PromoteMemoryRequest>,
 ) -> AppResult<Json<PromoteMemoryResponse>> {
     // Get the memory first to check if it's already global
     let memory = state.memory_guard.get_memory(id).await?;
+    ensure_memory_profile(&memory, profile_id)?;
     let was_already_global = memory.is_global;
 
     if was_already_global {
@@ -580,14 +608,24 @@ pub async fn promote_memory(
     Ok(Json(response))
 }
 
+fn ensure_memory_profile(memory: &Memory, profile_id: Uuid) -> AppResult<()> {
+    if memory.profile_id != profile_id {
+        return Err(crate::error::AppError::Validation(
+            "memory does not belong to the requested system profile".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_create_memory_request_conversion() {
+        let profile_id = Uuid::new_v4();
         let api_request = CreateMemoryApiRequest {
-            profile_id: Uuid::new_v4(),
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test content".to_string(),
@@ -599,8 +637,9 @@ mod tests {
             embedding_provider: Some("openai".to_string()),
         };
 
-        let input: CreateMemoryInput = api_request.clone().into();
+        let input = api_request.clone().into_domain_input(profile_id);
 
+        assert_eq!(input.profile_id, profile_id);
         assert_eq!(input.owner_id, api_request.owner_id);
         assert_eq!(input.scope_id, api_request.scope_id);
         assert_eq!(input.content, api_request.content);
@@ -648,6 +687,8 @@ mod tests {
             is_global: false,
             hit_count: 5,
             last_hit_at: Some(Utc::now()),
+            reinforcement_count: 2,
+            last_reinforced_at: Some(Utc::now()),
             decay_score: 0.8,
             source_event_id: None,
             status: Status::Active,
@@ -658,6 +699,8 @@ mod tests {
             inference_type: None,
             inference_confidence: None,
             inference_reasoning: None,
+            conflict_reason: Some("conflict reason".to_string()),
+            consistency_confidence: Some(0.87),
             promoted_at: None,
             promotion_reason: None,
             created_at: Utc::now(),
@@ -679,7 +722,14 @@ mod tests {
         assert_eq!(response.is_current_version, memory.is_current_version);
         assert_eq!(response.is_global, memory.is_global);
         assert_eq!(response.hit_count, memory.hit_count);
+        assert_eq!(response.reinforcement_count, memory.reinforcement_count);
+        assert_eq!(response.last_reinforced_at, memory.last_reinforced_at);
         assert_eq!(response.decay_score, memory.decay_score);
+        assert_eq!(response.conflict_reason, memory.conflict_reason);
+        assert_eq!(
+            response.consistency_confidence,
+            memory.consistency_confidence
+        );
         assert_eq!(response.status, memory.status);
         assert_eq!(response.embedding_status, memory.embedding_status);
         assert_eq!(response.processing_status, memory.processing_status);
@@ -688,7 +738,6 @@ mod tests {
     #[test]
     fn test_create_memory_request_minimal() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Test content"
         }"#;
@@ -708,7 +757,6 @@ mod tests {
     #[test]
     fn test_create_memory_request_global() {
         let json = r#"{
-            "profile_id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "owner123",
             "content": "Global memory content",
             "is_global": true

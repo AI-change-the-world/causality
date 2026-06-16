@@ -1,10 +1,14 @@
 //! Admin API handlers
 //!
 //! Implements:
-//! - POST /api/v1/admin/eviction - Trigger eviction process
-//! - POST /api/v1/admin/decay-update - Update decay scores
+//! - POST /api/v1/systems/{profile_id}/admin/eviction - Trigger eviction
+//! - POST /api/v1/systems/{profile_id}/admin/decay-update - Update decay scores
 
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::post,
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -20,23 +24,6 @@ pub struct EvictionRequest {
     /// Whether to perform a dry run (preview only, no changes)
     #[serde(default)]
     pub dry_run: bool,
-    /// Custom eviction configuration (optional, uses defaults if not specified)
-    pub config: Option<EvictionConfigRequest>,
-}
-
-/// Custom eviction configuration
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct EvictionConfigRequest {
-    /// Days without hit before transitioning to Cooldown
-    pub cooldown_threshold_days: Option<i64>,
-    /// Days without hit before transitioning to Candidate
-    pub candidate_threshold_days: Option<i64>,
-    /// Days without hit before archiving
-    pub archive_threshold_days: Option<i64>,
-    /// Maximum number of active memories per owner
-    pub max_memories_per_owner: Option<i64>,
-    /// Decay score threshold below which memories become candidates
-    pub decay_score_threshold: Option<f32>,
 }
 
 /// Response for eviction operation
@@ -125,14 +112,17 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/decay-update", post(update_decay_scores))
 }
 
-/// POST /api/v1/admin/eviction - Trigger eviction process
+/// POST /api/v1/systems/{profile_id}/admin/eviction - Trigger eviction process
 ///
 /// Runs the eviction process to transition stale memories through
 /// the lifecycle states: Active → Cooldown → Candidate → Archived.
 #[utoipa::path(
     post,
-    path = "/api/v1/admin/eviction",
+    path = "/api/v1/systems/{profile_id}/admin/eviction",
     tag = "admin",
+    params(
+        ("profile_id" = uuid::Uuid, Path, description = "System profile ID")
+    ),
     request_body = EvictionRequest,
     responses(
         (status = 200, description = "Eviction completed", body = EvictionResponse),
@@ -142,6 +132,7 @@ pub fn admin_routes() -> Router<AppState> {
 )]
 pub async fn run_eviction(
     State(state): State<AppState>,
+    Path(profile_id): Path<uuid::Uuid>,
     Json(request): Json<EvictionRequest>,
 ) -> AppResult<Json<EvictionResponse>> {
     // For now, we require an owner_id
@@ -153,7 +144,7 @@ pub async fn run_eviction(
         // Dry run: just get candidates without making changes
         let candidates = state
             .lifecycle_manager
-            .get_eviction_candidates(&owner_id, 100)
+            .get_eviction_candidates(profile_id, &owner_id, 100)
             .await?;
 
         let response = EvictionResponse {
@@ -178,19 +169,25 @@ pub async fn run_eviction(
     }
 
     // Run actual eviction
-    let result = state.lifecycle_manager.run_eviction(&owner_id).await?;
+    let result = state
+        .lifecycle_manager
+        .run_eviction(profile_id, &owner_id)
+        .await?;
 
     Ok(Json(EvictionResponse::from(result)))
 }
 
-/// POST /api/v1/admin/decay-update - Update decay scores
+/// POST /api/v1/systems/{profile_id}/admin/decay-update - Update decay scores
 ///
 /// Recalculates decay scores for all memories of an owner based on
 /// hit count and time since last activity.
 #[utoipa::path(
     post,
-    path = "/api/v1/admin/decay-update",
+    path = "/api/v1/systems/{profile_id}/admin/decay-update",
     tag = "admin",
+    params(
+        ("profile_id" = uuid::Uuid, Path, description = "System profile ID")
+    ),
     request_body = DecayUpdateRequest,
     responses(
         (status = 200, description = "Decay scores updated", body = DecayUpdateResponse),
@@ -200,6 +197,7 @@ pub async fn run_eviction(
 )]
 pub async fn update_decay_scores(
     State(state): State<AppState>,
+    Path(profile_id): Path<uuid::Uuid>,
     Json(request): Json<DecayUpdateRequest>,
 ) -> AppResult<Json<DecayUpdateResponse>> {
     // For now, we require an owner_id
@@ -222,7 +220,7 @@ pub async fn update_decay_scores(
     // Update decay scores
     let updated_count = state
         .lifecycle_manager
-        .update_decay_scores(&owner_id, &config)
+        .update_decay_scores(profile_id, &owner_id, &config)
         .await?;
 
     let response = DecayUpdateResponse {
@@ -244,7 +242,6 @@ mod tests {
         let request: EvictionRequest = serde_json::from_str(json).unwrap();
         assert!(request.owner_id.is_none());
         assert!(!request.dry_run);
-        assert!(request.config.is_none());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::domain::{
 use crate::error::{AppError, AppResult};
 use crate::llm::{ChatRequest, LlmProvider};
 use crate::repository::ProfileRepository;
+use uuid::Uuid;
 
 /// Default prompt template for parsing system description into structured profile
 const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据用户提供的系统描述，提取以下结构化信息：
@@ -75,13 +76,6 @@ impl ProfileService {
         // Validate input
         ProfileValidation::validate_create(&input)?;
 
-        // Check if profile already exists
-        if self.repo.exists().await? {
-            return Err(AppError::Validation(
-                "System profile already exists. Use update instead.".to_string(),
-            ));
-        }
-
         // Parse description using LLM
         let parsed = self.parse_description(&input.description).await?;
 
@@ -96,7 +90,7 @@ impl ProfileService {
         Ok(created)
     }
 
-    /// Get the current system profile
+    /// Get the first system profile.
     ///
     /// # Returns
     /// * `Ok(SystemProfile)` - The current profile
@@ -109,7 +103,24 @@ impl ProfileService {
         })
     }
 
-    /// Update the system profile
+    /// Get a profile by ID.
+    pub async fn get_by_id(&self, profile_id: Uuid) -> AppResult<SystemProfile> {
+        self.repo.get_by_id(profile_id).await?.ok_or_else(|| {
+            AppError::Validation(format!("System profile not found: {}", profile_id))
+        })
+    }
+
+    /// List all system profiles.
+    pub async fn list(&self) -> AppResult<Vec<SystemProfile>> {
+        self.repo.list().await
+    }
+
+    /// Get a profile by name.
+    pub async fn get_by_name(&self, name: &str) -> AppResult<Option<SystemProfile>> {
+        self.repo.get_by_name(name).await
+    }
+
+    /// Update a specific system profile
     ///
     /// Supports two modes:
     /// 1. Partial update: Only updates provided fields
@@ -121,14 +132,18 @@ impl ProfileService {
     /// # Returns
     /// * `Ok(SystemProfile)` - The updated profile
     /// * `Err(AppError::Validation)` - If no profile exists or validation fails
-    pub async fn update(&self, input: UpdateProfileInput) -> AppResult<SystemProfile> {
+    pub async fn update(
+        &self,
+        profile_id: Uuid,
+        input: UpdateProfileInput,
+    ) -> AppResult<SystemProfile> {
         debug!(reparse = input.reparse, "Updating system profile");
 
         // Validate input
         ProfileValidation::validate_update(&input)?;
 
         // Get existing profile
-        let mut profile = self.get().await?;
+        let mut profile = self.get_by_id(profile_id).await?;
 
         // Handle re-parse mode
         if input.reparse {

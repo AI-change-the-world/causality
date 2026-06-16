@@ -25,7 +25,7 @@ CREATE TYPE memory_category AS ENUM ('user_preference', 'behavior_pattern', 'bus
 CREATE TYPE event_memory_relation_type AS ENUM ('created_from', 'reinforced_by');
 
 -- ============================================================================
--- SYSTEM PROFILE TABLE (Multi-tenant) - Must be created first for FK references
+-- SYSTEM PROFILE TABLE (Business-system namespace) - Must be created first for FK references
 -- ============================================================================
 
 CREATE TABLE system_profiles (
@@ -44,8 +44,8 @@ CREATE TABLE system_profiles (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Index for profile name lookup
-CREATE INDEX idx_system_profiles_name ON system_profiles(name);
+-- System names are business-facing namespace identifiers.
+CREATE UNIQUE INDEX idx_system_profiles_name ON system_profiles(name);
 
 -- ============================================================================
 -- EVENTS TABLE (Immutable)
@@ -60,13 +60,30 @@ CREATE TABLE events (
     content TEXT NOT NULL,
     context TEXT,
     summary TEXT,
-    source VARCHAR(50),  -- 'user_created' | 'api' | etc.
-    -- Processing status
-    processed BOOLEAN NOT NULL DEFAULT false,
+    source VARCHAR(50),  -- 'conversation' | 'user_action' | 'system_event' | 'manual' | 'api'
+    -- Processing result
+    processing_status processing_status NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    processed_at TIMESTAMPTZ,
+    skipped BOOLEAN NOT NULL DEFAULT false,
+    skip_reason TEXT,
+    relevance_score REAL,
     -- Timestamps
     event_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE events
+    ADD CONSTRAINT chk_events_source
+    CHECK (
+        source IS NULL OR source IN (
+            'conversation',
+            'user_action',
+            'system_event',
+            'manual',
+            'api'
+        )
+    );
 
 -- ============================================================================
 -- MEMORIES TABLE (Content Immutable, Metadata Mutable)
@@ -96,6 +113,8 @@ CREATE TABLE memories (
     is_global BOOLEAN NOT NULL DEFAULT false,
     hit_count BIGINT NOT NULL DEFAULT 0,
     last_hit_at TIMESTAMPTZ,
+    reinforcement_count BIGINT NOT NULL DEFAULT 0,
+    last_reinforced_at TIMESTAMPTZ,
     decay_score REAL NOT NULL DEFAULT 1.0,
     
     -- Source tracking
@@ -117,6 +136,8 @@ CREATE TABLE memories (
     inference_type VARCHAR(50),
     inference_confidence REAL,
     inference_reasoning TEXT,
+    conflict_reason TEXT,
+    consistency_confidence REAL,
     
     -- Promotion tracking
     promoted_at TIMESTAMPTZ,
@@ -180,6 +201,7 @@ CREATE INDEX idx_structured_events_actor ON structured_events(actor_element);
 
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_id UUID NOT NULL REFERENCES system_profiles(id),
     memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     operation VARCHAR(50) NOT NULL,
     actor_id VARCHAR(255),
@@ -207,7 +229,9 @@ CREATE INDEX idx_events_profile ON events(profile_id);
 CREATE INDEX idx_events_profile_owner ON events(profile_id, owner_id);
 CREATE INDEX idx_events_owner ON events(owner_id);
 CREATE INDEX idx_events_owner_scope ON events(owner_id, scope_id);
-CREATE INDEX idx_events_processed ON events(processed) WHERE processed = false;
+CREATE INDEX idx_events_processing_pending ON events(processing_status) WHERE processing_status = 'pending';
+CREATE INDEX idx_events_processing_status ON events(processing_status);
+CREATE INDEX idx_events_skipped ON events(skipped) WHERE skipped = true;
 CREATE INDEX idx_events_event_time ON events(event_time);
 CREATE INDEX idx_events_created_at ON events(created_at);
 
@@ -236,6 +260,7 @@ CREATE INDEX idx_memories_category ON memories(category);
 -- Lifecycle indexes
 CREATE INDEX idx_memories_decay_score ON memories(decay_score);
 CREATE INDEX idx_memories_last_hit_at ON memories(last_hit_at);
+CREATE INDEX idx_memories_last_reinforced_at ON memories(last_reinforced_at);
 CREATE INDEX idx_memories_promoted_at ON memories(promoted_at) WHERE promoted_at IS NOT NULL;
 
 -- Processing indexes
@@ -261,6 +286,7 @@ CREATE INDEX idx_emr_type ON event_memory_relations(relation_type);
 -- ============================================================================
 
 CREATE INDEX idx_audit_logs_memory_id ON audit_logs(memory_id);
+CREATE INDEX idx_audit_logs_profile ON audit_logs(profile_id);
 CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX idx_audit_logs_operation ON audit_logs(operation);
 

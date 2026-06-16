@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub embedding: EmbeddingConfig,
     pub lifecycle: LifecycleConfig,
     pub retrieval: RetrievalConfig,
+    pub matching: MatchingConfig,
     pub audit: AuditConfig,
 }
 
@@ -312,6 +313,42 @@ impl Default for RetrievalConfig {
     }
 }
 
+/// Event-to-memory matching configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MatchingConfig {
+    /// Minimum vector similarity for an extracted memory to match an existing memory.
+    #[serde(default = "default_match_similarity_threshold")]
+    pub match_similarity_threshold: f32,
+    /// Similarity threshold for candidate conflicts. Reserved for richer conflict checks.
+    #[serde(default = "default_conflict_check_similarity_threshold")]
+    pub conflict_check_similarity_threshold: f32,
+    /// Maximum vector candidates to consider during reconciliation.
+    #[serde(default = "default_max_match_candidates")]
+    pub max_match_candidates: usize,
+}
+
+fn default_match_similarity_threshold() -> f32 {
+    0.70
+}
+
+fn default_conflict_check_similarity_threshold() -> f32 {
+    0.70
+}
+
+fn default_max_match_candidates() -> usize {
+    10
+}
+
+impl Default for MatchingConfig {
+    fn default() -> Self {
+        Self {
+            match_similarity_threshold: default_match_similarity_threshold(),
+            conflict_check_similarity_threshold: default_conflict_check_similarity_threshold(),
+            max_match_candidates: default_max_match_candidates(),
+        }
+    }
+}
+
 /// Audit logging configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditConfig {
@@ -360,6 +397,9 @@ impl AppConfig {
             .set_default("retrieval.default_top_k", 10)?
             .set_default("retrieval.max_top_k", 100)?
             .set_default("retrieval.cooldown_penalty", 0.5)?
+            .set_default("matching.match_similarity_threshold", 0.70)?
+            .set_default("matching.conflict_check_similarity_threshold", 0.70)?
+            .set_default("matching.max_match_candidates", 10)?
             .set_default("audit.enabled", true)?
             .set_default("audit.retention_days", 90)?
             // Load from YAML file if it exists
@@ -388,6 +428,9 @@ impl AppConfig {
             .set_default("retrieval.default_top_k", 10)?
             .set_default("retrieval.max_top_k", 100)?
             .set_default("retrieval.cooldown_penalty", 0.5)?
+            .set_default("matching.match_similarity_threshold", 0.70)?
+            .set_default("matching.conflict_check_similarity_threshold", 0.70)?
+            .set_default("matching.max_match_candidates", 10)?
             .set_default("audit.enabled", true)?
             .set_default("audit.retention_days", 90)?
             .add_source(File::with_name(path).required(true))

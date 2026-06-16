@@ -45,7 +45,7 @@ impl LifecycleManager {
     /// Finds all memories that haven't been hit within the cooldown threshold
     /// and transitions them to cooldown status.
     /// Returns the number of memories transitioned to cooldown.
-    pub async fn process_cooldown(&self) -> AppResult<usize> {
+    pub async fn process_cooldown(&self, profile_id: Uuid) -> AppResult<usize> {
         debug!("Processing cooldown candidates");
 
         // Use the eviction config threshold
@@ -53,7 +53,7 @@ impl LifecycleManager {
 
         let candidates = self
             .memory_repo
-            .find_cooldown_candidates(threshold_days)
+            .find_cooldown_candidates(Some(profile_id), threshold_days)
             .await?;
 
         let count = candidates.len();
@@ -124,6 +124,7 @@ impl LifecycleManager {
         if self.audit_enabled {
             self.audit_repo
                 .create(
+                    old_memory.profile_id,
                     memory_id,
                     AuditOperation::StatusChange,
                     actor_id,
@@ -195,10 +196,10 @@ impl LifecycleManager {
     ///
     /// Processes cooldown candidates.
     /// Returns the number of memories transitioned to cooldown.
-    pub async fn run_lifecycle_check(&self) -> AppResult<usize> {
+    pub async fn run_lifecycle_check(&self, profile_id: Uuid) -> AppResult<usize> {
         info!("Running lifecycle check");
 
-        let cooldown_count = self.process_cooldown().await?;
+        let cooldown_count = self.process_cooldown(profile_id).await?;
 
         info!(cooldown = cooldown_count, "Lifecycle check complete");
 
@@ -229,7 +230,7 @@ impl LifecycleManager {
     /// Check database health by performing a simple query
     pub async fn check_database_health(&self) -> AppResult<()> {
         // Try to find cooldown candidates - this will verify DB connectivity
-        let _ = self.memory_repo.find_cooldown_candidates(0).await?;
+        let _ = self.memory_repo.find_cooldown_candidates(None, 0).await?;
         Ok(())
     }
 
@@ -266,6 +267,7 @@ impl LifecycleManager {
         if self.audit_enabled {
             self.audit_repo
                 .create(
+                    old_memory.profile_id,
                     memory_id,
                     AuditOperation::StatusChange,
                     None,
@@ -295,19 +297,24 @@ impl LifecycleManager {
     /// Get eviction candidates for preview/dry-run
     pub async fn get_eviction_candidates(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         limit: usize,
     ) -> AppResult<Vec<Memory>> {
         // Get memories with low decay scores
         let candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, 0.5, limit as i64)
+            .find_eviction_candidates(profile_id, owner_id, 0.5, limit as i64)
             .await?;
         Ok(candidates)
     }
 
     /// Run the eviction process for an owner
-    pub async fn run_eviction(&self, owner_id: &str) -> AppResult<crate::service::EvictionResult> {
+    pub async fn run_eviction(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+    ) -> AppResult<crate::service::EvictionResult> {
         use crate::service::EvictionResult;
 
         let mut result = EvictionResult::empty();
@@ -316,7 +323,7 @@ impl LifecycleManager {
         let cooldown_threshold_days = self.config.eviction_config.cooldown_threshold_days;
         let cooldown_candidates = self
             .memory_repo
-            .find_cooldown_candidates(cooldown_threshold_days)
+            .find_cooldown_candidates(Some(profile_id), cooldown_threshold_days)
             .await?;
 
         for memory in cooldown_candidates
@@ -339,7 +346,7 @@ impl LifecycleManager {
         // Step 2: Find and transition Cooldown → Candidate (based on decay score)
         let candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, 0.1, 1000)
+            .find_eviction_candidates(profile_id, owner_id, 0.1, 1000)
             .await?;
 
         for memory in candidates
@@ -362,7 +369,7 @@ impl LifecycleManager {
         // Step 3: Archive Candidate memories
         let archive_candidates = self
             .memory_repo
-            .find_eviction_candidates(owner_id, 0.05, 1000)
+            .find_eviction_candidates(profile_id, owner_id, 0.05, 1000)
             .await?;
 
         for memory in archive_candidates
@@ -396,12 +403,14 @@ impl LifecycleManager {
     /// Update decay scores for an owner
     pub async fn update_decay_scores(
         &self,
+        profile_id: Uuid,
         owner_id: &str,
         config: &crate::service::DecayConfig,
     ) -> AppResult<usize> {
         let updated = self
             .memory_repo
             .update_decay_scores(
+                profile_id,
                 owner_id,
                 config.decay_half_life_days,
                 config.hit_boost_factor,
