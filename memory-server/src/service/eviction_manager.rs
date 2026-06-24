@@ -260,7 +260,7 @@ impl EvictionManager {
         // Get count of active memories
         let all_memories = self
             .memory_repo
-            .find_for_retrieval_by_profile(profile_id, owner_id, None, None, None, true)
+            .find_for_retrieval_by_profile(profile_id, owner_id, None, true)
             .await?;
 
         let active_count = all_memories.len() as i64;

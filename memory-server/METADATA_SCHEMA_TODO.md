@@ -2,278 +2,365 @@
 
 ## 背景
 
-当前系统在记忆覆盖、链路归并、历史偏好演变识别上，过度依赖向量相似度和自然语言内容本身。
+当前 memory server 的结构化能力分散在三处：
 
-这会导致几个核心问题：
+- `system_profiles` 提供文本化业务描述
+- `memories.category/tags` 提供弱结构化分类
+- `structured_events` 提供固定六要素事件解析
 
-1. 很难精准找到“之前相关的言论 / memory”
-2. 偏好变化、立场变化、技术路线变化不容易触发 supersede
-3. 多条历史记忆很难被一个新的阶段性结论统一收束
-4. 检索对业务侧不够可控，用户侧无法稳定参与 query planning
+这套设计在早期可用，但已经暴露出几个问题：
 
-因此需要引入一套 **profile 驱动的 metadata schema**，让 memory 的写入、检索、覆盖、链路归并都建立在可控的结构化语义之上。
+1. profile 只描述“系统是什么”，没有定义“记忆应该如何结构化”
+2. memory 只有 `category/tags`，无法支撑业务专属 metadata 检索和覆盖判断
+3. `structured_events` 采用固定列式 schema，不适合多业务系统扩展
+4. supersede / lineage / query planning 仍然过度依赖 embedding 和自然语言内容
 
----
+因此需要将系统升级为：
 
-## 核心目标
+> `profile schema -> event analysis payload -> memory metadata -> schema-aware retrieve/reconcile`
 
-### 1. 让 profile 不只是描述信息
+核心思路是：
 
-当前 profile 中的 `purpose`、`domain` 等字段，不应该只是文本说明。
-
-目标是让 profile 在初始化完成后，返回一份可供业务侧使用的 schema 定义，例如：
-
-- 有哪些实体类型
-- 哪些 metadata 字段是稳定可过滤的
-- 哪些字段是枚举值
-- 哪些字段会参与覆盖判断
-- 哪些字段会参与链路归并
-
-换句话说：
-
-> profile 应该定义 memory system 的结构化语义契约，而不是只定义一个 namespace。
+- profile 初始化时，由 LLM 产出一份结构化 `metadata_schema`
+- 业务侧确认并冻结 schema version
+- memory 写入和检索围绕 `metadata JSONB` 展开
+- 事件级分析保留，但改为 `analysis_payload JSONB`，不再保留固定六要素表
 
 ---
 
-## 需要设计的能力
+## 核心设计原则
 
-### 2. Profile 初始化返回 metadata schema
+### 1. Profile 不只是 namespace，而是语义契约
 
-初始化 profile 后，服务端应返回一份结构化 schema，供用户侧后续构建 memory 和 query。
+`profile_id` 仍然表示业务系统命名空间。
 
-建议至少包含：
+但初始化完成后，profile 还必须携带一份稳定的结构化语义契约：
 
-- `entity_types`
-- `filterable_fields`
-- `hierarchical_fields`
-- `enum_fields`
-- `time_fields`
-- `conflict_fields`
-- `lineage_group_fields`
-- `retrieval_defaults`
+- 有哪些 metadata 字段
+- 字段类型是什么
+- 哪些字段可过滤
+- 哪些字段参与 conflict candidate selection
+- 哪些字段参与 lineage grouping
+- 检索默认策略是什么
 
-示例方向：
+也就是说：
+
+> profile 定义的不只是“系统边界”，还定义“当前系统如何理解 memory metadata”。
+
+---
+
+### 2. Profile schema 必须是 proposal -> confirm -> version
+
+不能直接让 LLM 生成一份 schema 后立即长期生效。
+
+应分成两个阶段：
+
+1. `initialize profile`
+   返回 `metadata_schema_proposal`
+2. `confirm profile schema`
+   将 proposal 冻结为 `schema_version = 1`
+
+后续如需调整 schema，应升级版本，而不是直接覆盖旧版本。
+
+否则不同时间写入的 memories 会使用不同语义结构，导致检索、覆盖和 lineage 判断失稳。
+
+---
+
+### 3. Memory metadata 采用 JSONB，而不是继续堆固定字段
+
+当前 `memories.category` 和 `memories.tags` 应合并为：
+
+- `metadata JSONB`
+
+业务字段由当前 profile schema 决定，可多可少，不做全局硬编码。
+
+例如房产系统可能定义：
 
 ```json
 {
+  "memory_type": "house_preference",
+  "region": "浦东",
+  "budget_range": "500w-700w",
+  "layout": "3br",
+  "school_priority": true,
+  "time_scope": "current",
+  "polarity": "prefer"
+}
+```
+
+而另一个系统可以完全不是这套字段。
+
+---
+
+### 4. Event 分析结果也应采用 JSONB
+
+当前 `structured_events` 表以固定列承载六要素：
+
+- `time_element`
+- `location_element`
+- `actor_element`
+- `cause_element`
+- `process_element`
+- `result_element`
+- `background_element`
+- `details_element`
+
+这张表对“房产对话 / 电商行为 / CRM 跟进 / 工单处理”这种多系统形态不够通用。
+
+需要保留“事件级结构化分析”这个能力，但不保留当前固定列式表。
+
+建议升级为：
+
+- `events.analysis_payload JSONB`
+- `events.analysis_version`
+- `events.analysis_schema_version`
+
+注意：
+
+- event analysis payload 和 memory metadata 不是一回事
+- 一个 event 可能产出多条 memory
+- event payload 是事件理解层
+- memory metadata 是记忆语义层
+
+---
+
+## 数据模型目标
+
+### 5. SystemProfile 增加 schema 能力
+
+建议为 `system_profiles` 增加：
+
+- `metadata_schema JSONB`
+- `schema_status VARCHAR`
+  - `draft`
+  - `confirmed`
+- `schema_version INTEGER`
+- `schema_confirmed_at TIMESTAMPTZ`
+- `schema_generation_prompt TEXT`
+  - 可选，用于追踪 schema proposal 生成依据
+
+`metadata_schema` 建议结构：
+
+```json
+{
+  "version": 1,
   "entity_types": {
-    "preference": {
-      "subject": {
-        "type": "enum",
-        "values": ["programming_language", "framework", "work_style"]
+    "house_preference": {
+      "fields": {
+        "region": { "type": "string", "filterable": true },
+        "budget_range": { "type": "enum", "values": ["0-300w", "300w-500w", "500w-700w"] },
+        "time_scope": { "type": "enum", "values": ["past", "current"] },
+        "polarity": { "type": "enum", "values": ["prefer", "avoid", "neutral"] }
       },
-      "time_scope": {
-        "type": "enum",
-        "values": ["past", "current"]
-      },
-      "polarity": {
-        "type": "enum",
-        "values": ["like", "dislike", "neutral"]
-      },
-      "strength": {
-        "type": "float"
-      }
+      "candidate_match_fields": ["memory_type", "region"],
+      "conflict_fields": ["memory_type", "region", "time_scope"],
+      "lineage_group_fields": ["memory_type", "region"]
     }
+  },
+  "filterable_fields": ["memory_type", "region", "budget_range", "time_scope", "polarity"],
+  "retrieval_defaults": {
+    "use_vector": true,
+    "use_fulltext": true,
+    "collapse_lineage": true
   }
 }
 ```
 
 ---
 
-### 3. Memory 写入时允许附带 metadata
+### 6. Memories 采用 metadata JSONB
 
-除了自然语言 `content`，memory 写入时还应允许用户侧显式提供结构化 metadata。
+建议调整 `memories`：
 
-例如：
+- 删除：
+  - `category`
+  - `tags`
+- 新增：
+  - `metadata JSONB NOT NULL DEFAULT '{}'::jsonb`
+  - `schema_version INTEGER`
+  - `lineage_group_key VARCHAR(255)` 或后续再决定是否做派生字段
 
-- `entity_type = preference`
-- `subject = programming_language`
-- `object = rust`
-- `time_scope = current`
-- `polarity = like`
+说明：
 
-这样用户说：
-
-- 去年喜欢 C++
-- 去年喜欢 LangChain
-- 今年不喜欢了
-
-系统就不需要只靠 embedding 猜“是不是相关”，而是能先从 metadata 找出：
-
-- subject 接近
-- 同类 preference
-- 时间上可能被覆盖
+- `lineage_group_key` 可以是派生优化字段，不必要求业务侧显式写
+- `conflict_key` 也不建议做全局固定字段，更适合按 schema 动态计算
 
 ---
 
-### 4. Query 支持 where/filter schema
+### 7. Events 采用 analysis_payload JSONB
 
-需要定义一套稳定的结构化检索条件，而不是只有自然语言 query。
+建议调整 `events`：
 
-参考目标：
+- 新增：
+  - `analysis_payload JSONB`
+  - `analysis_status processing_status`
+  - `analysis_schema_version INTEGER`
+- 删除独立 `structured_events` 表
 
-```json
-{
-  "where": [
-    {
-      "subject": {
-        "in": ["programming_language", "framework"]
-      }
-    },
-    {
-      "time_scope": {
-        "eq": "current"
-      }
-    }
-  ]
-}
-```
+这样 profile 可以决定：
 
-建议支持：
+- 有的系统分析“六要素”
+- 有的系统分析“意图/对象/结果/风险”
+- 有的系统分析“会话摘要/用户状态/操作反馈”
+
+事件分析格式不应在数据库层写死。
+
+---
+
+## API 与职责边界
+
+### 8. Profile 初始化必须返回 schema proposal
+
+初始化 profile 不再只是返回：
+
+- purpose
+- domain
+- target_audience
+
+还必须返回：
+
+- `metadata_schema`
+- `schema_status`
+- `schema_version`
+
+建议流程：
+
+1. `POST /api/v1/systems`
+   返回 draft schema proposal
+2. `POST /api/v1/systems/{profile_id}/schema/confirm`
+   冻结 schema
+
+---
+
+### 9. 调用方负责 schema-aware query planning
+
+业务侧拿到 profile schema 后，应自行决定：
+
+- 如何构造 memory metadata
+- 如何构造 where/filter
+- 需要查询什么意图
+
+服务端不承担重型 query planner。
+
+服务端负责：
+
+- schema 存储
+- metadata 校验
+- memory 写入
+- retrieve / reconcile / lineage collapse
+
+调用方不直接检索 PG，而是调用 memory service 的 schema-aware API。
+
+---
+
+### 10. Retrieve API 支持 where/filter
+
+需要从当前的：
+
+- `query`
+- `category_prefix`
+- `tags`
+
+升级为：
+
+- `query`
+- `where`
+- `collapse_lineage`
+- `include_history`
+
+建议 where 语法支持：
 
 - `eq`
 - `neq`
 - `in`
 - `nin`
 - `exists`
-- `prefix`
 - `contains`
+- `prefix`
 - `gt/gte/lt/lte`
 - `and/or/not`
+
+并支持 JSONB 路径过滤。
 
 ---
 
 ## 覆盖与链路归并
 
-### 5. 覆盖候选不应只依赖向量相似度
+### 11. Supersede 候选先按 metadata 缩圈
 
-当前 supersede 触发路径是：
+当前路径是：
 
-1. 先向量命中候选
-2. 再做 consistency/conflict check
-3. 再决定 supersede
+1. 先向量召回
+2. 再 consistency check
+3. 再决定 reinforce / supersede
 
-问题是：
+未来应改为：
 
-- 同主题但表述不同的记忆，可能进不了候选集
-- 偏好变化、技术路线变化、阶段性结论变化都很容易漏掉
-
-目标改造：
-
-1. 先按 metadata 找“同主题候选集”
-2. 再结合 embedding / fulltext / LLM 做冲突判断
+1. 根据 profile schema 的 `candidate_match_fields` 找同主题候选
+2. 再结合 embedding / fulltext / LLM 做 rerank 和冲突判断
 3. 再决定 reinforce / supersede / merge
 
----
+这样能稳定处理：
 
-### 6. 去重升级为“链路归并”
-
-去重不应只是删掉重复结果。
-
-更合理的目标是：
-
-- 识别哪些 memory 属于同一演变主题
-- 将其归并到当前有效结论
-- 同时保留历史链路，用于解释和后续分析
-
-当前已经做了部分检索阶段的 lineage collapse，但还不够。
-
-后续需要补：
-
-1. 写入阶段的 lineage-aware merge
-2. 检索阶段的 schema-aware lineage collapse
-3. 历史解释层的 lineage 展示
+- 偏好变化
+- 立场变化
+- 路线变化
+- 阶段性总结覆盖多条旧结论
 
 ---
 
-### 7. 支持“多旧合一新”的覆盖模型
+### 12. 版本链模型后续升级为演变关系模型
 
-当前 schema 只能表达单链：
+当前仍保留：
 
-- `supersedes: Option<Uuid>`
-- `superseded_by: Option<Uuid>`
+- `supersedes`
+- `superseded_by`
 
-但真实业务会出现：
+作为 Phase 1 的兼容实现。
 
-- 多条旧 memory
-- 被一条新的阶段性结论统一覆盖 / 收束
+但目标不是长期停在单链，而是后续升级为：
 
-例如：
+- `memory_relations`
+- 支持 `supersedes_many`
+- 支持 `summarizes`
+- 支持 `supports`
+- 支持 `contradicts`
 
-- 去年喜欢 C++
-- 去年喜欢 LangChain
-- 今年转向另一种技术路线
-
-目标是支持：
-
-- 一个新 memory 覆盖多个旧 memory
-- 检索时默认返回当前结论
-- 历史链路保留被覆盖的旧结论集合
-
-这意味着后续需要从“版本链”升级为“记忆演变关系”。
+这样才能真正支撑“多旧合一新”。
 
 ---
 
-## 用户侧职责
+## 实施优先级
 
-### 8. Query Planning 放在业务侧
+### Phase 1：打底
 
-这个系统不应该承担重型 query planning。
+1. profile 增加 `metadata_schema/schema_status/schema_version`
+2. profile 初始化返回 schema proposal
+3. memory 增加 `metadata JSONB`
+4. event 增加 `analysis_payload JSONB`
+5. retrieve 增加基础 where/filter
 
-建议边界：
+### Phase 2：候选与冲突治理
 
-- 服务端负责：存储、更新、检索、反馈、链路归并
-- 用户侧负责：根据 profile schema 构建 metadata、生成 where/filter 条件、决定查询意图
+1. supersede 候选按 metadata 缩圈
+2. 冲突判断结合 metadata + semantic rerank
+3. lineage collapse 改成 schema-aware
 
-换句话说：
+### Phase 3：关系模型升级
 
-> 服务端做 memory engine，业务侧做 schema-aware query planner。
-
----
-
-### 9. Profile schema 返回后，用户侧需要有 SDK/文档
-
-如果 profile 真的返回 schema，用户侧必须知道怎么用。
-
-至少需要：
-
-1. memory 写入 payload 示例
-2. query where/filter 示例
-3. supersede / merge 相关 metadata 建议
-4. 常见 entity_type 设计参考
-
----
-
-## 实现优先级建议
-
-### Phase 1
-
-1. 给 profile 增加 metadata schema 定义能力
-2. profile 初始化返回 schema
-3. memory 写入支持 metadata 字段
-4. retrieve 支持 where/filter 基础语法
-
-### Phase 2
-
-1. 用 metadata 缩小 supersede 候选集
-2. 用 metadata + semantic rerank 做 conflict check
-3. 将“best match only”升级为“same-topic candidate set”
-
-### Phase 3
-
-1. 从单链 supersede 升级为记忆演变关系模型
+1. 从单链 supersede 升级为演变关系图
 2. 支持多旧合一新
-3. 支持更完整的 lineage collapse / explanation / analytics
+3. 支持 explanation / analytics / preference evolution
 
 ---
 
 ## 成功标准
 
-做到下面这些，才算这条路线真正跑通：
+做到下面这些，才算这条路线跑通：
 
-1. 用户侧可以根据 profile 返回的 schema 来构建 metadata
-2. 检索支持结构化 where/filter，而不只是 query string
-3. 偏好变化类场景可以稳定找到“之前相关的记忆”
-4. supersede 不再只依赖 embedding 相似度
-5. 检索默认返回当前有效结论，同时保留历史链路
-6. 后续可以对用户偏好变化、路线变化做分析，而不是只看孤立 memory
+1. profile 初始化会返回可冻结的 metadata schema proposal
+2. memory 写入可以携带 JSONB metadata，而不是只靠 category/tags
+3. retrieve 支持 where/filter，而不只是 query string
+4. supersede 候选不再只依赖 embedding 相似度
+5. event analysis 不再依赖固定六要素表结构
+6. 不同业务系统可以拥有完全不同的 metadata 结构，但共享同一 memory engine

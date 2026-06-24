@@ -8,7 +8,7 @@
 //!
 //! New architecture:
 //! - Removed layer, scope_type, scene, ttl_seconds, expires_at, event_source, event_time
-//! - Added category (hierarchical string), is_global
+//! - Metadata is stored as profile-defined JSON
 //! - Added version chain fields
 //! - Memory content is immutable after creation
 
@@ -20,6 +20,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -42,10 +43,11 @@ pub struct CreateMemoryApiRequest {
     pub scope_id: Option<String>,
     /// Memory content (Markdown format)
     pub content: String,
-    /// Hierarchical category (e.g., "work.code.eslint")
-    pub category: Option<String>,
-    /// Tags/keywords
-    pub tags: Option<Vec<String>>,
+    /// Structured metadata payload following the current profile schema
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    /// Schema version for the metadata payload
+    pub schema_version: Option<i32>,
     /// Importance score (0.0 - 1.0), defaults to 0.5
     pub importance: Option<f32>,
     /// Confidence score (0.0 - 1.0), defaults to 1.0
@@ -64,15 +66,12 @@ impl CreateMemoryApiRequest {
             owner_id: self.owner_id,
             scope_id: self.scope_id,
             content: self.content,
-            category: self.category,
-            tags: self.tags,
+            metadata: self.metadata,
+            schema_version: self.schema_version,
             importance: self.importance,
             confidence: self.confidence,
             is_global: self.is_global,
             embedding_provider: self.embedding_provider,
-            // Direct creation never uses LLM processing
-            process_with_llm: false,
-            llm_provider: None,
         }
     }
 }
@@ -88,8 +87,10 @@ pub struct CreateMemoryResponse {
     pub embedding_status: EmbeddingStatus,
     /// LLM processing status
     pub processing_status: ProcessingStatus,
-    /// Hierarchical category
-    pub category: Option<String>,
+    /// Structured metadata payload
+    pub metadata: Value,
+    /// Schema version used by the metadata payload
+    pub schema_version: i32,
 }
 
 /// Response for getting a memory
@@ -99,8 +100,8 @@ pub struct GetMemoryResponse {
     pub owner_id: String,
     pub scope_id: Option<String>,
     pub content: String,
-    pub category: Option<String>,
-    pub tags: Option<Vec<String>>,
+    pub metadata: Value,
+    pub schema_version: i32,
     pub importance: f32,
     pub confidence: f32,
     // Version chain
@@ -140,8 +141,8 @@ impl From<Memory> for GetMemoryResponse {
             owner_id: m.owner_id,
             scope_id: m.scope_id,
             content: m.content,
-            category: m.category,
-            tags: m.tags,
+            metadata: m.metadata.clone(),
+            schema_version: m.schema_version,
             importance: m.importance,
             confidence: m.confidence,
             root_memory_id: m.root_memory_id,
@@ -241,12 +242,10 @@ pub struct MemoryVersionResponse {
     pub is_current_version: bool,
     /// Memory content
     pub content: String,
-    /// Category
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
-    /// Tags
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
+    /// Structured metadata payload
+    pub metadata: Value,
+    /// Schema version used by the metadata payload
+    pub schema_version: i32,
     /// Importance score
     pub importance: f32,
     /// Confidence score
@@ -399,7 +398,8 @@ pub async fn create_memory(
         created_at: memory.created_at,
         embedding_status: memory.embedding_status,
         processing_status: memory.processing_status,
-        category: memory.category,
+        metadata: memory.metadata.clone(),
+        schema_version: memory.schema_version,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -531,7 +531,12 @@ pub async fn get_memory_history(
     let next_version_id =
         requested_index.and_then(|idx| history.versions.get(idx + 1).map(|next| next.id));
     let lineage_to_current: Vec<Uuid> = requested_index
-        .map(|idx| history.versions[idx..].iter().map(|version| version.id).collect())
+        .map(|idx| {
+            history.versions[idx..]
+                .iter()
+                .map(|version| version.id)
+                .collect()
+        })
         .unwrap_or_default();
     let hops_to_current = lineage_to_current.len().saturating_sub(1);
 
@@ -552,8 +557,8 @@ pub async fn get_memory_history(
             version_number: version.version_number,
             is_current_version: version.is_current_version,
             content: version.content,
-            category: version.category,
-            tags: version.tags,
+            metadata: version.metadata.clone(),
+            schema_version: version.schema_version,
             importance: version.importance,
             confidence: version.confidence,
             status: version.status,
@@ -727,7 +732,6 @@ pub(crate) fn vector_payload(memory: &Memory) -> crate::repository::VectorPayloa
         owner_id: memory.owner_id.clone(),
         memory_id: memory.id,
         scope_id: memory.scope_id.clone(),
-        category: memory.category.clone(),
         is_global: memory.is_global,
         status: memory.status.to_string(),
     }
@@ -744,8 +748,12 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test content".to_string(),
-            category: Some("work.code".to_string()),
-            tags: Some(vec!["tag1".to_string(), "tag2".to_string()]),
+            metadata: Some(serde_json::json!({
+                "memory_type": "engineering_note",
+                "topic": "work.code",
+                "keywords": ["tag1", "tag2"]
+            })),
+            schema_version: Some(1),
             importance: Some(0.8),
             confidence: Some(0.9),
             is_global: false,
@@ -758,15 +766,12 @@ mod tests {
         assert_eq!(input.owner_id, api_request.owner_id);
         assert_eq!(input.scope_id, api_request.scope_id);
         assert_eq!(input.content, api_request.content);
-        assert_eq!(input.category, api_request.category);
-        assert_eq!(input.tags, api_request.tags);
+        assert_eq!(input.metadata, api_request.metadata);
+        assert_eq!(input.schema_version, api_request.schema_version);
         assert_eq!(input.importance, api_request.importance);
         assert_eq!(input.confidence, api_request.confidence);
         assert_eq!(input.is_global, api_request.is_global);
         assert_eq!(input.embedding_provider, api_request.embedding_provider);
-        // Direct creation never uses LLM processing
-        assert!(!input.process_with_llm);
-        assert!(input.llm_provider.is_none());
     }
 
     #[test]
@@ -790,8 +795,12 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test memory content".to_string(),
-            category: Some("work.code".to_string()),
-            tags: Some(vec!["tag1".to_string(), "tag2".to_string()]),
+            metadata: serde_json::json!({
+                "memory_type": "engineering_note",
+                "topic": "work.code",
+                "keywords": ["tag1", "tag2"]
+            }),
+            schema_version: 2,
             importance: 0.75,
             confidence: 0.95,
             root_memory_id: None,
@@ -828,8 +837,8 @@ mod tests {
         assert_eq!(response.owner_id, memory.owner_id);
         assert_eq!(response.scope_id, memory.scope_id);
         assert_eq!(response.content, memory.content);
-        assert_eq!(response.category, memory.category);
-        assert_eq!(response.tags, memory.tags);
+        assert_eq!(response.metadata, memory.metadata);
+        assert_eq!(response.schema_version, memory.schema_version);
         assert_eq!(response.importance, memory.importance);
         assert_eq!(response.confidence, memory.confidence);
         assert_eq!(response.root_memory_id, memory.root_memory_id);
@@ -891,8 +900,11 @@ mod tests {
                 owner_id: "owner123".to_string(),
                 scope_id: Some("scope456".to_string()),
                 content: "current".to_string(),
-                category: Some("work.code".to_string()),
-                tags: None,
+                metadata: serde_json::json!({
+                    "memory_type": "engineering_note",
+                    "topic": "work.code"
+                }),
+                schema_version: 1,
                 importance: 0.8,
                 confidence: 0.9,
                 root_memory_id: Some(requested),
@@ -941,8 +953,8 @@ mod tests {
         assert_eq!(api_request.owner_id, "owner123");
         assert_eq!(api_request.content, "Test content");
         assert!(api_request.scope_id.is_none());
-        assert!(api_request.category.is_none());
-        assert!(api_request.tags.is_none());
+        assert!(api_request.metadata.is_none());
+        assert!(api_request.schema_version.is_none());
         assert!(api_request.importance.is_none());
         assert!(api_request.confidence.is_none());
         assert!(!api_request.is_global);

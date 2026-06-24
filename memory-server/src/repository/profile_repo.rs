@@ -4,10 +4,11 @@
 //! Each SystemProfile is a business-system namespace for memories and events.
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::domain::SystemProfile;
+use crate::domain::{SchemaStatus, SystemProfile};
 use crate::error::{AppError, AppResult};
 
 /// Repository for SystemProfile CRUD operations
@@ -29,13 +30,18 @@ impl ProfileRepository {
             INSERT INTO system_profiles (
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12, $13, $14, $15, $16, $17
+            )
             RETURNING
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             "#,
         )
         .bind(profile.id)
@@ -48,6 +54,11 @@ impl ProfileRepository {
         .bind(&profile.memory_focus)
         .bind(&profile.boundaries)
         .bind(&profile.extraction_prompt)
+        .bind(&profile.metadata_schema)
+        .bind(profile.schema_status.to_string())
+        .bind(profile.schema_version)
+        .bind(profile.schema_confirmed_at)
+        .bind(&profile.schema_generation_prompt)
         .bind(profile.created_at)
         .bind(profile.updated_at)
         .fetch_one(&self.pool)
@@ -77,7 +88,8 @@ impl ProfileRepository {
             SELECT
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             FROM system_profiles
             LIMIT 1
             "#,
@@ -95,7 +107,8 @@ impl ProfileRepository {
             SELECT
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             FROM system_profiles
             WHERE id = $1
             "#,
@@ -114,7 +127,8 @@ impl ProfileRepository {
             SELECT
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             FROM system_profiles
             WHERE name = $1
             ORDER BY created_at ASC
@@ -135,7 +149,8 @@ impl ProfileRepository {
             SELECT
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             FROM system_profiles
             ORDER BY created_at ASC
             "#,
@@ -162,12 +177,18 @@ impl ProfileRepository {
                 memory_focus = $8,
                 boundaries = $9,
                 extraction_prompt = $10,
-                updated_at = $11
+                metadata_schema = $11,
+                schema_status = $12,
+                schema_version = $13,
+                schema_confirmed_at = $14,
+                schema_generation_prompt = $15,
+                updated_at = $16
             WHERE id = $1
             RETURNING
                 id, name, description, purpose, domain, target_audience,
                 event_categories, memory_focus, boundaries, extraction_prompt,
-                created_at, updated_at
+                metadata_schema, schema_status, schema_version, schema_confirmed_at,
+                schema_generation_prompt, created_at, updated_at
             "#,
         )
         .bind(profile.id)
@@ -180,6 +201,11 @@ impl ProfileRepository {
         .bind(&profile.memory_focus)
         .bind(&profile.boundaries)
         .bind(&profile.extraction_prompt)
+        .bind(&profile.metadata_schema)
+        .bind(profile.schema_status.to_string())
+        .bind(profile.schema_version)
+        .bind(profile.schema_confirmed_at)
+        .bind(&profile.schema_generation_prompt)
         .bind(profile.updated_at)
         .fetch_optional(&self.pool)
         .await?
@@ -216,12 +242,22 @@ struct ProfileRow {
     memory_focus: Vec<String>,
     boundaries: Vec<String>,
     extraction_prompt: String,
+    metadata_schema: Value,
+    schema_status: String,
+    schema_version: i32,
+    schema_confirmed_at: Option<DateTime<Utc>>,
+    schema_generation_prompt: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
 impl From<ProfileRow> for SystemProfile {
     fn from(row: ProfileRow) -> Self {
+        let schema_status = match row.schema_status.as_str() {
+            "confirmed" => SchemaStatus::Confirmed,
+            _ => SchemaStatus::Draft,
+        };
+
         SystemProfile {
             id: row.id,
             name: row.name,
@@ -233,6 +269,11 @@ impl From<ProfileRow> for SystemProfile {
             memory_focus: row.memory_focus,
             boundaries: row.boundaries,
             extraction_prompt: row.extraction_prompt,
+            metadata_schema: row.metadata_schema,
+            schema_status,
+            schema_version: row.schema_version,
+            schema_confirmed_at: row.schema_confirmed_at,
+            schema_generation_prompt: row.schema_generation_prompt,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }

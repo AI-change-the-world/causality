@@ -5,6 +5,7 @@
 //! - Profile retrieval
 //! - Partial and full profile updates
 
+use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -17,7 +18,7 @@ use crate::repository::ProfileRepository;
 use uuid::Uuid;
 
 /// Default prompt template for parsing system description into structured profile
-const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据用户提供的系统描述，提取以下结构化信息：
+const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据用户提供的系统描述，为一个独立业务系统生成 profile 配置和 metadata schema proposal。
 
 用户描述：
 {description}
@@ -31,7 +32,29 @@ const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据
   "event_categories": ["可能的事件类型列表"],
   "memory_focus": ["需要关注的记忆类型"],
   "boundaries": ["系统不处理的内容"],
-  "extraction_prompt": "一段完整的 prompt，用于指导 LLM 将原始事件解析为六要素格式（时间、地点、人物、起因、经过、结果、背景、细节）。这个 prompt 应该针对该业务领域定制，包含具体的提取指导和示例。"
+  "extraction_prompt": "一段完整的 prompt，用于指导 LLM 将原始事件解析为该业务系统专属的 JSON 分析结果。输出应偏向 event analysis payload，而不是固定六要素。prompt 里要明确提取哪些事件字段、如何归纳意图、对象、状态变化、风险、结论等。",
+  "metadata_schema": {
+    "version": 1,
+    "entity_types": {
+      "example_entity": {
+        "description": "该类型 memory 的定义",
+        "fields": {
+          "memory_type": { "type": "string", "required": true, "filterable": true },
+          "example_field": { "type": "string", "required": false, "filterable": true }
+        },
+        "candidate_match_fields": ["memory_type"],
+        "conflict_fields": ["memory_type"],
+        "lineage_group_fields": ["memory_type"]
+      }
+    },
+    "filterable_fields": ["memory_type", "example_field"],
+    "retrieval_defaults": {
+      "use_vector": true,
+      "use_fulltext": true,
+      "collapse_lineage": true
+    }
+  },
+  "schema_generation_prompt": "一段完整 prompt，用于指导后续 LLM/调用方按照 metadata_schema 生成 memory metadata JSON。这个 prompt 必须清楚说明允许的字段、字段含义、必填字段、枚举范围、禁止杜撰未知字段。"
 }
 ```
 
@@ -39,7 +62,11 @@ const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据
 - event_categories 应该是该业务场景下常见的用户行为/事件类型
 - memory_focus 应该是对该业务有价值的用户信息类型
 - boundaries 应该明确系统的边界，避免功能发散
-- extraction_prompt 应该是一个完整的、可直接使用的 prompt 模板，包含该领域的具体提取指导"#;
+- extraction_prompt 应该是一个完整的、可直接使用的 prompt 模板，输出事件分析 JSON
+- metadata_schema 必须是业务专属的 schema proposal，不要使用固定通用字段凑数
+- metadata_schema 中的字段要以记忆检索、候选缩圈、冲突判断为目标
+- schema_generation_prompt 必须能直接指导下游生成符合 schema 的 metadata JSON
+- 不要输出 markdown，不要附加解释，只返回 JSON"#;
 
 /// Service for managing SystemProfile
 ///
@@ -169,6 +196,24 @@ impl ProfileService {
         Ok(updated)
     }
 
+    /// Confirm the current schema proposal for a profile.
+    pub async fn confirm_schema(&self, profile_id: Uuid) -> AppResult<SystemProfile> {
+        debug!(%profile_id, "Confirming profile schema");
+
+        let mut profile = self.get_by_id(profile_id).await?;
+        profile.confirm_schema();
+
+        let updated = self.repo.update(&profile).await?;
+        info!(
+            id = %updated.id,
+            schema_version = updated.schema_version,
+            confirmed_at = ?updated.schema_confirmed_at,
+            "Profile schema confirmed"
+        );
+
+        Ok(updated)
+    }
+
     /// Parse a natural language description into structured profile fields using LLM
     ///
     /// # Arguments
@@ -234,6 +279,12 @@ impl ProfileService {
             .unwrap_or("")
             .trim()
             .to_string();
+        let metadata_schema = parsed["metadata_schema"].clone();
+        let schema_generation_prompt = parsed["schema_generation_prompt"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         // Validate required fields
         if purpose.is_empty() {
@@ -248,6 +299,20 @@ impl ProfileService {
             ));
         }
 
+        if extraction_prompt.is_empty() {
+            return Err(AppError::Internal(
+                "LLM response missing required field: extraction_prompt".to_string(),
+            ));
+        }
+
+        Self::validate_metadata_schema(&metadata_schema)?;
+
+        if schema_generation_prompt.is_empty() {
+            return Err(AppError::Internal(
+                "LLM response missing required field: schema_generation_prompt".to_string(),
+            ));
+        }
+
         Ok(ParsedProfile {
             purpose,
             domain,
@@ -256,6 +321,8 @@ impl ProfileService {
             memory_focus,
             boundaries,
             extraction_prompt,
+            metadata_schema,
+            schema_generation_prompt,
         })
     }
 
@@ -318,6 +385,42 @@ impl ProfileService {
             })
             .unwrap_or_default()
     }
+
+    fn validate_metadata_schema(schema: &Value) -> AppResult<()> {
+        let schema_obj = schema.as_object().ok_or_else(|| {
+            AppError::Internal("LLM response metadata_schema must be a JSON object".to_string())
+        })?;
+
+        if !schema_obj.contains_key("entity_types") {
+            return Err(AppError::Internal(
+                "LLM response metadata_schema missing required field: entity_types".to_string(),
+            ));
+        }
+
+        if !schema_obj["entity_types"].is_object() {
+            return Err(AppError::Internal(
+                "LLM response metadata_schema.entity_types must be an object".to_string(),
+            ));
+        }
+
+        if !schema_obj.contains_key("filterable_fields")
+            || !schema_obj["filterable_fields"].is_array()
+        {
+            return Err(AppError::Internal(
+                "LLM response metadata_schema.filterable_fields must be an array".to_string(),
+            ));
+        }
+
+        if !schema_obj.contains_key("retrieval_defaults")
+            || !schema_obj["retrieval_defaults"].is_object()
+        {
+            return Err(AppError::Internal(
+                "LLM response metadata_schema.retrieval_defaults must be an object".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -334,7 +437,27 @@ mod tests {
   "event_categories": ["咨询", "看房"],
   "memory_focus": ["偏好"],
   "boundaries": ["租房"],
-  "extraction_prompt": "提取prompt"
+  "extraction_prompt": "提取prompt",
+  "metadata_schema": {
+    "version": 1,
+    "entity_types": {
+      "house_preference": {
+        "fields": {
+          "memory_type": { "type": "string", "required": true, "filterable": true }
+        },
+        "candidate_match_fields": ["memory_type"],
+        "conflict_fields": ["memory_type"],
+        "lineage_group_fields": ["memory_type"]
+      }
+    },
+    "filterable_fields": ["memory_type"],
+    "retrieval_defaults": {
+      "use_vector": true,
+      "use_fulltext": true,
+      "collapse_lineage": true
+    }
+  },
+  "schema_generation_prompt": "生成 memory metadata"
 }
 ```"#;
         let json = ProfileService::extract_json(response);
@@ -379,7 +502,28 @@ mod tests {
             "event_categories": ["咨询", "看房", "成交"],
             "memory_focus": ["购房偏好", "预算范围"],
             "boundaries": ["不处理租房"],
-            "extraction_prompt": "请将用户行为解析为结构化格式..."
+            "extraction_prompt": "请将用户行为解析为结构化格式...",
+            "metadata_schema": {
+                "version": 1,
+                "entity_types": {
+                    "house_preference": {
+                        "fields": {
+                            "memory_type": { "type": "string", "required": true, "filterable": true },
+                            "region": { "type": "string", "required": false, "filterable": true }
+                        },
+                        "candidate_match_fields": ["memory_type", "region"],
+                        "conflict_fields": ["memory_type", "region"],
+                        "lineage_group_fields": ["memory_type", "region"]
+                    }
+                },
+                "filterable_fields": ["memory_type", "region"],
+                "retrieval_defaults": {
+                    "use_vector": true,
+                    "use_fulltext": true,
+                    "collapse_lineage": true
+                }
+            },
+            "schema_generation_prompt": "请基于 house_preference schema 输出 metadata JSON"
         }"#;
 
         let result = ProfileService::parse_llm_response(response).unwrap();
@@ -391,13 +535,24 @@ mod tests {
         assert_eq!(result.memory_focus, vec!["购房偏好", "预算范围"]);
         assert_eq!(result.boundaries, vec!["不处理租房"]);
         assert!(!result.extraction_prompt.is_empty());
+        assert!(result.metadata_schema.is_object());
+        assert_eq!(
+            result.metadata_schema["entity_types"]["house_preference"]["fields"]["region"]["type"],
+            "string"
+        );
+        assert_eq!(
+            result.schema_generation_prompt,
+            "请基于 house_preference schema 输出 metadata JSON"
+        );
     }
 
     #[test]
     fn test_parse_llm_response_missing_purpose() {
         let response = r#"{
             "domain": "房地产",
-            "target_audience": "购房者"
+            "target_audience": "购房者",
+            "metadata_schema": {},
+            "schema_generation_prompt": "生成 metadata"
         }"#;
 
         let result = ProfileService::parse_llm_response(response);
@@ -408,7 +563,9 @@ mod tests {
     fn test_parse_llm_response_missing_domain() {
         let response = r#"{
             "purpose": "房产推荐",
-            "target_audience": "购房者"
+            "target_audience": "购房者",
+            "metadata_schema": {},
+            "schema_generation_prompt": "生成 metadata"
         }"#;
 
         let result = ProfileService::parse_llm_response(response);
@@ -425,13 +582,103 @@ mod tests {
     "event_categories": ["浏览", "购买"],
     "memory_focus": ["购物偏好"],
     "boundaries": ["B2B"],
-    "extraction_prompt": "提取prompt"
+    "extraction_prompt": "提取prompt",
+    "metadata_schema": {
+        "version": 1,
+        "entity_types": {
+            "product_preference": {
+                "fields": {
+                    "memory_type": { "type": "string", "required": true, "filterable": true }
+                },
+                "candidate_match_fields": ["memory_type"],
+                "conflict_fields": ["memory_type"],
+                "lineage_group_fields": ["memory_type"]
+            }
+        },
+        "filterable_fields": ["memory_type"],
+        "retrieval_defaults": {
+            "use_vector": true,
+            "use_fulltext": true,
+            "collapse_lineage": true
+        }
+    },
+    "schema_generation_prompt": "提取商品偏好 metadata"
 }
 ```"#;
 
         let result = ProfileService::parse_llm_response(response).unwrap();
         assert_eq!(result.purpose, "电商推荐");
         assert_eq!(result.domain, "电子商务");
+    }
+
+    #[test]
+    fn test_parse_llm_response_missing_metadata_schema() {
+        let response = r#"{
+            "purpose": "房产推荐",
+            "domain": "房地产",
+            "target_audience": "购房者",
+            "extraction_prompt": "提取prompt",
+            "schema_generation_prompt": "生成 metadata"
+        }"#;
+
+        let result = ProfileService::parse_llm_response(response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_llm_response_invalid_metadata_schema() {
+        let response = r#"{
+            "purpose": "房产推荐",
+            "domain": "房地产",
+            "target_audience": "购房者",
+            "extraction_prompt": "提取prompt",
+            "metadata_schema": {
+                "version": 1,
+                "entity_types": []
+            },
+            "schema_generation_prompt": "生成 metadata"
+        }"#;
+
+        let result = ProfileService::parse_llm_response(response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_confirm_schema_is_idempotent_on_entity() {
+        let mut profile = SystemProfile {
+            id: uuid::Uuid::new_v4(),
+            name: "system".to_string(),
+            description: "desc".to_string(),
+            purpose: "purpose".to_string(),
+            domain: "domain".to_string(),
+            target_audience: "audience".to_string(),
+            event_categories: vec![],
+            memory_focus: vec![],
+            boundaries: vec![],
+            extraction_prompt: "prompt".to_string(),
+            metadata_schema: serde_json::json!({
+                "version": 1,
+                "entity_types": {},
+                "filterable_fields": [],
+                "retrieval_defaults": {}
+            }),
+            schema_status: crate::domain::SchemaStatus::Confirmed,
+            schema_version: 3,
+            schema_confirmed_at: Some(Utc::now()),
+            schema_generation_prompt: Some("schema prompt".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let confirmed_at = profile.schema_confirmed_at;
+        profile.confirm_schema();
+
+        assert_eq!(
+            profile.schema_status,
+            crate::domain::SchemaStatus::Confirmed
+        );
+        assert_eq!(profile.schema_version, 3);
+        assert_eq!(profile.schema_confirmed_at, confirmed_at);
     }
 
     #[test]

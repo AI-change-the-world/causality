@@ -9,7 +9,6 @@ mod event_repo;
 mod memory_repo;
 mod profile_repo;
 mod qdrant_repo;
-mod structured_event_repo;
 
 pub use audit_repo::{AuditLogEntry, AuditOperation, AuditQueryParams, AuditRepository};
 pub use config_repo::ConfigRepository;
@@ -19,7 +18,6 @@ pub use profile_repo::ProfileRepository;
 pub use qdrant_repo::{
     MultiCollectionSearch, QdrantRepository, VectorFilter, VectorPayload, VectorSearchResult,
 };
-pub use structured_event_repo::StructuredEventRepository;
 
 // Re-export domain types that are commonly used with repositories
 pub use crate::domain::CreateMemoryFromEventInput;

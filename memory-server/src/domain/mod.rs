@@ -7,13 +7,11 @@
 //! - Added version chain support for Memory
 //! - Added LFU eviction support
 //! - Added SystemProfile for system configuration
-//! - Added StructuredEvent for six-element event model
 
 mod event;
 mod memory;
 mod profile;
 mod status;
-mod structured_event;
 
 pub use event::{
     CreateEventInput, CreateEventValidation, Event, EventMemoryRelation, EventMemoryRelationType,
@@ -24,11 +22,7 @@ pub use memory::{
     CreateSupersedingMemoryInput, Memory,
 };
 pub use profile::{
-    CreateProfileInput, ParsedProfile, ProfileValidation, SystemProfile, UpdateProfileInput,
-    MAX_NAME_LENGTH,
+    CreateProfileInput, ParsedProfile, ProfileValidation, SchemaStatus, SystemProfile,
+    UpdateProfileInput, MAX_NAME_LENGTH,
 };
-pub use status::{
-    EmbeddingStatus, ExtractedMemory, InferenceType, MemoryCategory, ProcessingMode,
-    ProcessingStatus, Status,
-};
-pub use structured_event::{CreateStructuredEventInput, ParsedStructuredEvent, StructuredEvent};
+pub use status::{EmbeddingStatus, InferenceType, ProcessingMode, ProcessingStatus, Status};

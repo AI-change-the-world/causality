@@ -20,7 +20,7 @@ mod retrieval_engine;
 pub use decay_calculator::{
     calculate_decay_score, calculate_decay_score_at_time, DecayCalculator, DecayConfig,
 };
-pub use event_handler::{EventHandler, RelevanceCheckResult};
+pub use event_handler::{EventAnalysis, EventHandler, RelevanceCheckResult};
 pub use event_ingestion::{EventIngestionResult, EventIngestionService};
 pub use eviction_manager::{EvictionConfig, EvictionManager, EvictionResult};
 pub use global_promoter::{GlobalPromoter, PromotionCheck, PromotionCriteria};
@@ -32,15 +32,15 @@ pub use memory_guard::{
 };
 pub use memory_matcher::{MatchResult, MatcherConfig, MemoryMatcher};
 pub use memory_processor::{
-    EnhancedQuery, ExtractFromEventRequest, ExtractFromEventResult, MemoryProcessor,
-    ProcessMemoryRequest, ProcessMemoryResult, ProcessingError,
+    EnhancedQuery, ExtractFromEventRequest, ExtractFromEventResult, ExtractedMemory,
+    MemoryProcessor, ProcessingError,
 };
 pub use memory_reconciler::{
     AlwaysConflictingChecker, AlwaysConsistentChecker, ConsistencyChecker, ConsistencyResult,
-    ExtractedMemory, LlmConsistencyChecker, MemoryReconciler, ReconcileOutcome, ReconcilerConfig,
+    LlmConsistencyChecker, MemoryReconciler, ReconcileOutcome, ReconcilerConfig,
 };
 pub use profile_service::ProfileService;
 pub use retrieval_engine::{
-    CategoryQuery, CurrentMemoryResolution, MemoryEvidence, MemoryHistory, RetrievalEngine,
-    RetrieveRequest, RetrieveResponse, RetrievedMemory,
+    CurrentMemoryResolution, MemoryEvidence, MemoryHistory, RetrievalEngine, RetrieveRequest,
+    RetrieveResponse, RetrievedMemory,
 };

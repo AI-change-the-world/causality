@@ -10,7 +10,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Postgres, Row, Transaction};
+use serde_json::Value;
+use sqlx::{postgres::PgRow, FromRow, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::domain::{
@@ -47,7 +48,7 @@ pub struct MemoryRepository {
 
 // SQL column list for Memory (used in multiple queries)
 const MEMORY_COLUMNS: &str = r#"
-    id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
+    id, profile_id, owner_id, scope_id, content, metadata, schema_version, importance, confidence,
     root_memory_id, version_number, is_current_version, supersedes, superseded_by,
     is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
     decay_score, source_event_id,
@@ -78,7 +79,7 @@ impl MemoryRepository {
             &format!(
                 r#"
                 INSERT INTO memories (
-                    id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
+                    id, profile_id, owner_id, scope_id, content, metadata, schema_version, importance, confidence,
                     root_memory_id, version_number, is_current_version, supersedes, superseded_by,
                     is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
                     decay_score, source_event_id,
@@ -103,8 +104,8 @@ impl MemoryRepository {
         .bind(&memory.owner_id)
         .bind(&memory.scope_id)
         .bind(&memory.content)
-        .bind(&memory.category)
-        .bind(&memory.tags)
+        .bind(&memory.metadata)
+        .bind(memory.schema_version)
         .bind(memory.importance)
         .bind(memory.confidence)
         .bind(memory.root_memory_id)
@@ -625,8 +626,6 @@ impl MemoryRepository {
         profile_id: Uuid,
         owner_id: &str,
         scope_id: Option<&str>,
-        category_prefix: Option<&str>,
-        tags: Option<&[String]>,
         include_global: bool,
     ) -> AppResult<Vec<Memory>> {
         let rows = sqlx::query_as::<_, MemoryRow>(&format!(
@@ -644,7 +643,6 @@ impl MemoryRepository {
                       AND (scope_id = $3 OR ($4 = true AND is_global = true))
                     )
                   )
-                  AND ($5::text IS NULL OR category LIKE $5 || '%')
                 ORDER BY decay_score DESC, updated_at DESC
                 LIMIT 1000
                 "#,
@@ -654,25 +652,10 @@ impl MemoryRepository {
         .bind(owner_id)
         .bind(scope_id)
         .bind(include_global)
-        .bind(category_prefix)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut memories: Vec<Memory> = rows.into_iter().map(Into::into).collect();
-
-        // Apply tags filter in memory
-        if let Some(tag_filter) = tags {
-            if !tag_filter.is_empty() {
-                memories.retain(|m| {
-                    m.tags
-                        .as_ref()
-                        .map(|memory_tags| tag_filter.iter().any(|t| memory_tags.contains(t)))
-                        .unwrap_or(false)
-                });
-            }
-        }
-
-        Ok(memories)
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// Find context memories for event processing
@@ -794,7 +777,7 @@ impl MemoryRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
+                id, profile_id, owner_id, scope_id, content, metadata, schema_version, importance, confidence,
                 root_memory_id, version_number, is_current_version, supersedes, superseded_by,
                 is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
                 decay_score, source_event_id,
@@ -837,43 +820,7 @@ impl MemoryRepository {
         let mut results: Vec<FullTextSearchResult> = Vec::with_capacity(rows.len());
 
         for row in rows {
-            let memory = Memory {
-                id: row.get("id"),
-                profile_id: row.get("profile_id"),
-                owner_id: row.get("owner_id"),
-                scope_id: row.get("scope_id"),
-                content: row.get("content"),
-                category: row.get("category"),
-                tags: row.get("tags"),
-                importance: row.get("importance"),
-                confidence: row.get("confidence"),
-                root_memory_id: row.get("root_memory_id"),
-                version_number: row.get("version_number"),
-                is_current_version: row.get("is_current_version"),
-                supersedes: row.get("supersedes"),
-                superseded_by: row.get("superseded_by"),
-                is_global: row.get("is_global"),
-                hit_count: row.get("hit_count"),
-                last_hit_at: row.get("last_hit_at"),
-                reinforcement_count: row.get("reinforcement_count"),
-                last_reinforced_at: row.get("last_reinforced_at"),
-                decay_score: row.get("decay_score"),
-                source_event_id: row.get("source_event_id"),
-                status: row.get("status"),
-                embedding_status: row.get("embedding_status"),
-                embedding_provider: row.get("embedding_provider"),
-                processing_status: row.get("processing_status"),
-                llm_provider: row.get("llm_provider"),
-                inference_type: row.get("inference_type"),
-                inference_confidence: row.get("inference_confidence"),
-                inference_reasoning: row.get("inference_reasoning"),
-                conflict_reason: row.get("conflict_reason"),
-                consistency_confidence: row.get("consistency_confidence"),
-                promoted_at: row.get("promoted_at"),
-                promotion_reason: row.get("promotion_reason"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            };
+            let memory = Self::memory_from_row(&row);
 
             let rank: f32 = row.get("rank");
             let headline: Option<String> = row.get("headline");
@@ -1071,7 +1018,7 @@ impl MemoryRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, profile_id, owner_id, scope_id, content, category, tags, importance, confidence,
+                id, profile_id, owner_id, scope_id, content, metadata, schema_version, importance, confidence,
                 root_memory_id, version_number, is_current_version, supersedes, superseded_by,
                 is_global, hit_count, last_hit_at, reinforcement_count, last_reinforced_at,
                 decay_score, source_event_id,
@@ -1108,43 +1055,7 @@ impl MemoryRepository {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let memory = Memory {
-                id: row.get("id"),
-                profile_id: row.get("profile_id"),
-                owner_id: row.get("owner_id"),
-                scope_id: row.get("scope_id"),
-                content: row.get("content"),
-                category: row.get("category"),
-                tags: row.get("tags"),
-                importance: row.get("importance"),
-                confidence: row.get("confidence"),
-                root_memory_id: row.get("root_memory_id"),
-                version_number: row.get("version_number"),
-                is_current_version: row.get("is_current_version"),
-                supersedes: row.get("supersedes"),
-                superseded_by: row.get("superseded_by"),
-                is_global: row.get("is_global"),
-                hit_count: row.get("hit_count"),
-                last_hit_at: row.get("last_hit_at"),
-                reinforcement_count: row.get("reinforcement_count"),
-                last_reinforced_at: row.get("last_reinforced_at"),
-                decay_score: row.get("decay_score"),
-                source_event_id: row.get("source_event_id"),
-                status: row.get("status"),
-                embedding_status: row.get("embedding_status"),
-                embedding_provider: row.get("embedding_provider"),
-                processing_status: row.get("processing_status"),
-                llm_provider: row.get("llm_provider"),
-                inference_type: row.get("inference_type"),
-                inference_confidence: row.get("inference_confidence"),
-                inference_reasoning: row.get("inference_reasoning"),
-                conflict_reason: row.get("conflict_reason"),
-                consistency_confidence: row.get("consistency_confidence"),
-                promoted_at: row.get("promoted_at"),
-                promotion_reason: row.get("promotion_reason"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            };
+            let memory = Self::memory_from_row(&row);
             let rank: f32 = row.get("rank");
             results.push((memory, rank));
         }
@@ -1327,6 +1238,46 @@ impl MemoryRepository {
 
         Ok(grouped)
     }
+
+    fn memory_from_row(row: &PgRow) -> Memory {
+        Memory {
+            id: row.get("id"),
+            profile_id: row.get("profile_id"),
+            owner_id: row.get("owner_id"),
+            scope_id: row.get("scope_id"),
+            content: row.get("content"),
+            metadata: row.get("metadata"),
+            schema_version: row.get("schema_version"),
+            importance: row.get("importance"),
+            confidence: row.get("confidence"),
+            root_memory_id: row.get("root_memory_id"),
+            version_number: row.get("version_number"),
+            is_current_version: row.get("is_current_version"),
+            supersedes: row.get("supersedes"),
+            superseded_by: row.get("superseded_by"),
+            is_global: row.get("is_global"),
+            hit_count: row.get("hit_count"),
+            last_hit_at: row.get("last_hit_at"),
+            reinforcement_count: row.get("reinforcement_count"),
+            last_reinforced_at: row.get("last_reinforced_at"),
+            decay_score: row.get("decay_score"),
+            source_event_id: row.get("source_event_id"),
+            status: row.get("status"),
+            embedding_status: row.get("embedding_status"),
+            embedding_provider: row.get("embedding_provider"),
+            processing_status: row.get("processing_status"),
+            llm_provider: row.get("llm_provider"),
+            inference_type: row.get("inference_type"),
+            inference_confidence: row.get("inference_confidence"),
+            inference_reasoning: row.get("inference_reasoning"),
+            conflict_reason: row.get("conflict_reason"),
+            consistency_confidence: row.get("consistency_confidence"),
+            promoted_at: row.get("promoted_at"),
+            promotion_reason: row.get("promotion_reason"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }
+    }
 }
 
 /// Internal row type for sqlx mapping
@@ -1337,8 +1288,8 @@ struct MemoryRow {
     owner_id: String,
     scope_id: Option<String>,
     content: String,
-    category: Option<String>,
-    tags: Option<Vec<String>>,
+    metadata: Value,
+    schema_version: i32,
     importance: f32,
     confidence: f32,
     // Version chain
@@ -1406,8 +1357,8 @@ impl From<MemoryRow> for Memory {
             owner_id: row.owner_id,
             scope_id: row.scope_id,
             content: row.content,
-            category: row.category,
-            tags: row.tags,
+            metadata: row.metadata,
+            schema_version: row.schema_version,
             importance: row.importance,
             confidence: row.confidence,
             root_memory_id: row.root_memory_id,

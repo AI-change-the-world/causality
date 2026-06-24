@@ -15,18 +15,17 @@ use uuid::Uuid;
 
 use crate::domain::{
     CreateEventInput, CreateMemoryInput, CreateMemoryValidation, EmbeddingStatus, Event,
-    EventSource, Memory,
+    EventSource, Memory, SystemProfile,
 };
 use crate::embedding::{EmbeddingProvider, EmbeddingRequest};
 use crate::error::{AppError, AppResult};
 use crate::repository::{
     AuditOperation, AuditRepository, EventRepository, MemoryRepository, QdrantRepository,
-    StructuredEventRepository,
 };
 
 use super::{
-    ConsistencyChecker, ExtractFromEventRequest, ExtractedMemory, MemoryMatcher, MemoryProcessor,
-    MemoryReconciler, ReconcileOutcome, RetrievalEngine, RetrieveRequest, RetrieveResponse,
+    ConsistencyChecker, ExtractFromEventRequest, MemoryMatcher, MemoryProcessor, MemoryReconciler,
+    ReconcileOutcome, RetrievalEngine, RetrieveRequest, RetrieveResponse,
 };
 
 /// Result of processing an event
@@ -53,6 +52,8 @@ pub struct ProcessEventResult {
 /// This struct holds the globally configured providers and repositories needed
 /// by the event-driven memory processing pipeline.
 pub struct EventProcessingContext {
+    /// Active business system profile
+    pub profile: SystemProfile,
     /// Memory processor for LLM-driven extraction
     pub memory_processor: Arc<MemoryProcessor>,
     /// Event handler for structuring events into six-element format
@@ -67,8 +68,6 @@ pub struct EventProcessingContext {
     pub qdrant_repo: QdrantRepository,
     /// Matcher for finding existing memories during event reconciliation
     pub memory_matcher: Arc<MemoryMatcher>,
-    /// Structured event repository for persisting LLM-parsed event elements
-    pub structured_event_repo: StructuredEventRepository,
     /// Context memories for better relevance judgment and memory updates
     /// These are same-scope memories + global memories fetched before processing
     pub context_memories: Vec<crate::domain::Memory>,
@@ -76,6 +75,7 @@ pub struct EventProcessingContext {
 
 impl EventProcessingContext {
     pub fn new(
+        profile: SystemProfile,
         memory_processor: Arc<MemoryProcessor>,
         event_handler: Arc<super::EventHandler>,
         llm_provider: Arc<dyn crate::llm::LlmProvider>,
@@ -83,10 +83,10 @@ impl EventProcessingContext {
         embedding_provider_name: String,
         qdrant_repo: QdrantRepository,
         memory_matcher: Arc<MemoryMatcher>,
-        structured_event_repo: StructuredEventRepository,
         context_memories: Vec<crate::domain::Memory>,
     ) -> Self {
         Self {
+            profile,
             memory_processor,
             event_handler: Some(event_handler),
             llm_provider,
@@ -94,7 +94,6 @@ impl EventProcessingContext {
             embedding_provider_name,
             qdrant_repo,
             memory_matcher,
-            structured_event_repo,
             context_memories,
         }
     }
@@ -262,7 +261,6 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         debug!(
             owner_id = %input.owner_id,
             scope_id = ?input.scope_id,
-            process_with_llm = input.process_with_llm,
             "Creating memory directly"
         );
 
@@ -416,30 +414,23 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             "Processing event with context"
         );
 
-        // Step 1: Structure the event into six-element format (if EventHandler is available)
-        let structured_event = if let Some(ref event_handler) = context.event_handler {
+        // Step 1: Analyze the event into a profile-aware payload (if EventHandler is available)
+        let event_analysis = if let Some(ref event_handler) = context.event_handler {
             match event_handler.structure_event(event).await {
-                Ok(structured) => {
-                    let stored = match context
-                        .structured_event_repo
-                        .get_by_event_id(structured.event_id)
-                        .await?
-                    {
-                        Some(existing) => existing,
-                        None => context.structured_event_repo.create(&structured).await?,
-                    };
+                Ok(analysis) => {
                     debug!(
                         event_id = %event.id,
-                        structured_event_id = %stored.id,
-                        "Event structured into six-element format"
+                        has_analysis_payload = analysis.payload.is_object(),
+                        analysis_schema_version = ?analysis.schema_version,
+                        "Event analyzed successfully"
                     );
-                    Some(stored)
+                    Some(analysis)
                 }
                 Err(e) => {
                     warn!(
                         event_id = %event.id,
                         error = %e,
-                        "Failed to structure event, continuing with raw content"
+                        "Failed to analyze event, continuing with raw content"
                     );
                     None
                 }
@@ -452,19 +443,29 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             None
         };
 
-        // Step 2: Build extraction request with structured event info if available
-        let extract_request = if let Some(ref structured) = structured_event {
-            // Build enhanced context from structured event
-            let enhanced_context = Self::build_enhanced_context(event, structured);
-            ExtractFromEventRequest {
-                content: event.content.clone(),
-                context: Some(enhanced_context),
-            }
+        // Step 2: Build a schema-aware extraction request
+        let extract_request = if let Some(ref analysis) = event_analysis {
+            let enhanced_context = Self::build_enhanced_context(event, &analysis.payload);
+            ExtractFromEventRequest::with_context(
+                event.content.clone(),
+                enhanced_context,
+                context.profile.extraction_prompt.clone(),
+                context.profile.metadata_schema.clone(),
+                context.profile.schema_generation_prompt.clone(),
+                analysis
+                    .schema_version
+                    .unwrap_or(context.profile.schema_version),
+            )
         } else {
-            ExtractFromEventRequest {
-                content: event.content.clone(),
-                context: event.context.clone(),
-            }
+            let mut request = ExtractFromEventRequest::new(
+                event.content.clone(),
+                context.profile.extraction_prompt.clone(),
+                context.profile.metadata_schema.clone(),
+                context.profile.schema_generation_prompt.clone(),
+                context.profile.schema_version,
+            );
+            request.context = event.context.clone();
+            request
         };
 
         // Step 3: Extract memories from the event using LLM
@@ -490,18 +491,6 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
         // Process each extracted memory
         for extracted in &extract_result.extracted_memories {
-            // Convert to our ExtractedMemory type
-            let extracted_memory = ExtractedMemory {
-                content: extracted.content.clone(),
-                category: extracted.category.clone(),
-                tags: extracted.tags.clone(),
-                importance: extracted.importance,
-                confidence: extracted.confidence,
-                inference_type: extracted.inference_type,
-                inference_confidence: extracted.confidence,
-                inference_reasoning: extracted.reasoning.clone(),
-            };
-
             let embedding_request = EmbeddingRequest::new(&extracted.content);
             let embedding_response = context
                 .embedding_provider
@@ -529,12 +518,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             // Use LLM-based consistency checking with the context's LLM provider
             let outcome = self
                 .memory_reconciler
-                .reconcile_with_llm(
-                    event,
-                    &extracted_memory,
-                    matches,
-                    context.llm_provider.clone(),
-                )
+                .reconcile_with_llm(event, extracted, matches, context.llm_provider.clone())
                 .await?;
 
             // Track the outcome
@@ -669,7 +653,14 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         // Mark event as processed
         let processed_event = self
             .event_repo
-            .mark_processed(event.id, &extract_result.event_summary)
+            .mark_processed(
+                event.id,
+                &extract_result.event_summary,
+                event_analysis.as_ref().map(|analysis| &analysis.payload),
+                event_analysis
+                    .as_ref()
+                    .and_then(|analysis| analysis.schema_version),
+            )
             .await?;
 
         info!(
@@ -827,14 +818,11 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         engine.retrieve(request, similarities, actor_id).await
     }
 
-    /// Build enhanced context from structured event for memory extraction
+    /// Build enhanced context from event analysis payload for memory extraction
     ///
-    /// Combines the original event context with structured event information
+    /// Combines the original event context with analysis payload
     /// to provide richer context for memory extraction.
-    fn build_enhanced_context(
-        event: &Event,
-        structured: &crate::domain::StructuredEvent,
-    ) -> String {
+    fn build_enhanced_context(event: &Event, analysis_payload: &serde_json::Value) -> String {
         let mut context_parts = Vec::new();
 
         // Add original context if present
@@ -842,34 +830,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             context_parts.push(format!("原始上下文: {}", ctx));
         }
 
-        // Add structured event elements
-        context_parts.push("结构化事件信息:".to_string());
-
-        if let Some(ref time) = structured.time_element {
-            context_parts.push(format!("- 时间: {}", time));
-        }
-        if let Some(ref location) = structured.location_element {
-            context_parts.push(format!("- 地点: {}", location));
-        }
-        context_parts.push(format!("- 人物: {}", structured.actor_element));
-        if let Some(ref cause) = structured.cause_element {
-            context_parts.push(format!("- 起因: {}", cause));
-        }
-        if let Some(ref process) = structured.process_element {
-            context_parts.push(format!("- 经过: {}", process));
-        }
-        if let Some(ref result) = structured.result_element {
-            context_parts.push(format!("- 结果: {}", result));
-        }
-        if let Some(ref background) = structured.background_element {
-            context_parts.push(format!("- 背景: {}", background));
-        }
-        if let Some(ref details) = structured.details_element {
-            context_parts.push(format!("- 细节: {}", details));
-        }
-        if let Some(ref category) = structured.category {
-            context_parts.push(format!("- 分类: {}", category));
-        }
+        context_parts.push("事件分析结果(JSON):".to_string());
+        context_parts.push(analysis_payload.to_string());
 
         context_parts.join("\n")
     }
@@ -901,7 +863,6 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             owner_id: memory.owner_id.clone(),
             memory_id: memory.id,
             scope_id: memory.scope_id.clone(),
-            category: memory.category.clone(),
             status: memory.status.to_string(),
             is_global: memory.is_global,
         };

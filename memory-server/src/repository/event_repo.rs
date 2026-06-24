@@ -8,6 +8,7 @@
 //! - No event_type, scope_type, or scene fields
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -16,7 +17,7 @@ use crate::error::{AppError, AppResult};
 
 const EVENT_COLUMNS: &str = r#"
     id, profile_id, owner_id, scope_id, content, context,
-    summary, source, processing_status, error_message, processed_at,
+    summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
     skipped, skip_reason, relevance_score, event_time, created_at
 "#;
 
@@ -38,16 +39,16 @@ impl EventRepository {
             r#"
             INSERT INTO events (
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15, $16
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
@@ -58,6 +59,8 @@ impl EventRepository {
         .bind(&event.content)
         .bind(&event.context)
         .bind(&event.summary)
+        .bind(&event.analysis_payload)
+        .bind(event.analysis_schema_version)
         .bind(event.source.map(|source| source.to_string()))
         .bind(event.processing_status)
         .bind(&event.error_message)
@@ -127,13 +130,21 @@ impl EventRepository {
         Ok(row.into())
     }
 
-    /// Mark an event as processed with a summary
-    pub async fn mark_processed(&self, id: Uuid, summary: &str) -> AppResult<Event> {
+    /// Mark an event as processed with summary and optional analysis payload.
+    pub async fn mark_processed(
+        &self,
+        id: Uuid,
+        summary: &str,
+        analysis_payload: Option<&Value>,
+        analysis_schema_version: Option<i32>,
+    ) -> AppResult<Event> {
         let row = sqlx::query_as::<_, EventRow>(
             r#"
             UPDATE events
             SET processing_status = 'completed'::processing_status,
                 summary = $2,
+                analysis_payload = $3,
+                analysis_schema_version = $4,
                 error_message = NULL,
                 processed_at = NOW(),
                 skipped = false,
@@ -141,12 +152,14 @@ impl EventRepository {
             WHERE id = $1
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
         .bind(id)
         .bind(summary)
+        .bind(analysis_payload)
+        .bind(analysis_schema_version)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::EventNotFound(id))?;
@@ -173,7 +186,7 @@ impl EventRepository {
             WHERE id = $1
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
@@ -199,7 +212,7 @@ impl EventRepository {
             WHERE id = $1
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
@@ -228,7 +241,7 @@ impl EventRepository {
               AND processing_status = 'failed'::processing_status
             RETURNING
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             "#,
         )
@@ -257,7 +270,7 @@ impl EventRepository {
             r#"
             SELECT
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             FROM events
             WHERE profile_id = $1
@@ -289,7 +302,7 @@ impl EventRepository {
                 r#"
                 SELECT
                     id, profile_id, owner_id, scope_id, content, context,
-                    summary, source, processing_status, error_message, processed_at,
+                    summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                     skipped, skip_reason, relevance_score, event_time, created_at
                 FROM events
                 WHERE profile_id = $1
@@ -311,7 +324,7 @@ impl EventRepository {
                 r#"
                 SELECT
                     id, profile_id, owner_id, scope_id, content, context,
-                    summary, source, processing_status, error_message, processed_at,
+                    summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                     skipped, skip_reason, relevance_score, event_time, created_at
                 FROM events
                 WHERE profile_id = $1
@@ -342,7 +355,7 @@ impl EventRepository {
             r#"
             SELECT
                 id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
+                summary, analysis_payload, analysis_schema_version, source, processing_status, error_message, processed_at,
                 skipped, skip_reason, relevance_score, event_time, created_at
             FROM events
             WHERE profile_id = $1
@@ -469,7 +482,7 @@ impl EventRepository {
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT e.id, e.profile_id, e.owner_id, e.scope_id, e.content, e.context,
-                   e.summary, e.source, e.processing_status, e.error_message, e.processed_at,
+                   e.summary, e.analysis_payload, e.analysis_schema_version, e.source, e.processing_status, e.error_message, e.processed_at,
                    e.skipped, e.skip_reason, e.relevance_score, e.event_time, e.created_at
             FROM events e
             JOIN event_memory_relations emr ON e.id = emr.event_id
@@ -496,7 +509,7 @@ impl EventRepository {
         let row = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT e.id, e.profile_id, e.owner_id, e.scope_id, e.content, e.context,
-                   e.summary, e.source, e.processing_status, e.error_message, e.processed_at,
+                   e.summary, e.analysis_payload, e.analysis_schema_version, e.source, e.processing_status, e.error_message, e.processed_at,
                    e.skipped, e.skip_reason, e.relevance_score, e.event_time, e.created_at
             FROM events e
             JOIN event_memory_relations emr ON e.id = emr.event_id
@@ -525,6 +538,8 @@ struct EventRow {
     content: String,
     context: Option<String>,
     summary: Option<String>,
+    analysis_payload: Option<Value>,
+    analysis_schema_version: Option<i32>,
     source: Option<String>,
     processing_status: ProcessingStatus,
     error_message: Option<String>,
@@ -546,6 +561,8 @@ impl From<EventRow> for Event {
             content: row.content,
             context: row.context,
             summary: row.summary,
+            analysis_payload: row.analysis_payload,
+            analysis_schema_version: row.analysis_schema_version,
             source: row.source.and_then(|source| source.parse().ok()),
             processing_status: row.processing_status,
             error_message: row.error_message,

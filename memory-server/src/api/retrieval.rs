@@ -6,7 +6,7 @@
 //!
 //! New architecture:
 //! - Removed scope_type, layer, scene, event_source_prefix filters
-//! - Added category_prefix filter
+//! - Retrieval is driven by query + scope + score controls
 //! - Added include_evidence and include_history options
 //! - owner_id is now required
 
@@ -46,10 +46,6 @@ pub struct RetrieveApiRequest {
 /// Advanced retrieval options for callers that need scoring/debug controls.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct RetrieveOptions {
-    /// Filter by category prefix (e.g. "work.code" matches "work.code.eslint")
-    pub category_prefix: Option<String>,
-    /// Filter by tags
-    pub tags: Option<Vec<String>>,
     /// Minimum score threshold
     pub min_score: Option<f32>,
     /// Minimum confidence threshold
@@ -78,8 +74,6 @@ impl RetrieveApiRequest {
             query: self.query,
             owner_id: self.owner_id,
             scope_id: self.scope_id,
-            category_prefix: options.category_prefix,
-            tags: options.tags,
             top_k: self.top_k,
             min_score: options.min_score,
             min_confidence: options.min_confidence,
@@ -210,6 +204,26 @@ pub struct RetrievedMemoryResponse {
     pub merged_lineage_sources: Option<Vec<LineageSourceResponse>>,
 }
 
+/// Retrieval trace for debugging the recall chain.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RetrievalTraceResponse {
+    /// Original user query
+    pub query: String,
+    /// Whether vector search participated in this retrieval
+    pub used_vector: bool,
+    /// Whether full-text search participated in this retrieval
+    pub used_fulltext: bool,
+    /// Scope filter used by the request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    /// Number of vector candidates returned before merge
+    pub vector_candidate_count: usize,
+    /// Number of candidates after structured filtering
+    pub structured_candidate_count: usize,
+    /// Number of final results after lineage collapse
+    pub final_result_count: usize,
+}
+
 /// Response for memory retrieval
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RetrieveApiResponse {
@@ -217,6 +231,8 @@ pub struct RetrieveApiResponse {
     pub memories: Vec<RetrievedMemoryResponse>,
     /// Total candidates after structured filtering
     pub total_candidates: usize,
+    /// Retrieval trace for debugging and demos
+    pub trace: RetrievalTraceResponse,
 }
 
 /// Request body for auto retrieval
@@ -244,16 +260,12 @@ pub struct AutoRetrieveRecord {
     pub record: usize,
     /// Event time (when the memory was created or event occurred)
     pub time: DateTime<Utc>,
-    /// Category of the memory
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    /// Structured metadata payload
+    pub metadata: serde_json::Value,
     /// Inferred memory content
     pub infer: String,
     /// Relevance score
     pub score: f32,
-    /// Tags if available
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
 }
 
 /// Response for auto retrieval (formatted output)
@@ -265,6 +277,8 @@ pub struct AutoRetrieveApiResponse {
     pub records: Vec<AutoRetrieveRecord>,
     /// Total candidates found
     pub total_candidates: usize,
+    /// Retrieval trace for debugging and demos
+    pub trace: RetrievalTraceResponse,
     /// Formatted markdown output for direct use
     pub markdown: String,
 }
@@ -308,17 +322,20 @@ pub async fn retrieve_memories(
     use crate::repository::VectorFilter;
     use tracing::{debug, warn};
 
+    let request_body = request;
+
     debug!(
         profile_id = %profile_id,
-        query = %request.query,
-        owner_id = %request.owner_id,
-        scope_id = ?request.scope_id,
+        query = %request_body.query,
+        owner_id = %request_body.owner_id,
+        scope_id = ?request_body.scope_id,
         "retrieve_memories: starting request"
     );
 
     let include_global = true;
-    let top_k = request.top_k.unwrap_or(10);
-    let use_vector = request.options.use_vector.unwrap_or(true);
+    let top_k = request_body.top_k.unwrap_or(10);
+    let use_vector = request_body.options.use_vector.unwrap_or(true);
+    let use_fulltext = request_body.options.use_fulltext.unwrap_or(true);
     let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
 
     // Step 1: Try vector search if enabled
@@ -327,13 +344,13 @@ pub async fn retrieve_memories(
         let embedding_provider_name = &state.embedding_provider_name;
 
         // Generate query embedding using global provider
-        let embedding_request = EmbeddingRequest::new(&request.query);
+        let embedding_request = EmbeddingRequest::new(&request_body.query);
         match state.embedding_provider.embed(embedding_request).await {
             Ok(query_embedding) => {
                 let filter = VectorFilter {
                     profile_id: Some(profile_id),
-                    owner_id: Some(request.owner_id.clone()),
-                    scope_id: request.scope_id.clone(),
+                    owner_id: Some(request_body.owner_id.clone()),
+                    scope_id: request_body.scope_id.clone(),
                     include_global: Some(include_global),
                     statuses: Some(vec!["active".to_string()]),
                     ..Default::default()
@@ -379,10 +396,11 @@ pub async fn retrieve_memories(
         "retrieve_memories: combined all vector search results"
     );
 
-    let mut retrieve_request = request.into_service_request(profile_id);
+    let mut retrieve_request = request_body.clone().into_service_request(profile_id);
 
     // If no vector results, disable vector search in the request
     let has_vector_results = !all_similarities.is_empty();
+    let vector_candidate_count = all_similarities.len();
     if !has_vector_results {
         retrieve_request.use_vector = Some(false);
     }
@@ -402,7 +420,9 @@ pub async fn retrieve_memories(
         )
         .await?;
 
-    let collapsed = collapse_retrieved_memories_to_current(&state, profile_id, result.memories).await?;
+    let collapsed =
+        collapse_retrieved_memories_to_current(&state, profile_id, result.memories).await?;
+    let final_result_count = collapsed.len();
 
     let memories = collapsed
         .into_iter()
@@ -412,6 +432,15 @@ pub async fn retrieve_memories(
     let response = RetrieveApiResponse {
         memories,
         total_candidates: result.total_candidates,
+        trace: RetrievalTraceResponse {
+            query: request_body.query,
+            used_vector: has_vector_results,
+            used_fulltext: use_fulltext,
+            scope_id: request_body.scope_id,
+            vector_candidate_count,
+            structured_candidate_count: result.total_candidates,
+            final_result_count,
+        },
     };
 
     Ok(Json(response))
@@ -473,7 +502,8 @@ async fn collapse_retrieved_memories_to_current(
         match collapsed_by_current.get_mut(&current_id) {
             Some(existing) => {
                 existing.retrieved.score = existing.retrieved.score.max(retrieved.score);
-                existing.retrieved.similarity = existing.retrieved.similarity.max(retrieved.similarity);
+                existing.retrieved.similarity =
+                    existing.retrieved.similarity.max(retrieved.similarity);
                 existing.retrieved.text_match_score = max_option_f32(
                     existing.retrieved.text_match_score,
                     retrieved.text_match_score,
@@ -500,10 +530,8 @@ async fn collapse_retrieved_memories_to_current(
 
                 let mut current_retrieved = retrieved.clone();
                 current_retrieved.memory = resolution.current_memory.clone();
-                current_retrieved.history = merge_history_with_lineage(
-                    current_retrieved.history,
-                    &resolution,
-                );
+                current_retrieved.history =
+                    merge_history_with_lineage(current_retrieved.history, &resolution);
 
                 collapsed_by_current.insert(
                     current_id,
@@ -548,11 +576,7 @@ fn merge_history_with_lineage(
 ) -> Option<MemoryHistory> {
     history.or_else(|| {
         Some(MemoryHistory {
-            versions: resolution
-                .lineage_to_current
-                .iter()
-                .cloned()
-                .collect(),
+            versions: resolution.lineage_to_current.iter().cloned().collect(),
             current_version: Some(resolution.current_memory.clone()),
         })
     })
@@ -596,29 +620,31 @@ pub async fn auto_retrieve_memories(
     use crate::repository::VectorFilter;
     use tracing::{debug, warn};
 
+    let request_body = request;
+
     debug!(
         profile_id = %profile_id,
-        query = %request.query,
-        owner_id = %request.owner_id,
-        scope_id = ?request.scope_id,
+        query = %request_body.query,
+        owner_id = %request_body.owner_id,
+        scope_id = ?request_body.scope_id,
         "auto_retrieve_memories: starting request"
     );
 
     let include_global = true;
-    let top_k = request.top_k.unwrap_or(10);
+    let top_k = request_body.top_k.unwrap_or(10);
     let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
 
     // Use global embedding provider for query embedding
     let embedding_provider_name = &state.embedding_provider_name;
 
     // Generate query embedding using global provider
-    let embedding_request = EmbeddingRequest::new(&request.query);
+    let embedding_request = EmbeddingRequest::new(&request_body.query);
     match state.embedding_provider.embed(embedding_request).await {
         Ok(query_embedding) => {
             let filter = VectorFilter {
                 profile_id: Some(profile_id),
-                owner_id: Some(request.owner_id.clone()),
-                scope_id: request.scope_id.clone(),
+                owner_id: Some(request_body.owner_id.clone()),
+                scope_id: request_body.scope_id.clone(),
                 include_global: Some(include_global),
                 statuses: Some(vec!["active".to_string()]),
                 ..Default::default()
@@ -659,15 +685,14 @@ pub async fn auto_retrieve_memories(
 
     // Build retrieve request - use_vector depends on whether we have vector results
     let has_vector_results = !all_similarities.is_empty();
+    let vector_candidate_count = all_similarities.len();
     let retrieve_request = RetrieveRequest {
         profile_id,
-        query: request.query.clone(),
-        owner_id: request.owner_id.clone(),
-        scope_id: request.scope_id,
-        category_prefix: None,
-        tags: None,
-        top_k: request.top_k,
-        min_score: request.min_score,
+        query: request_body.query.clone(),
+        owner_id: request_body.owner_id.clone(),
+        scope_id: request_body.scope_id.clone(),
+        top_k: request_body.top_k,
+        min_score: request_body.min_score,
         min_confidence: None,
         use_fulltext: Some(true),
         use_vector: Some(has_vector_results),
@@ -702,10 +727,9 @@ pub async fn auto_retrieve_memories(
             AutoRetrieveRecord {
                 record: idx + 1,
                 time,
-                category: rm.memory.category.clone(),
+                metadata: rm.memory.metadata.clone(),
                 infer: rm.memory.content.clone(),
                 score: rm.score,
-                tags: rm.memory.tags.clone(),
             }
         })
         .collect();
@@ -714,16 +738,25 @@ pub async fn auto_retrieve_memories(
     let markdown = format_records_as_markdown(&records);
 
     // Use the original query as parsed intent (could be enhanced with LLM parsing later)
-    let parsed_intent = if let Some(ctx) = &request.context {
-        format!("{} (context: {})", request.query, ctx)
+    let parsed_intent = if let Some(ctx) = &request_body.context {
+        format!("{} (context: {})", request_body.query, ctx)
     } else {
-        request.query.clone()
+        request_body.query.clone()
     };
 
     let response = AutoRetrieveApiResponse {
         parsed_intent,
         records,
         total_candidates: result.total_candidates,
+        trace: RetrievalTraceResponse {
+            query: request_body.query,
+            used_vector: has_vector_results,
+            used_fulltext: true,
+            scope_id: request_body.scope_id,
+            vector_candidate_count,
+            structured_candidate_count: result.total_candidates,
+            final_result_count: result.memories.len(),
+        },
         markdown,
     };
 
@@ -743,16 +776,9 @@ fn format_records_as_markdown(records: &[AutoRetrieveRecord]) -> String {
             "time: {}\n",
             record.time.format("%Y-%m-%d %H:%M:%S")
         ));
-        if let Some(category) = &record.category {
-            output.push_str(&format!("category: {}\n", category));
-        }
+        output.push_str(&format!("metadata: {}\n", record.metadata));
         output.push_str(&format!("infer: {}\n", record.infer));
         output.push_str(&format!("score: {:.2}\n", record.score));
-        if let Some(tags) = &record.tags {
-            if !tags.is_empty() {
-                output.push_str(&format!("tags: {}\n", tags.join(", ")));
-            }
-        }
         output.push('\n');
     }
     output.trim_end().to_string()
@@ -771,8 +797,6 @@ mod tests {
             scope_id: Some("scope456".to_string()),
             top_k: Some(20),
             options: RetrieveOptions {
-                category_prefix: Some("preference".to_string()),
-                tags: Some(vec!["ui".to_string()]),
                 min_score: Some(0.5),
                 min_confidence: Some(0.7),
                 use_fulltext: Some(true),
@@ -790,11 +814,6 @@ mod tests {
         assert_eq!(retrieve_request.query, api_request.query);
         assert_eq!(retrieve_request.owner_id, api_request.owner_id);
         assert_eq!(retrieve_request.scope_id, api_request.scope_id);
-        assert_eq!(
-            retrieve_request.category_prefix,
-            Some("preference".to_string())
-        );
-        assert_eq!(retrieve_request.tags, Some(vec!["ui".to_string()]));
         assert_eq!(retrieve_request.top_k, api_request.top_k);
         assert_eq!(retrieve_request.min_score, api_request.options.min_score);
         assert_eq!(
@@ -838,8 +857,6 @@ mod tests {
         assert_eq!(retrieve_request.query, "simple query");
         assert_eq!(retrieve_request.owner_id, "owner123");
         assert!(retrieve_request.scope_id.is_none());
-        assert!(retrieve_request.category_prefix.is_none());
-        assert!(retrieve_request.tags.is_none());
         assert!(retrieve_request.top_k.is_none());
         assert!(retrieve_request.min_score.is_none());
         assert!(retrieve_request.min_confidence.is_none());
@@ -908,28 +925,31 @@ mod tests {
             AutoRetrieveRecord {
                 record: 1,
                 time: Utc::now(),
-                category: Some("preference.ui".to_string()),
+                metadata: serde_json::json!({
+                    "memory_type": "ui_preference",
+                    "theme": "dark",
+                    "channel": "explicit"
+                }),
                 infer: "用户喜欢深色模式".to_string(),
                 score: 0.95,
-                tags: Some(vec!["dark_mode".to_string(), "ui".to_string()]),
             },
             AutoRetrieveRecord {
                 record: 2,
                 time: Utc::now(),
-                category: None,
+                metadata: serde_json::json!({}),
                 infer: "用户偏好简洁界面".to_string(),
                 score: 0.82,
-                tags: None,
             },
         ];
 
         let markdown = format_records_as_markdown(&records);
         assert!(markdown.contains("record: 1"));
         assert!(markdown.contains("record: 2"));
-        assert!(markdown.contains("category: preference.ui"));
+        assert!(markdown.contains(
+            "metadata: {\"channel\":\"explicit\",\"memory_type\":\"ui_preference\",\"theme\":\"dark\"}"
+        ));
         assert!(markdown.contains("infer: 用户喜欢深色模式"));
         assert!(markdown.contains("score: 0.95"));
-        assert!(markdown.contains("tags: dark_mode, ui"));
     }
 
     #[test]
@@ -940,8 +960,11 @@ mod tests {
                 owner_id: "owner123".to_string(),
                 scope_id: Some("scope456".to_string()),
                 content: "用户更喜欢 Rust".to_string(),
-                category: Some("preference.tech.programming_language".to_string()),
-                tags: None,
+                metadata: serde_json::json!({
+                    "memory_type": "language_preference",
+                    "language": "Rust"
+                }),
+                schema_version: 1,
                 importance: 0.9,
                 confidence: 0.9,
                 root_memory_id: Some(Uuid::new_v4()),

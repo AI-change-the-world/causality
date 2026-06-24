@@ -26,7 +26,6 @@ const FIELD_MEMORY_ID: &str = "memory_id";
 const FIELD_PROFILE_ID: &str = "profile_id";
 const FIELD_OWNER_ID: &str = "owner_id";
 const FIELD_SCOPE_ID: &str = "scope_id";
-const FIELD_CATEGORY: &str = "category";
 const FIELD_IS_GLOBAL: &str = "is_global";
 const FIELD_STATUS: &str = "status";
 
@@ -479,7 +478,6 @@ pub struct VectorPayload {
     pub owner_id: String,
     pub memory_id: Uuid,
     pub scope_id: Option<String>,
-    pub category: Option<String>,
     pub is_global: bool,
     pub status: String,
 }
@@ -516,14 +514,6 @@ impl VectorPayload {
                 },
             );
         }
-        if let Some(ref category) = self.category {
-            payload.insert(
-                FIELD_CATEGORY.to_string(),
-                Value {
-                    kind: Some(Kind::StringValue(category.clone())),
-                },
-            );
-        }
         payload.insert(
             FIELD_IS_GLOBAL.to_string(),
             Value {
@@ -547,7 +537,6 @@ pub struct VectorFilter {
     pub profile_id: Option<Uuid>,
     pub owner_id: Option<String>,
     pub scope_id: Option<String>,
-    pub category_prefix: Option<String>,
     pub is_global: Option<bool>,
     pub include_global: Option<bool>,
     pub statuses: Option<Vec<String>>,
@@ -577,14 +566,6 @@ impl VectorFilter {
             }
         } else if self.include_global.unwrap_or(true) && self.is_global.is_none() {
             must.push(Condition::matches(FIELD_IS_GLOBAL, true));
-        }
-
-        if let Some(ref category_prefix) = self.category_prefix {
-            // Use prefix match for category
-            must.push(Condition::matches(
-                FIELD_CATEGORY,
-                format!("{}*", category_prefix),
-            ));
         }
 
         if let Some(is_global) = self.is_global {
@@ -655,7 +636,6 @@ mod tests {
             owner_id: "owner123".to_string(),
             memory_id: Uuid::new_v4(),
             scope_id: Some("scope123".to_string()),
-            category: Some("work.code".to_string()),
             is_global: false,
             status: "active".to_string(),
         };
@@ -698,10 +678,9 @@ mod tests {
     fn test_vector_filter_with_scope() {
         let filter = VectorFilter {
             scope_id: Some("scope123".to_string()),
-            category_prefix: Some("work".to_string()),
             ..Default::default()
         };
         let qdrant_filter = filter.to_qdrant_filter();
-        assert_eq!(qdrant_filter.must.len(), 2);
+        assert_eq!(qdrant_filter.must.len(), 1);
     }
 }

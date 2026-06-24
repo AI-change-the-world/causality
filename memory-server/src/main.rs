@@ -21,7 +21,6 @@ use causality::llm::{
 };
 use causality::repository::{
     AuditRepository, EventRepository, MemoryRepository, ProfileRepository, QdrantRepository,
-    StructuredEventRepository,
 };
 use causality::service::{
     EventIngestionService, LifecycleManager, MatcherConfig, MemoryGuard, MemoryMatcher,
@@ -178,7 +177,6 @@ async fn main() -> anyhow::Result<()> {
     let event_repo = EventRepository::new(pool.clone());
     let audit_repo = AuditRepository::new(pool.clone());
     let profile_repo = ProfileRepository::new(pool.clone());
-    let structured_event_repo = StructuredEventRepository::new(pool.clone());
 
     // Create services
     let memory_guard = MemoryGuard::new_basic(
@@ -219,7 +217,6 @@ async fn main() -> anyhow::Result<()> {
         embedding_provider_name.clone(),
         qdrant_repo.clone(),
         memory_matcher,
-        structured_event_repo.clone(),
     );
 
     // Create application state
@@ -233,7 +230,6 @@ async fn main() -> anyhow::Result<()> {
         embedding_provider,
         embedding_provider_name,
         qdrant_repo,
-        structured_event_repo,
     };
 
     // Create router with middleware

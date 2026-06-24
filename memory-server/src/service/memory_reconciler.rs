@@ -12,34 +12,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
+use super::memory_processor::ExtractedMemory;
 use crate::domain::{
-    CreateMemoryFromEventInput, CreateSupersedingMemoryInput, Event, EventMemoryRelation,
-    InferenceType, Memory,
+    CreateMemoryFromEventInput, CreateSupersedingMemoryInput, Event, EventMemoryRelation, Memory,
 };
 use crate::error::AppResult;
 use crate::repository::MemoryRepository;
 use crate::service::MatchResult;
-
-/// Extracted memory content from LLM processing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExtractedMemory {
-    /// Memory content
-    pub content: String,
-    /// Hierarchical category (e.g., "work.code.eslint")
-    pub category: Option<String>,
-    /// Tags/keywords
-    pub tags: Option<Vec<String>>,
-    /// Importance score (0.0 - 1.0)
-    pub importance: f32,
-    /// Confidence score (0.0 - 1.0)
-    pub confidence: f32,
-    /// Inference type
-    pub inference_type: InferenceType,
-    /// Inference confidence
-    pub inference_confidence: f32,
-    /// Reasoning for the inference
-    pub inference_reasoning: String,
-}
 
 /// Outcome of the reconciliation process
 #[derive(Debug, Clone)]
@@ -275,8 +254,8 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
             owner_id: event.owner_id.clone(),
             scope_id: event.scope_id.clone(),
             content: extracted.content.clone(),
-            category: extracted.category.clone(),
-            tags: extracted.tags.clone(),
+            metadata: extracted.metadata.clone(),
+            schema_version: extracted.schema_version,
             importance: extracted.importance,
             confidence: extracted.confidence,
             source_event_id: event.id,
@@ -349,8 +328,8 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
             owner_id: old_memory.owner_id.clone(),
             scope_id: old_memory.scope_id.clone(),
             content: extracted.content.clone(),
-            category: extracted.category.clone(),
-            tags: extracted.tags.clone(),
+            metadata: extracted.metadata.clone(),
+            schema_version: extracted.schema_version,
             importance: extracted.importance,
             confidence: extracted.confidence,
             is_global: old_memory.is_global, // Inherit global status
@@ -558,8 +537,11 @@ mod tests {
     fn test_extracted_memory_creation() {
         let extracted = ExtractedMemory {
             content: "User prefers dark mode".to_string(),
-            category: Some("preference.ui".to_string()),
-            tags: Some(vec!["preference".to_string(), "ui".to_string()]),
+            metadata: serde_json::json!({
+                "memory_type": "ui_preference",
+                "theme": "dark"
+            }),
+            schema_version: 1,
             importance: 0.8,
             confidence: 0.95,
             inference_type: InferenceType::Preference,
@@ -569,6 +551,7 @@ mod tests {
 
         assert_eq!(extracted.content, "User prefers dark mode");
         assert!((extracted.importance - 0.8).abs() < f32::EPSILON);
+        assert_eq!(extracted.metadata["memory_type"], "ui_preference");
     }
 
     #[test]

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
 use crate::llm::LlmProvider;
-use crate::repository::{QdrantRepository, StructuredEventRepository};
+use crate::repository::QdrantRepository;
 use crate::service::AlwaysConsistentChecker;
 use crate::service::{
     EventIngestionService, LifecycleManager, MemoryGuard, ProfileService, RetrievalEngine,
@@ -52,8 +52,6 @@ pub struct AppState {
     pub embedding_provider_name: String,
     /// Qdrant repository for vector operations
     pub qdrant_repo: QdrantRepository,
-    /// Structured event repository
-    pub structured_event_repo: StructuredEventRepository,
 }
 
 /// OpenAPI documentation
@@ -61,7 +59,7 @@ pub struct AppState {
 #[openapi(
     info(
         title = "Memory Server API",
-        version = "0.1.0",
+        version = "0.3.0",
         description = "A context memory governance service for Agent/LLM applications.\n\nProvides structured memory storage, retrieval, lifecycle management, and optional LLM-powered memory processing.",
         license(name = "MIT"),
     ),
@@ -101,6 +99,7 @@ pub struct AppState {
         profile::list_profiles,
         profile::get_profile_by_id,
         profile::update_profile_by_id,
+        profile::confirm_profile_schema,
     ),
     components(schemas(
         // Memory types
@@ -149,12 +148,13 @@ pub struct AppState {
         // Profile types
         profile::InitializeProfileRequest,
         profile::ProfileResponse,
+        profile::ConfirmProfileSchemaResponse,
         profile::UpdateProfileRequest,
         // Domain types
         crate::domain::Status,
         crate::domain::EmbeddingStatus,
         crate::domain::ProcessingStatus,
-        crate::domain::MemoryCategory,
+        crate::domain::SchemaStatus,
         crate::domain::InferenceType,
         crate::domain::ProcessingMode,
         crate::embedding::ProviderType,

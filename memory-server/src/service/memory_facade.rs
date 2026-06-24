@@ -104,8 +104,6 @@ impl MemoryFacade {
             query: query.into(),
             owner_id: owner_id.into(),
             scope_id,
-            category_prefix: None,
-            tags: None,
             top_k,
             min_score: None,
             min_confidence: None,

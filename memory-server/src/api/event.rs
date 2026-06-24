@@ -18,6 +18,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -72,6 +73,8 @@ impl From<EventIngestionResult> for CreateEventApiResponse {
             error_message: result.event.error_message,
             processed_at: result.event.processed_at,
             event_summary: result.event.summary,
+            analysis_payload: result.event.analysis_payload,
+            analysis_schema_version: result.event.analysis_schema_version,
             memories_created: result.memories_created,
             memories_reinforced: result.memories_reinforced,
             memories_superseded: result.memories_superseded,
@@ -103,6 +106,12 @@ pub struct CreateEventApiResponse {
     /// Event summary (LLM-generated understanding of the event)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_summary: Option<String>,
+    /// Profile-aware event analysis payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_payload: Option<Value>,
+    /// Schema version used to generate the analysis payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_schema_version: Option<i32>,
     /// Number of memories created from this event
     pub memories_created: usize,
     /// Number of existing memories reinforced by this event
@@ -143,6 +152,12 @@ pub struct GetEventApiResponse {
     /// Event summary
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Profile-aware event analysis payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_payload: Option<Value>,
+    /// Schema version used to generate the analysis payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_schema_version: Option<i32>,
     /// Event source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<EventSource>,
@@ -421,6 +436,8 @@ pub async fn get_event(
         content: event.content,
         context: event.context,
         summary: event.summary,
+        analysis_payload: event.analysis_payload,
+        analysis_schema_version: event.analysis_schema_version,
         source: event.source,
         processing_status: event.processing_status,
         error_message: event.error_message,
@@ -525,6 +542,10 @@ mod tests {
             error_message: None,
             processed_at: None,
             event_summary: Some("User changed theme settings".to_string()),
+            analysis_payload: Some(serde_json::json!({
+                "event_type": "preference_update"
+            })),
+            analysis_schema_version: Some(1),
             memories_created: 2,
             memories_reinforced: 1,
             memories_superseded: 0,
@@ -551,6 +572,8 @@ mod tests {
             error_message: None,
             processed_at: None,
             event_summary: None,
+            analysis_payload: None,
+            analysis_schema_version: None,
             memories_created: 0,
             memories_reinforced: 0,
             memories_superseded: 0,
@@ -572,6 +595,10 @@ mod tests {
             content: "Test event content".to_string(),
             context: Some("Test context".to_string()),
             summary: Some("Test summary".to_string()),
+            analysis_payload: Some(serde_json::json!({
+                "event_type": "test"
+            })),
+            analysis_schema_version: Some(1),
             source: Some(EventSource::Api),
             processing_status: ProcessingStatus::Completed,
             error_message: None,

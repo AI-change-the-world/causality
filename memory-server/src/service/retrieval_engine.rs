@@ -1,7 +1,7 @@
 //! RetrievalEngine service
 //!
 //! Responsible for multi-stage memory retrieval:
-//! 1. PostgreSQL structured filtering (owner_id, scope_id, category_prefix, is_global)
+//! 1. PostgreSQL structured filtering (owner_id, scope_id, is_global)
 //! 2. PostgreSQL full-text search (optional, using tsvector/tsquery)
 //! 3. Qdrant vector similarity search
 //! 4. Composite scoring (similarity, fulltext, importance, recency, hit_count)
@@ -11,7 +11,6 @@
 //! - Default filter: is_current_version = true
 //! - Default exclude: status IN ('superseded', 'archived')
 //! - Support scope_id + is_global combined query
-//! - Support category prefix matching
 //! - Support evidence and history loading
 
 use chrono::Utc;
@@ -25,42 +24,6 @@ use crate::domain::{Event, Memory, Status};
 use crate::error::{AppError, AppResult};
 use crate::repository::{AuditOperation, AuditRepository, EventRepository, MemoryRepository};
 
-/// Category query type for hierarchical category matching
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CategoryQuery {
-    /// Exact match: category = 'work.code.eslint'
-    Exact(String),
-    /// Prefix match: category LIKE 'work.code.%'
-    Prefix(String),
-}
-
-impl CategoryQuery {
-    /// Create a prefix query from a string
-    pub fn prefix(s: impl Into<String>) -> Self {
-        CategoryQuery::Prefix(s.into())
-    }
-
-    /// Create an exact query from a string
-    pub fn exact(s: impl Into<String>) -> Self {
-        CategoryQuery::Exact(s.into())
-    }
-
-    /// Get the category string for filtering
-    pub fn as_prefix_pattern(&self) -> Option<String> {
-        match self {
-            CategoryQuery::Exact(cat) => Some(cat.clone()),
-            CategoryQuery::Prefix(prefix) => {
-                if prefix.ends_with('.') {
-                    Some(prefix.clone())
-                } else {
-                    Some(format!("{}.", prefix))
-                }
-            }
-        }
-    }
-}
-
 /// Request for memory retrieval
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrieveRequest {
@@ -72,10 +35,6 @@ pub struct RetrieveRequest {
     pub owner_id: String,
     /// Filter by scope ID (when provided, also includes global memories)
     pub scope_id: Option<String>,
-    /// Filter by category prefix (e.g., "work.code" matches "work.code.eslint")
-    pub category_prefix: Option<String>,
-    /// Filter by tags (extracted keywords)
-    pub tags: Option<Vec<String>>,
     /// Maximum number of results (default: 10)
     pub top_k: Option<usize>,
     /// Minimum score threshold
@@ -172,7 +131,7 @@ pub struct RetrieveResponse {
 /// - Default filter: is_current_version = true
 /// - Default exclude: status IN ('superseded', 'archived')
 /// - Support scope_id + is_global combined query
-/// - Support category prefix matching
+/// - Support profile-defined metadata retrieval
 /// - Support evidence and history loading
 #[derive(Clone)]
 pub struct RetrievalEngine {
@@ -210,8 +169,6 @@ impl RetrievalEngine {
     ///    - scope_id + is_global (when scope_id provided, also includes global memories)
     ///    - is_current_version = true (default)
     ///    - status NOT IN ('superseded', 'archived') (default)
-    ///    - category_prefix (optional)
-    ///    - tags (optional)
     /// 2. Perform full-text search (PostgreSQL tsvector/tsquery) - optional
     /// 3. Perform vector similarity search (Qdrant) - uses provided similarities
     /// 4. Compute composite scores (combining all signals)
@@ -229,8 +186,6 @@ impl RetrievalEngine {
             query = %request.query,
             owner_id = %request.owner_id,
             scope_id = ?request.scope_id,
-            category_prefix = ?request.category_prefix,
-            tags = ?request.tags,
             top_k = ?request.top_k,
             use_fulltext = ?request.use_fulltext,
             use_vector = ?request.use_vector,
@@ -267,8 +222,6 @@ impl RetrievalEngine {
                 request.profile_id,
                 &request.owner_id,
                 request.scope_id.as_deref(),
-                request.category_prefix.as_deref(),
-                request.tags.as_deref(),
                 include_global,
             )
             .await?;
@@ -724,8 +677,11 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test content".to_string(),
-            category: Some("work.code".to_string()),
-            tags: None,
+            metadata: serde_json::json!({
+                "memory_type": "engineering_note",
+                "topic": "work.code"
+            }),
+            schema_version: 1,
             importance: 0.5,
             confidence: 1.0,
             // Version chain
@@ -807,27 +763,6 @@ mod tests {
     }
 
     #[test]
-    fn test_category_query_prefix() {
-        let query = CategoryQuery::prefix("work.code");
-        assert_eq!(query.as_prefix_pattern(), Some("work.code.".to_string()));
-
-        let query_with_dot = CategoryQuery::prefix("work.code.");
-        assert_eq!(
-            query_with_dot.as_prefix_pattern(),
-            Some("work.code.".to_string())
-        );
-    }
-
-    #[test]
-    fn test_category_query_exact() {
-        let query = CategoryQuery::exact("work.code.eslint");
-        assert_eq!(
-            query.as_prefix_pattern(),
-            Some("work.code.eslint".to_string())
-        );
-    }
-
-    #[test]
     fn test_has_retrieval_signal_requires_an_actual_match() {
         assert!(!RetrievalEngine::has_retrieval_signal(
             None, None, true, true
@@ -875,7 +810,10 @@ mod tests {
         let json = serde_json::to_value(&resolution).unwrap();
         assert_eq!(json["requested_memory"]["id"], requested.id.to_string());
         assert_eq!(json["current_memory"]["id"], current.id.to_string());
-        assert_eq!(json["lineage_to_current"][0]["id"], requested.id.to_string());
+        assert_eq!(
+            json["lineage_to_current"][0]["id"],
+            requested.id.to_string()
+        );
         assert_eq!(json["lineage_to_current"][1]["id"], current.id.to_string());
     }
 }

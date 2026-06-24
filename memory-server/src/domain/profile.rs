@@ -6,12 +6,32 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fmt;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::AppError;
 
 /// Maximum allowed length for the system name
 pub const MAX_NAME_LENGTH: usize = 100;
+
+/// Metadata schema lifecycle state for a system profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaStatus {
+    Draft,
+    Confirmed,
+}
+
+impl fmt::Display for SchemaStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SchemaStatus::Draft => write!(f, "draft"),
+            SchemaStatus::Confirmed => write!(f, "confirmed"),
+        }
+    }
+}
 
 /// SystemProfile entity representing the system's configuration and boundaries
 ///
@@ -39,6 +59,16 @@ pub struct SystemProfile {
     pub boundaries: Vec<String>,
     /// Complete prompt template for event extraction (LLM generated)
     pub extraction_prompt: String,
+    /// Profile-specific metadata schema contract used by callers and the engine
+    pub metadata_schema: Value,
+    /// Schema lifecycle state
+    pub schema_status: SchemaStatus,
+    /// Monotonic schema version
+    pub schema_version: i32,
+    /// When the schema was confirmed for production use
+    pub schema_confirmed_at: Option<DateTime<Utc>>,
+    /// Prompt used to generate the schema proposal
+    pub schema_generation_prompt: Option<String>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
@@ -71,6 +101,10 @@ pub struct ParsedProfile {
     pub boundaries: Vec<String>,
     /// Extraction prompt template
     pub extraction_prompt: String,
+    /// Generated metadata schema proposal
+    pub metadata_schema: Value,
+    /// Prompt used to generate the schema proposal
+    pub schema_generation_prompt: String,
 }
 
 /// Input for updating a SystemProfile
@@ -94,6 +128,16 @@ pub struct UpdateProfileInput {
     pub boundaries: Option<Vec<String>>,
     /// New extraction prompt (optional)
     pub extraction_prompt: Option<String>,
+    /// New metadata schema (optional)
+    pub metadata_schema: Option<Value>,
+    /// New schema status (optional)
+    pub schema_status: Option<SchemaStatus>,
+    /// New schema version (optional)
+    pub schema_version: Option<i32>,
+    /// New schema confirmed timestamp (optional)
+    pub schema_confirmed_at: Option<Option<DateTime<Utc>>>,
+    /// New schema generation prompt (optional)
+    pub schema_generation_prompt: Option<Option<String>>,
     /// Whether to re-parse description with LLM
     #[serde(default)]
     pub reparse: bool,
@@ -165,6 +209,11 @@ impl SystemProfile {
             memory_focus: parsed.memory_focus,
             boundaries: parsed.boundaries,
             extraction_prompt: parsed.extraction_prompt,
+            metadata_schema: parsed.metadata_schema,
+            schema_status: SchemaStatus::Draft,
+            schema_version: 1,
+            schema_confirmed_at: None,
+            schema_generation_prompt: Some(parsed.schema_generation_prompt),
             created_at: now,
             updated_at: now,
         }
@@ -202,6 +251,21 @@ impl SystemProfile {
         if let Some(extraction_prompt) = input.extraction_prompt {
             self.extraction_prompt = extraction_prompt;
         }
+        if let Some(metadata_schema) = input.metadata_schema {
+            self.metadata_schema = metadata_schema;
+        }
+        if let Some(schema_status) = input.schema_status {
+            self.schema_status = schema_status;
+        }
+        if let Some(schema_version) = input.schema_version {
+            self.schema_version = schema_version;
+        }
+        if let Some(schema_confirmed_at) = input.schema_confirmed_at {
+            self.schema_confirmed_at = schema_confirmed_at;
+        }
+        if let Some(schema_generation_prompt) = input.schema_generation_prompt {
+            self.schema_generation_prompt = schema_generation_prompt;
+        }
         self.updated_at = Utc::now();
     }
 
@@ -214,6 +278,21 @@ impl SystemProfile {
         self.memory_focus = parsed.memory_focus;
         self.boundaries = parsed.boundaries;
         self.extraction_prompt = parsed.extraction_prompt;
+        self.metadata_schema = parsed.metadata_schema;
+        self.schema_version += 1;
+        self.schema_status = SchemaStatus::Draft;
+        self.schema_confirmed_at = None;
+        self.schema_generation_prompt = Some(parsed.schema_generation_prompt);
+        self.updated_at = Utc::now();
+    }
+
+    /// Mark the current metadata schema as confirmed.
+    pub fn confirm_schema(&mut self) {
+        if self.schema_status == SchemaStatus::Confirmed {
+            return;
+        }
+        self.schema_status = SchemaStatus::Confirmed;
+        self.schema_confirmed_at = Some(Utc::now());
         self.updated_at = Utc::now();
     }
 }
@@ -238,6 +317,28 @@ mod tests {
             memory_focus: vec!["购房偏好".to_string(), "预算范围".to_string()],
             boundaries: vec!["不处理租房".to_string()],
             extraction_prompt: "请将用户行为解析为结构化格式...".to_string(),
+            metadata_schema: serde_json::json!({
+                "version": 1,
+                "entity_types": {
+                    "house_preference": {
+                        "fields": {
+                            "region": { "type": "string", "filterable": true },
+                            "budget_range": { "type": "string", "filterable": true }
+                        },
+                        "candidate_match_fields": ["memory_type", "region"],
+                        "conflict_fields": ["memory_type", "region"],
+                        "lineage_group_fields": ["memory_type", "region"]
+                    }
+                },
+                "filterable_fields": ["memory_type", "region", "budget_range"],
+                "retrieval_defaults": {
+                    "use_vector": true,
+                    "use_fulltext": true,
+                    "collapse_lineage": true
+                }
+            }),
+            schema_generation_prompt: "请根据当前业务 schema 输出符合约束的 memory metadata JSON。"
+                .to_string(),
         }
     }
 
@@ -303,6 +404,14 @@ mod tests {
         assert_eq!(profile.memory_focus, parsed.memory_focus);
         assert_eq!(profile.boundaries, parsed.boundaries);
         assert_eq!(profile.extraction_prompt, parsed.extraction_prompt);
+        assert_eq!(profile.metadata_schema, parsed.metadata_schema);
+        assert_eq!(profile.schema_status, SchemaStatus::Draft);
+        assert_eq!(profile.schema_version, 1);
+        assert!(profile.schema_confirmed_at.is_none());
+        assert_eq!(
+            profile.schema_generation_prompt,
+            Some(parsed.schema_generation_prompt)
+        );
     }
 
     #[test]
@@ -349,8 +458,21 @@ mod tests {
             memory_focus: vec!["新关注点".to_string()],
             boundaries: vec!["新边界".to_string()],
             extraction_prompt: "新提取prompt".to_string(),
+            metadata_schema: serde_json::json!({
+                "version": 2,
+                "entity_types": {
+                    "customer_intent": {
+                        "fields": {
+                            "intent": { "type": "string", "filterable": true }
+                        }
+                    }
+                }
+            }),
+            schema_generation_prompt: "请输出符合 customer_intent schema 的 metadata JSON。"
+                .to_string(),
         };
 
+        profile.confirm_schema();
         profile.apply_parsed(new_parsed.clone());
 
         assert_eq!(profile.purpose, new_parsed.purpose);
@@ -360,7 +482,27 @@ mod tests {
         assert_eq!(profile.memory_focus, new_parsed.memory_focus);
         assert_eq!(profile.boundaries, new_parsed.boundaries);
         assert_eq!(profile.extraction_prompt, new_parsed.extraction_prompt);
+        assert_eq!(profile.metadata_schema, new_parsed.metadata_schema);
+        assert_eq!(
+            profile.schema_generation_prompt,
+            Some(new_parsed.schema_generation_prompt)
+        );
+        assert_eq!(profile.schema_status, SchemaStatus::Draft);
+        assert_eq!(profile.schema_version, 2);
+        assert!(profile.schema_confirmed_at.is_none());
         assert!(profile.updated_at > original_updated_at);
+    }
+
+    #[test]
+    fn test_profile_confirm_schema() {
+        let input = valid_create_input();
+        let parsed = valid_parsed_profile();
+        let mut profile = SystemProfile::new(input, parsed);
+
+        profile.confirm_schema();
+
+        assert_eq!(profile.schema_status, SchemaStatus::Confirmed);
+        assert!(profile.schema_confirmed_at.is_some());
     }
 
     #[test]

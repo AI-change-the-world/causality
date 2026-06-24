@@ -308,14 +308,12 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test memory".to_string(),
-            category: None,
-            tags: None,
+            metadata: None,
+            schema_version: None,
             importance: None,
             confidence: None,
             is_global: false,
             embedding_provider: None,
-            process_with_llm: false,
-            llm_provider: None,
         };
 
         let memory = Memory::new(input);

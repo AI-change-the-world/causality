@@ -1,7 +1,7 @@
 //! Status enums for Memory Server
 //!
 //! Contains Status (memory lifecycle state), EmbeddingStatus,
-//! ProcessingStatus, MemoryCategory, and InferenceType.
+//! ProcessingStatus, and InferenceType.
 
 use serde::{Deserialize, Serialize};
 use sqlx::TypeInfo;
@@ -131,57 +131,6 @@ impl std::fmt::Display for ProcessingStatus {
     }
 }
 
-/// Memory category for classification (kept for backward compatibility)
-/// Note: In the new architecture, category is a hierarchical string field
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, ToSchema)]
-#[sqlx(type_name = "memory_category", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryCategory {
-    /// User preferences (e.g., likes dark theme)
-    UserPreference,
-    /// Behavior patterns (e.g., usually processes emails in the morning)
-    BehaviorPattern,
-    /// Business rules (e.g., contract approval requires three signatures)
-    BusinessRule,
-    /// Factual knowledge (e.g., project deadline is X)
-    FactualKnowledge,
-    /// Other category
-    Other,
-}
-
-impl Default for MemoryCategory {
-    fn default() -> Self {
-        MemoryCategory::Other
-    }
-}
-
-impl std::fmt::Display for MemoryCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MemoryCategory::UserPreference => write!(f, "user_preference"),
-            MemoryCategory::BehaviorPattern => write!(f, "behavior_pattern"),
-            MemoryCategory::BusinessRule => write!(f, "business_rule"),
-            MemoryCategory::FactualKnowledge => write!(f, "factual_knowledge"),
-            MemoryCategory::Other => write!(f, "other"),
-        }
-    }
-}
-
-impl std::str::FromStr for MemoryCategory {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "user_preference" | "userpreference" => Ok(MemoryCategory::UserPreference),
-            "behavior_pattern" | "behaviorpattern" => Ok(MemoryCategory::BehaviorPattern),
-            "business_rule" | "businessrule" => Ok(MemoryCategory::BusinessRule),
-            "factual_knowledge" | "factualknowledge" => Ok(MemoryCategory::FactualKnowledge),
-            "other" => Ok(MemoryCategory::Other),
-            _ => Err(format!("Unknown memory category: {}", s)),
-        }
-    }
-}
-
 /// Inference type for memories extracted from events
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -304,25 +253,6 @@ impl std::str::FromStr for ProcessingMode {
     }
 }
 
-/// Memory extracted from an event by LLM processing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExtractedMemory {
-    /// The extracted memory content
-    pub content: String,
-    /// Hierarchical category (e.g., "work.code.eslint")
-    pub category: Option<String>,
-    /// Auto-extracted tags/keywords
-    pub tags: Option<Vec<String>>,
-    /// Importance score (0.0 - 1.0)
-    pub importance: f32,
-    /// Confidence score for this extraction (0.0 - 1.0)
-    pub confidence: f32,
-    /// Type of inference made (fact, preference, pattern, rule)
-    pub inference_type: InferenceType,
-    /// Reasoning explaining why this memory was extracted
-    pub reasoning: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,36 +342,6 @@ mod tests {
     #[test]
     fn test_processing_status_processing_display() {
         assert_eq!(ProcessingStatus::Processing.to_string(), "processing");
-    }
-
-    #[test]
-    fn test_memory_category_default() {
-        assert_eq!(MemoryCategory::default(), MemoryCategory::Other);
-    }
-
-    #[test]
-    fn test_memory_category_from_str() {
-        assert_eq!(
-            "user_preference".parse::<MemoryCategory>().unwrap(),
-            MemoryCategory::UserPreference
-        );
-        assert_eq!(
-            "behavior_pattern".parse::<MemoryCategory>().unwrap(),
-            MemoryCategory::BehaviorPattern
-        );
-        assert_eq!(
-            "business_rule".parse::<MemoryCategory>().unwrap(),
-            MemoryCategory::BusinessRule
-        );
-        assert_eq!(
-            "factual_knowledge".parse::<MemoryCategory>().unwrap(),
-            MemoryCategory::FactualKnowledge
-        );
-        assert_eq!(
-            "other".parse::<MemoryCategory>().unwrap(),
-            MemoryCategory::Other
-        );
-        assert!("unknown".parse::<MemoryCategory>().is_err());
     }
 
     #[test]

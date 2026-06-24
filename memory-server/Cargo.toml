@@ -1,6 +1,6 @@
 [package]
 name = "causality"                                                             # 因果律
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A context memory governance service for Agent/LLM applications"
 authors = ["xiaoshuyui"]

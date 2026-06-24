@@ -8,6 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::{EmbeddingStatus, InferenceType, ProcessingStatus, Status};
@@ -31,10 +32,10 @@ pub struct Memory {
     // === Content fields (immutable after creation) ===
     /// Memory content
     pub content: String,
-    /// Hierarchical category (e.g., "work.code.eslint")
-    pub category: Option<String>,
-    /// Tags/keywords extracted from content
-    pub tags: Option<Vec<String>>,
+    /// Profile-defined metadata payload for retrieval, reconcile, and lineage logic
+    pub metadata: Value,
+    /// Schema version used to interpret metadata
+    pub schema_version: i32,
     /// Importance score (0.0 - 1.0)
     pub importance: f32,
     /// Confidence score (0.0 - 1.0)
@@ -120,10 +121,10 @@ pub struct CreateMemoryInput {
     pub scope_id: Option<String>,
     /// Memory content
     pub content: String,
-    /// Hierarchical category (e.g., "work.code.eslint")
-    pub category: Option<String>,
-    /// Tags/keywords
-    pub tags: Option<Vec<String>>,
+    /// Profile-defined metadata payload
+    pub metadata: Option<Value>,
+    /// Schema version used to interpret metadata
+    pub schema_version: Option<i32>,
     /// Importance score (0.0 - 1.0), defaults to 0.5
     pub importance: Option<f32>,
     /// Confidence score (0.0 - 1.0), defaults to 1.0
@@ -133,11 +134,6 @@ pub struct CreateMemoryInput {
     pub is_global: bool,
     /// Embedding provider to use (uses default if not specified)
     pub embedding_provider: Option<String>,
-    /// Whether to process content with LLM
-    #[serde(default)]
-    pub process_with_llm: bool,
-    /// LLM provider to use for processing
-    pub llm_provider: Option<String>,
 }
 
 /// Input for creating a memory from an event extraction
@@ -151,10 +147,10 @@ pub struct CreateMemoryFromEventInput {
     pub scope_id: Option<String>,
     /// Memory content (extracted by LLM)
     pub content: String,
-    /// Hierarchical category
-    pub category: Option<String>,
-    /// Tags/keywords extracted from content
-    pub tags: Option<Vec<String>>,
+    /// Structured metadata derived from the current profile schema
+    pub metadata: Value,
+    /// Schema version used to interpret metadata
+    pub schema_version: i32,
     /// Importance score (0.0 - 1.0)
     pub importance: f32,
     /// Confidence score (0.0 - 1.0)
@@ -190,10 +186,10 @@ pub struct CreateSupersedingMemoryInput {
     pub scope_id: Option<String>,
     /// New content
     pub content: String,
-    /// Category
-    pub category: Option<String>,
-    /// Tags
-    pub tags: Option<Vec<String>>,
+    /// Structured metadata
+    pub metadata: Value,
+    /// Schema version used to interpret metadata
+    pub schema_version: i32,
     /// Importance
     pub importance: f32,
     /// Confidence
@@ -269,21 +265,14 @@ impl Memory {
         let now = Utc::now();
         let id = Uuid::new_v4();
 
-        // Determine initial processing status based on process_with_llm flag
-        let processing_status = if input.process_with_llm {
-            ProcessingStatus::Pending
-        } else {
-            ProcessingStatus::Skipped
-        };
-
         Memory {
             id,
             profile_id: input.profile_id,
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
-            category: input.category,
-            tags: input.tags,
+            metadata: input.metadata.unwrap_or_else(|| serde_json::json!({})),
+            schema_version: input.schema_version.unwrap_or(1),
             importance: input.importance.unwrap_or(0.5),
             confidence: input.confidence.unwrap_or(1.0),
             // Version chain - first version
@@ -306,8 +295,8 @@ impl Memory {
             // Processing
             embedding_status: EmbeddingStatus::Pending,
             embedding_provider: input.embedding_provider,
-            processing_status,
-            llm_provider: input.llm_provider,
+            processing_status: ProcessingStatus::Skipped,
+            llm_provider: None,
             // Inference (not applicable for direct creation)
             inference_type: None,
             inference_confidence: None,
@@ -337,8 +326,8 @@ impl Memory {
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
-            category: input.category,
-            tags: input.tags,
+            metadata: input.metadata,
+            schema_version: input.schema_version,
             importance: input.importance,
             confidence: input.confidence,
             // Version chain - first version
@@ -389,8 +378,8 @@ impl Memory {
             owner_id: input.owner_id,
             scope_id: input.scope_id,
             content: input.content,
-            category: input.category,
-            tags: input.tags,
+            metadata: input.metadata,
+            schema_version: input.schema_version,
             importance: input.importance,
             confidence: input.confidence,
             // Version chain - new version
@@ -544,14 +533,16 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "Test memory content".to_string(),
-            category: Some("work.code".to_string()),
-            tags: Some(vec!["test".to_string()]),
+            metadata: Some(serde_json::json!({
+                "memory_type": "engineering_note",
+                "topic": "work.code",
+                "keywords": ["test"]
+            })),
+            schema_version: Some(1),
             importance: Some(0.7),
             confidence: Some(0.9),
             is_global: false,
             embedding_provider: None,
-            process_with_llm: false,
-            llm_provider: None,
         }
     }
 
@@ -561,8 +552,12 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             content: "User prefers dark mode".to_string(),
-            category: Some("preference.ui".to_string()),
-            tags: Some(vec!["preference".to_string(), "ui".to_string()]),
+            metadata: serde_json::json!({
+                "memory_type": "ui_preference",
+                "theme": "dark",
+                "channel": "explicit_statement"
+            }),
+            schema_version: 1,
             importance: 0.8,
             confidence: 0.95,
             source_event_id: Uuid::new_v4(),
@@ -632,14 +627,12 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: None,
             content: "Test content".to_string(),
-            category: None,
-            tags: None,
+            metadata: None,
+            schema_version: None,
             importance: None,
             confidence: None,
             is_global: false,
             embedding_provider: None,
-            process_with_llm: false,
-            llm_provider: None,
         };
 
         let memory = Memory::new(input);
@@ -652,6 +645,8 @@ mod tests {
         assert!(memory.last_reinforced_at.is_none());
         assert_eq!(memory.embedding_status, EmbeddingStatus::Pending);
         assert_eq!(memory.processing_status, ProcessingStatus::Skipped);
+        assert_eq!(memory.metadata, serde_json::json!({}));
+        assert_eq!(memory.schema_version, 1);
         // Version chain
         assert_eq!(memory.root_memory_id, Some(memory.id));
         assert_eq!(memory.version_number, 1);
@@ -699,8 +694,12 @@ mod tests {
             owner_id: first_memory.owner_id.clone(),
             scope_id: first_memory.scope_id.clone(),
             content: "User now prefers light mode".to_string(),
-            category: Some("preference.ui".to_string()),
-            tags: Some(vec!["preference".to_string()]),
+            metadata: serde_json::json!({
+                "memory_type": "ui_preference",
+                "theme": "light",
+                "channel": "explicit_statement"
+            }),
+            schema_version: 1,
             importance: 0.8,
             confidence: 0.95,
             is_global: false,
@@ -842,14 +841,10 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_with_llm_processing_enabled() {
-        let mut input = valid_input();
-        input.process_with_llm = true;
-        input.llm_provider = Some("openai".to_string());
-
-        let memory = Memory::new(input);
-        assert_eq!(memory.processing_status, ProcessingStatus::Pending);
-        assert_eq!(memory.llm_provider, Some("openai".to_string()));
+    fn test_direct_memory_creation_skips_llm_processing() {
+        let memory = Memory::new(valid_input());
+        assert_eq!(memory.processing_status, ProcessingStatus::Skipped);
+        assert!(memory.llm_provider.is_none());
     }
 
     #[test]
@@ -861,5 +856,29 @@ mod tests {
         let memory = Memory::new(input);
         assert!(memory.is_global);
         assert!(memory.scope_id.is_none());
+    }
+
+    #[test]
+    fn test_memory_preserves_metadata_and_schema_version() {
+        let memory = Memory::new(CreateMemoryInput {
+            profile_id: Uuid::new_v4(),
+            owner_id: "owner123".to_string(),
+            scope_id: None,
+            content: "Test content".to_string(),
+            metadata: Some(serde_json::json!({
+                "memory_type": "ui_preference",
+                "theme": "dark",
+                "source_channel": "chat"
+            })),
+            schema_version: Some(3),
+            importance: None,
+            confidence: None,
+            is_global: false,
+            embedding_provider: None,
+        });
+
+        assert_eq!(memory.metadata["memory_type"], "ui_preference");
+        assert_eq!(memory.metadata["theme"], "dark");
+        assert_eq!(memory.schema_version, 3);
     }
 }

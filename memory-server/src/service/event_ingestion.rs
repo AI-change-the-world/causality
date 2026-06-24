@@ -14,12 +14,12 @@ use super::{
     MemoryGuard, MemoryMatcher, MemoryProcessor, ProfileService, RelevanceCheckResult,
 };
 use crate::domain::{
-    CreateEventInput, CreateEventValidation, Event, EventMemoryRelationType, Memory,
+    CreateEventInput, CreateEventValidation, Event, EventMemoryRelationType, Memory, SystemProfile,
 };
 use crate::embedding::EmbeddingProvider;
 use crate::error::AppResult;
 use crate::llm::LlmProvider;
-use crate::repository::{QdrantRepository, StructuredEventRepository};
+use crate::repository::QdrantRepository;
 
 /// Result returned by the event ingestion pipeline.
 #[derive(Debug, Clone)]
@@ -68,7 +68,6 @@ pub struct EventIngestionService {
     embedding_provider_name: String,
     qdrant_repo: QdrantRepository,
     memory_matcher: Arc<MemoryMatcher>,
-    structured_event_repo: StructuredEventRepository,
 }
 
 impl EventIngestionService {
@@ -81,7 +80,6 @@ impl EventIngestionService {
         embedding_provider_name: String,
         qdrant_repo: QdrantRepository,
         memory_matcher: Arc<MemoryMatcher>,
-        structured_event_repo: StructuredEventRepository,
     ) -> Self {
         Self {
             memory_guard,
@@ -91,7 +89,6 @@ impl EventIngestionService {
             embedding_provider_name,
             qdrant_repo,
             memory_matcher,
-            structured_event_repo,
         }
     }
 
@@ -226,6 +223,8 @@ impl EventIngestionService {
                     .summary
                     .as_deref()
                     .unwrap_or("Recovered completed event from existing memory relations"),
+                event.analysis_payload.as_ref(),
+                event.analysis_schema_version,
             )
             .await?;
 
@@ -245,17 +244,13 @@ impl EventIngestionService {
 
     async fn process_loaded_event(&self, event: Event) -> AppResult<EventIngestionResult> {
         let event_handler = self.event_handler();
+        let profile = self.profile_service.get_by_id(event.profile_id).await?;
         let context_memories = self
             .load_context_memories(event.profile_id, &event.owner_id, event.scope_id.as_deref())
             .await;
 
         if let Some(skip) = self
-            .skip_reason_if_irrelevant(
-                &event_handler,
-                event.profile_id,
-                &event.content,
-                &context_memories,
-            )
+            .skip_reason_if_irrelevant(&event_handler, &profile, &event.content, &context_memories)
             .await?
         {
             let processed_event = self
@@ -266,7 +261,7 @@ impl EventIngestionService {
             return Ok(EventIngestionResult::skipped(processed_event));
         }
 
-        let context = self.processing_context(event_handler, context_memories);
+        let context = self.processing_context(profile, event_handler, context_memories);
         let result = self
             .memory_guard
             .process_event_with_context(&event, context, None)
@@ -306,12 +301,12 @@ impl EventIngestionService {
     async fn skip_reason_if_irrelevant(
         &self,
         event_handler: &EventHandler,
-        profile_id: Uuid,
+        profile: &SystemProfile,
         content: &str,
         context_memories: &[Memory],
     ) -> AppResult<Option<SkipDecision>> {
         let relevance = event_handler
-            .check_relevance_with_profile(profile_id, content, Some(context_memories))
+            .check_relevance(content, profile, Some(context_memories))
             .await?;
 
         if relevance.is_relevant {
@@ -320,7 +315,7 @@ impl EventIngestionService {
 
         let skip_reason = Self::skip_reason(&relevance);
         info!(
-            profile_id = %profile_id,
+            profile_id = %profile.id,
             relevance_score = relevance.relevance_score,
             reason = %skip_reason,
             "Event skipped due to irrelevance"
@@ -334,10 +329,12 @@ impl EventIngestionService {
 
     fn processing_context(
         &self,
+        profile: SystemProfile,
         event_handler: EventHandler,
         context_memories: Vec<Memory>,
     ) -> EventProcessingContext {
         EventProcessingContext::new(
+            profile,
             Arc::new(MemoryProcessor::new(self.llm_provider.clone())),
             Arc::new(event_handler),
             self.llm_provider.clone(),
@@ -345,7 +342,6 @@ impl EventIngestionService {
             self.embedding_provider_name.clone(),
             self.qdrant_repo.clone(),
             self.memory_matcher.clone(),
-            self.structured_event_repo.clone(),
             context_memories,
         )
     }

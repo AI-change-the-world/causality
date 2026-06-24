@@ -1,67 +1,51 @@
 //! EventHandler service
 //!
-//! Responsible for structuring raw events into the six-element format (六要素模型).
-//! Uses LLM to parse event content based on SystemProfile's extraction_prompt.
-//!
-//! The six core elements are:
-//! - Time (时间): When the event occurred
-//! - Location (地点): Device, page, content position
-//! - Actor (人物): User identifier
-//! - Cause (起因): Why the event was triggered
-//! - Process (经过): What happened step by step
-//! - Result (结果): Outcome of the event
-//!
-//! Plus two auxiliary elements:
-//! - Background (背景): Context/scenario
-//! - Details (细节): Key details, follow-up actions
-//!
-//! Also includes relevance filtering to ensure events match the SystemProfile's domain.
-//!
-//! Requirements: 6.9-6.10, 7.1-7.5, 8.1-8.4
+//! Responsible for analyzing raw events into profile-aware JSON payloads and
+//! performing relevance checks before memory extraction.
 
 use std::sync::Arc;
+
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::domain::{Event, Memory, ParsedStructuredEvent, StructuredEvent, SystemProfile};
+use crate::domain::{Event, Memory, SystemProfile};
 use crate::error::{AppError, AppResult};
 use crate::llm::{ChatRequest, LlmProvider};
 use crate::service::ProfileService;
 
-/// Default extraction prompt when no SystemProfile exists
-/// This provides generic extraction without domain-specific guidance
-const DEFAULT_EXTRACTION_PROMPT: &str = r#"你是一个事件分析助手。请将以下事件内容解析为结构化的六要素格式。
+/// Default extraction prompt when no SystemProfile exists.
+const DEFAULT_EXTRACTION_PROMPT: &str = r#"你是一个事件分析助手。请将以下事件内容解析为结构化事件分析 JSON。
 
 事件内容：
 {content}
 
-请提取以下要素：
-1. 时间 (time)：事件发生的具体时间点
-2. 地点 (location)：用户使用的设备类型、所在页面或位置
-3. 人物 (actor)：用户标识
-4. 起因 (cause)：事件触发的原因或动机
-5. 经过 (process)：用户的具体操作过程
-6. 结果 (result)：操作的结果或影响
-7. 背景 (background)：用户当前的场景和目的
-8. 细节 (details)：其他关键信息
-9. 分类 (category)：事件类型分类
+请尽量提取以下信息：
+1. 事件类型 (event_type)
+2. 行为主体 (actor)
+3. 意图/动机 (intent)
+4. 涉及对象 (entities)
+5. 关键状态变化 (state_changes)
+6. 结果/结论 (result)
+7. 风险或限制 (risk_flags)
+8. 上下文补充 (context_notes)
+9. 分类 (category)
 
 请以 JSON 格式返回，无法确定的字段返回 null：
 ```json
 {
-  "time": "时间信息或null",
-  "location": "地点信息或null",
-  "actor": "用户标识",
-  "cause": "起因或null",
-  "process": "经过或null",
+  "event_type": "事件类型或null",
+  "actor": "主体标识或null",
+  "intent": "意图或null",
+  "entities": ["对象1", "对象2"],
+  "state_changes": ["变化1", "变化2"],
   "result": "结果或null",
-  "background": "背景或null",
-  "details": "细节或null",
+  "risk_flags": ["风险1", "风险2"],
+  "context_notes": "补充上下文或null",
   "category": "分类或null"
 }
 ```"#;
 
-/// Prompt template for checking event relevance against SystemProfile
-/// Now includes context memories for better relevance judgment
+/// Prompt template for checking event relevance against SystemProfile.
 const RELEVANCE_CHECK_PROMPT: &str = r#"你是一个事件相关性判断助手。请判断以下事件内容是否与系统的业务领域相关，或者是否与用户的历史记忆有关联。
 
 ## 系统信息
@@ -83,8 +67,7 @@ const RELEVANCE_CHECK_PROMPT: &str = r#"你是一个事件相关性判断助手�
 1. 事件内容是否与业务领域直接相关
 2. 事件是否属于系统定义的事件类型范围
 3. 事件是否在系统边界之内（不在 boundaries 列表中）
-4. **重要**：事件是否与用户的历史记忆有关联（可能是更新、补充或相关信息）
-   - 例如：用户之前说"买不起"，现在说"中彩票有钱了"，虽然表面不直接相关，但实际上是对财务状况的更新
+4. 事件是否与用户的历史记忆有关联
 5. 事件是否可能产生对目标用户有价值的记忆
 
 ## 请以 JSON 格式返回判断结果：
@@ -96,15 +79,9 @@ const RELEVANCE_CHECK_PROMPT: &str = r#"你是一个事件相关性判断助手�
   "matched_categories": ["匹配的事件类型列表，如果有的话"],
   "related_memory_indices": [与哪些历史记忆相关的索引号，从1开始]
 }
-```
+```"#;
 
-注意：
-- 如果事件与业务领域直接相关，is_relevant 应为 true
-- 如果事件与用户历史记忆有关联（即使表面上与业务领域不直接相关），is_relevant 也应为 true
-- 只有当事件与业务领域完全无关，且与用户历史记忆也没有任何关联时，is_relevant 才应为 false
-- relevance_score 低于 0.3 时，建议 is_relevant 为 false"#;
-
-/// Prompt template for checking event relevance without context memories (fallback)
+/// Prompt template for checking event relevance without context memories.
 const RELEVANCE_CHECK_PROMPT_NO_CONTEXT: &str = r#"你是一个事件相关性判断助手。请判断以下事件内容是否与系统的业务领域相关。
 
 ## 系统信息
@@ -133,42 +110,33 @@ const RELEVANCE_CHECK_PROMPT_NO_CONTEXT: &str = r#"你是一个事件相关性�
   "reason": "判断理由的简短说明",
   "matched_categories": ["匹配的事件类型列表，如果有的话"]
 }
-```
+```"#;
 
-注意：
-- 如果事件内容与业务领域完全无关，is_relevant 应为 false
-- relevance_score 低于 0.3 时，建议 is_relevant 为 false
-- 请严格按照系统边界判断，边界内的内容不应被处理"#;
-
-/// Result of relevance check
+/// Result of relevance check.
 #[derive(Debug, Clone)]
 pub struct RelevanceCheckResult {
-    /// Whether the event is relevant to the system profile
     pub is_relevant: bool,
-    /// Relevance score (0.0 - 1.0)
     pub relevance_score: f32,
-    /// Reason for the relevance decision
     pub reason: String,
-    /// Matched event categories (if any)
     pub matched_categories: Vec<String>,
-    /// Indices of related context memories (1-based)
     pub related_memory_indices: Vec<usize>,
 }
 
-/// EventHandler service for structuring raw events
-///
-/// Uses LLM to parse raw event content into the six-element structured format.
-/// When a SystemProfile exists, uses its extraction_prompt for domain-specific guidance.
+/// Profile-aware event analysis result.
+#[derive(Debug, Clone)]
+pub struct EventAnalysis {
+    pub payload: Value,
+    pub schema_version: Option<i32>,
+}
+
+/// EventHandler service for analyzing raw events.
 #[derive(Clone)]
 pub struct EventHandler {
-    /// LLM provider for parsing events
     llm_provider: Arc<dyn LlmProvider>,
-    /// Profile service for getting extraction prompt
     profile_service: Option<ProfileService>,
 }
 
 impl EventHandler {
-    /// Create a new EventHandler with LLM provider
     pub fn new(llm_provider: Arc<dyn LlmProvider>) -> Self {
         Self {
             llm_provider,
@@ -176,7 +144,6 @@ impl EventHandler {
         }
     }
 
-    /// Create a new EventHandler with LLM provider and profile service
     pub fn with_profile_service(
         llm_provider: Arc<dyn LlmProvider>,
         profile_service: ProfileService,
@@ -187,32 +154,19 @@ impl EventHandler {
         }
     }
 
-    /// Structure a raw event into the six-element format
-    ///
-    /// Uses the SystemProfile's extraction_prompt if available,
-    /// otherwise falls back to the default generic prompt.
-    ///
-    /// # Arguments
-    /// * `event` - The raw event to structure
-    ///
-    /// # Returns
-    /// * `Ok(StructuredEvent)` - The structured event with six elements
-    /// * `Err(AppError)` - If LLM parsing fails
-    pub async fn structure_event(&self, event: &Event) -> AppResult<StructuredEvent> {
+    /// Analyze a raw event into a profile-aware JSON payload.
+    pub async fn structure_event(&self, event: &Event) -> AppResult<EventAnalysis> {
         debug!(
             event_id = %event.id,
             owner_id = %event.owner_id,
             content_len = event.content.len(),
-            "Structuring event into six-element format"
+            "Analyzing event into structured payload"
         );
 
-        // Get the extraction prompt (from SystemProfile or default)
-        let extraction_prompt = self.get_extraction_prompt(event.profile_id).await;
-
-        // Build the full prompt with event content
+        let (extraction_prompt, schema_version) =
+            self.get_extraction_config(event.profile_id).await;
         let prompt = self.build_extraction_prompt(&event.content, &extraction_prompt);
 
-        // Call LLM to parse the event
         let chat_request = ChatRequest::new(prompt)
             .with_temperature(0.3)
             .with_json_response();
@@ -222,38 +176,21 @@ impl EventHandler {
             AppError::Internal(format!("Failed to structure event: {}", e))
         })?;
 
-        // Parse the LLM response into structured event
-        let parsed = self.parse_llm_response(&response.content, &event.owner_id)?;
-
-        // Create the StructuredEvent
-        let structured_event = StructuredEvent::from_parsed(event.id, parsed);
+        let payload = self.parse_llm_response(&response.content)?;
 
         info!(
             event_id = %event.id,
-            structured_event_id = %structured_event.id,
-            has_time = structured_event.time_element.is_some(),
-            has_location = structured_event.location_element.is_some(),
-            has_category = structured_event.category.is_some(),
-            "Event structured successfully"
+            schema_version = ?schema_version,
+            top_level_keys = payload.as_object().map(|obj| obj.len()).unwrap_or(0),
+            "Event analyzed successfully"
         );
 
-        Ok(structured_event)
+        Ok(EventAnalysis {
+            payload,
+            schema_version,
+        })
     }
 
-    /// Check if an event is relevant to the SystemProfile
-    ///
-    /// Uses LLM to determine if the event content matches the system's
-    /// business domain, event categories, and is within system boundaries.
-    /// Also considers context memories to detect implicit relationships.
-    ///
-    /// # Arguments
-    /// * `content` - The event content to check
-    /// * `profile` - The SystemProfile to check against
-    /// * `context_memories` - Optional context memories for better relevance judgment
-    ///
-    /// # Returns
-    /// * `Ok(RelevanceCheckResult)` - The relevance check result
-    /// * `Err(AppError)` - If LLM check fails
     pub async fn check_relevance(
         &self,
         content: &str,
@@ -267,10 +204,8 @@ impl EventHandler {
             "Checking event relevance against SystemProfile"
         );
 
-        // Choose prompt template based on whether we have context memories
         let prompt = if let Some(memories) = context_memories {
             if memories.is_empty() {
-                // No context memories - use simple prompt
                 RELEVANCE_CHECK_PROMPT_NO_CONTEXT
                     .replace("{system_name}", &profile.name)
                     .replace("{purpose}", &profile.purpose)
@@ -281,9 +216,6 @@ impl EventHandler {
                     .replace("{boundaries}", &profile.boundaries.join(", "))
                     .replace("{content}", content)
             } else {
-                // Format context memories for the prompt
-                let context_memories_text = Self::format_context_memories(memories);
-
                 RELEVANCE_CHECK_PROMPT
                     .replace("{system_name}", &profile.name)
                     .replace("{purpose}", &profile.purpose)
@@ -292,11 +224,13 @@ impl EventHandler {
                     .replace("{event_categories}", &profile.event_categories.join(", "))
                     .replace("{memory_focus}", &profile.memory_focus.join(", "))
                     .replace("{boundaries}", &profile.boundaries.join(", "))
-                    .replace("{context_memories}", &context_memories_text)
+                    .replace(
+                        "{context_memories}",
+                        &Self::format_context_memories(memories),
+                    )
                     .replace("{content}", content)
             }
         } else {
-            // No context memories provided - use simple prompt
             RELEVANCE_CHECK_PROMPT_NO_CONTEXT
                 .replace("{system_name}", &profile.name)
                 .replace("{purpose}", &profile.purpose)
@@ -308,9 +242,8 @@ impl EventHandler {
                 .replace("{content}", content)
         };
 
-        // Call LLM to check relevance
         let chat_request = ChatRequest::new(prompt)
-            .with_temperature(0.1) // Low temperature for consistent judgment
+            .with_temperature(0.1)
             .with_json_response();
 
         let response = self.llm_provider.chat(chat_request).await.map_err(|e| {
@@ -318,7 +251,6 @@ impl EventHandler {
             AppError::Internal(format!("Failed to check event relevance: {}", e))
         })?;
 
-        // Parse the relevance check response
         let result = self.parse_relevance_response(&response.content)?;
 
         info!(
@@ -332,36 +264,6 @@ impl EventHandler {
         Ok(result)
     }
 
-    /// Format context memories for inclusion in the relevance check prompt
-    fn format_context_memories(memories: &[Memory]) -> String {
-        if memories.is_empty() {
-            return "（无历史记忆）".to_string();
-        }
-
-        memories
-            .iter()
-            .enumerate()
-            .map(|(idx, m)| {
-                let category = m.category.as_deref().unwrap_or("未分类");
-                let global_marker = if m.is_global { " [长期记忆]" } else { "" };
-                format!("{}. [{}{}] {}", idx + 1, category, global_marker, m.content)
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Check relevance using the profile from ProfileService
-    ///
-    /// Convenience method that fetches the profile and checks relevance.
-    /// If no profile exists, returns a default "relevant" result (permissive mode).
-    ///
-    /// # Arguments
-    /// * `profile_id` - The system profile namespace to check against
-    /// * `content` - The event content to check
-    /// * `context_memories` - Optional context memories for better relevance judgment
-    ///
-    /// # Returns
-    /// * `Ok(RelevanceCheckResult)` - The relevance check result
     pub async fn check_relevance_with_profile(
         &self,
         profile_id: uuid::Uuid,
@@ -381,7 +283,6 @@ impl EventHandler {
             }
         }
 
-        // No profile available - default to permissive (relevant)
         Ok(RelevanceCheckResult {
             is_relevant: true,
             relevance_score: 1.0,
@@ -391,60 +292,45 @@ impl EventHandler {
         })
     }
 
-    /// Parse the LLM response for relevance check
-    fn parse_relevance_response(&self, response: &str) -> AppResult<RelevanceCheckResult> {
-        let json_str = Self::extract_json(response);
+    fn format_context_memories(memories: &[Memory]) -> String {
+        if memories.is_empty() {
+            return "（无历史记忆）".to_string();
+        }
 
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
-            warn!(response = %response, error = %e, "Failed to parse relevance check response");
-            AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
-        })?;
-
-        let is_relevant = parsed["is_relevant"].as_bool().unwrap_or(true);
-        let relevance_score = parsed["relevance_score"]
-            .as_f64()
-            .map(|f| f as f32)
-            .unwrap_or(if is_relevant { 1.0 } else { 0.0 });
-        let reason = parsed["reason"]
-            .as_str()
-            .unwrap_or("No reason provided")
-            .to_string();
-        let matched_categories = parsed["matched_categories"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
+        memories
+            .iter()
+            .enumerate()
+            .map(|(idx, memory)| {
+                let metadata_preview =
+                    if memory.metadata.is_null() || memory.metadata == serde_json::json!({}) {
+                        "metadata={}".to_string()
+                    } else {
+                        format!("metadata={}", memory.metadata)
+                    };
+                let global_marker = if memory.is_global {
+                    " [长期记忆]"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}. [{}{}] {}",
+                    idx + 1,
+                    metadata_preview,
+                    global_marker,
+                    memory.content
+                )
             })
-            .unwrap_or_default();
-        let related_memory_indices = parsed["related_memory_indices"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(RelevanceCheckResult {
-            is_relevant,
-            relevance_score,
-            reason,
-            matched_categories,
-            related_memory_indices,
-        })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    /// Get the extraction prompt from SystemProfile or use default
-    async fn get_extraction_prompt(&self, profile_id: uuid::Uuid) -> String {
+    async fn get_extraction_config(&self, profile_id: uuid::Uuid) -> (String, Option<i32>) {
         if let Some(ref profile_service) = self.profile_service {
             match profile_service.get_by_id(profile_id).await {
                 Ok(profile) => {
                     if !profile.extraction_prompt.is_empty() {
                         debug!("Using extraction prompt from SystemProfile");
-                        return profile.extraction_prompt;
+                        return (profile.extraction_prompt, Some(profile.schema_version));
                     }
                 }
                 Err(e) => {
@@ -454,65 +340,82 @@ impl EventHandler {
         }
 
         debug!("Using default extraction prompt");
-        DEFAULT_EXTRACTION_PROMPT.to_string()
+        (DEFAULT_EXTRACTION_PROMPT.to_string(), None)
     }
 
-    /// Build the extraction prompt with event content
-    ///
-    /// Replaces {content} placeholder in the prompt template with actual event content.
     fn build_extraction_prompt(&self, content: &str, prompt_template: &str) -> String {
         prompt_template.replace("{content}", content)
     }
 
-    /// Parse the LLM response into ParsedStructuredEvent
-    fn parse_llm_response(
-        &self,
-        response: &str,
-        default_actor: &str,
-    ) -> AppResult<ParsedStructuredEvent> {
+    fn parse_llm_response(&self, response: &str) -> AppResult<Value> {
         let json_str = Self::extract_json(response);
 
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+        let parsed: Value = serde_json::from_str(&json_str).map_err(|e| {
             warn!(response = %response, error = %e, "Failed to parse LLM response JSON");
             AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
         })?;
 
-        // Extract fields with null handling
-        let time = Self::extract_optional_string(&parsed["time"]);
-        let location = Self::extract_optional_string(&parsed["location"]);
-        let actor = Self::extract_optional_string(&parsed["actor"])
-            .unwrap_or_else(|| default_actor.to_string());
-        let cause = Self::extract_optional_string(&parsed["cause"]);
-        let process = Self::extract_optional_string(&parsed["process"]);
-        let result = Self::extract_optional_string(&parsed["result"]);
-        let background = Self::extract_optional_string(&parsed["background"]);
-        let details = Self::extract_optional_string(&parsed["details"]);
-        let category = Self::extract_optional_string(&parsed["category"]);
+        if !parsed.is_object() {
+            return Err(AppError::Internal(
+                "Invalid JSON response from LLM: expected top-level object".to_string(),
+            ));
+        }
 
-        Ok(ParsedStructuredEvent {
-            time,
-            location,
-            actor,
-            cause,
-            process,
-            result,
-            background,
-            details,
-            category,
+        Ok(parsed)
+    }
+
+    fn parse_relevance_response(&self, response: &str) -> AppResult<RelevanceCheckResult> {
+        let json_str = Self::extract_json(response);
+
+        let parsed: Value = serde_json::from_str(&json_str).map_err(|e| {
+            warn!(response = %response, error = %e, "Failed to parse relevance check response");
+            AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
+        })?;
+
+        Ok(RelevanceCheckResult {
+            is_relevant: parsed["is_relevant"].as_bool().unwrap_or(true),
+            relevance_score: parsed["relevance_score"]
+                .as_f64()
+                .map(|f| f as f32)
+                .unwrap_or(if parsed["is_relevant"].as_bool().unwrap_or(true) {
+                    1.0
+                } else {
+                    0.0
+                }),
+            reason: parsed["reason"]
+                .as_str()
+                .unwrap_or("No reason provided")
+                .to_string(),
+            matched_categories: parsed["matched_categories"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            related_memory_indices: parsed["related_memory_indices"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
-    /// Extract JSON from response (handles markdown code blocks)
     fn extract_json(response: &str) -> String {
         let response = response.trim();
 
-        // Try to find JSON in markdown code block
         if let Some(start) = response.find("```json") {
             if let Some(end) = response[start..]
                 .find("```\n")
                 .or(response[start..].rfind("```"))
             {
-                let json_start = start + 7; // Skip "```json"
+                let json_start = start + 7;
                 let json_end = start + end;
                 if json_start < json_end {
                     return response[json_start..json_end].trim().to_string();
@@ -520,7 +423,6 @@ impl EventHandler {
             }
         }
 
-        // Try to find JSON in generic code block
         if let Some(start) = response.find("```") {
             let after_start = start + 3;
             if let Some(end) = response[after_start..].find("```") {
@@ -536,7 +438,6 @@ impl EventHandler {
             }
         }
 
-        // Try to find raw JSON object
         if let Some(start) = response.find('{') {
             if let Some(end) = response.rfind('}') {
                 if start < end {
@@ -546,14 +447,6 @@ impl EventHandler {
         }
 
         response.to_string()
-    }
-
-    /// Extract optional string from JSON value, returning None for null or empty
-    fn extract_optional_string(value: &serde_json::Value) -> Option<String> {
-        value
-            .as_str()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && s.to_lowercase() != "null")
     }
 }
 
@@ -565,62 +458,27 @@ mod tests {
     fn test_extract_json_from_code_block() {
         let response = r#"```json
 {
-  "time": "2024-01-15 14:30",
-  "location": "房源详情页",
+  "event_type": "feedback",
   "actor": "user123",
-  "cause": "用户对房源不满意",
-  "process": "点击了不喜欢按钮",
+  "intent": "reject_listing",
+  "entities": ["listing_001"],
+  "state_changes": ["listing_marked_disliked"],
   "result": "房源被标记为不喜欢",
-  "background": "用户正在浏览推荐房源",
-  "details": "选择原因：价格过高",
+  "risk_flags": [],
+  "context_notes": "用户正在浏览推荐房源",
   "category": "反馈"
 }
 ```"#;
         let json = EventHandler::extract_json(response);
         assert!(json.contains("user123"));
-        assert!(json.contains("房源详情页"));
+        assert!(json.contains("reject_listing"));
     }
 
     #[test]
     fn test_extract_json_raw() {
-        let response = r#"{"time": "2024-01-15", "actor": "user123"}"#;
+        let response = r#"{"event_type":"browse","actor":"user123"}"#;
         let json = EventHandler::extract_json(response);
         assert_eq!(json, response);
-    }
-
-    #[test]
-    fn test_extract_optional_string_valid() {
-        let value = serde_json::json!("test value");
-        let result = EventHandler::extract_optional_string(&value);
-        assert_eq!(result, Some("test value".to_string()));
-    }
-
-    #[test]
-    fn test_extract_optional_string_null() {
-        let value = serde_json::json!(null);
-        let result = EventHandler::extract_optional_string(&value);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_optional_string_null_string() {
-        let value = serde_json::json!("null");
-        let result = EventHandler::extract_optional_string(&value);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_optional_string_empty() {
-        let value = serde_json::json!("");
-        let result = EventHandler::extract_optional_string(&value);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_optional_string_whitespace() {
-        let value = serde_json::json!("   ");
-        let result = EventHandler::extract_optional_string(&value);
-        assert!(result.is_none());
     }
 
     #[test]
@@ -629,187 +487,104 @@ mod tests {
     }
 
     #[test]
-    fn test_build_extraction_prompt() {
-        // Test the prompt building logic directly
-        let template = "Process this: {content}";
-        let content = "User clicked button";
-        let result = template.replace("{content}", content);
-
-        assert_eq!(result, "Process this: User clicked button");
-    }
-
-    #[test]
     fn test_parse_llm_response_full() {
-        // Test parsing logic using a helper function that doesn't need a provider
         let response = r#"{
-            "time": "2024-01-15 14:30",
-            "location": "房源详情页",
+            "event_type": "feedback",
             "actor": "user123",
-            "cause": "用户对房源不满意",
-            "process": "点击了不喜欢按钮",
+            "intent": "reject_listing",
+            "entities": ["listing_001"],
+            "state_changes": ["listing_marked_disliked"],
             "result": "房源被标记为不喜欢",
-            "background": "用户正在浏览推荐房源",
-            "details": "选择原因：价格过高",
+            "context_notes": "用户正在浏览推荐房源",
             "category": "反馈"
         }"#;
 
-        let result = parse_llm_response_test(response, "default_user").unwrap();
+        let result = parse_llm_response_test(response).unwrap();
 
-        assert_eq!(result.time, Some("2024-01-15 14:30".to_string()));
-        assert_eq!(result.location, Some("房源详情页".to_string()));
-        assert_eq!(result.actor, "user123");
-        assert_eq!(result.cause, Some("用户对房源不满意".to_string()));
-        assert_eq!(result.process, Some("点击了不喜欢按钮".to_string()));
-        assert_eq!(result.result, Some("房源被标记为不喜欢".to_string()));
-        assert_eq!(result.background, Some("用户正在浏览推荐房源".to_string()));
-        assert_eq!(result.details, Some("选择原因：价格过高".to_string()));
-        assert_eq!(result.category, Some("反馈".to_string()));
-    }
-
-    #[test]
-    fn test_parse_llm_response_with_nulls() {
-        let response = r#"{
-            "time": null,
-            "location": "页面A",
-            "actor": null,
-            "cause": null,
-            "process": "用户操作",
-            "result": null,
-            "background": null,
-            "details": null,
-            "category": "操作"
-        }"#;
-
-        let result = parse_llm_response_test(response, "default_user").unwrap();
-
-        assert!(result.time.is_none());
-        assert_eq!(result.location, Some("页面A".to_string()));
-        assert_eq!(result.actor, "default_user"); // Falls back to default
-        assert!(result.cause.is_none());
-        assert_eq!(result.process, Some("用户操作".to_string()));
-        assert!(result.result.is_none());
-        assert!(result.background.is_none());
-        assert!(result.details.is_none());
-        assert_eq!(result.category, Some("操作".to_string()));
+        assert_eq!(result["event_type"], "feedback");
+        assert_eq!(result["actor"], "user123");
+        assert_eq!(result["intent"], "reject_listing");
+        assert_eq!(result["category"], "反馈");
     }
 
     #[test]
     fn test_parse_llm_response_with_code_block() {
         let response = r#"```json
 {
-    "time": "2024-01-15",
-    "location": "首页",
+    "event_type": "browse",
     "actor": "user456",
-    "cause": null,
-    "process": "浏览",
+    "intent": "view_page",
+    "entities": ["首页"],
+    "state_changes": [],
     "result": null,
-    "background": null,
-    "details": null,
+    "risk_flags": [],
+    "context_notes": null,
     "category": "浏览"
 }
 ```"#;
 
-        let result = parse_llm_response_test(response, "default_user").unwrap();
-
-        assert_eq!(result.time, Some("2024-01-15".to_string()));
-        assert_eq!(result.location, Some("首页".to_string()));
-        assert_eq!(result.actor, "user456");
-        assert_eq!(result.category, Some("浏览".to_string()));
+        let result = parse_llm_response_test(response).unwrap();
+        assert_eq!(result["event_type"], "browse");
+        assert_eq!(result["actor"], "user456");
+        assert_eq!(result["category"], "浏览");
     }
 
-    /// Helper function for testing parse_llm_response without needing a provider
-    fn parse_llm_response_test(
-        response: &str,
-        default_actor: &str,
-    ) -> crate::error::AppResult<ParsedStructuredEvent> {
+    fn parse_llm_response_test(response: &str) -> crate::error::AppResult<Value> {
         let json_str = EventHandler::extract_json(response);
-
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+        let parsed: Value = serde_json::from_str(&json_str).map_err(|e| {
             crate::error::AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
         })?;
 
-        // Extract fields with null handling
-        let time = EventHandler::extract_optional_string(&parsed["time"]);
-        let location = EventHandler::extract_optional_string(&parsed["location"]);
-        let actor = EventHandler::extract_optional_string(&parsed["actor"])
-            .unwrap_or_else(|| default_actor.to_string());
-        let cause = EventHandler::extract_optional_string(&parsed["cause"]);
-        let process = EventHandler::extract_optional_string(&parsed["process"]);
-        let result = EventHandler::extract_optional_string(&parsed["result"]);
-        let background = EventHandler::extract_optional_string(&parsed["background"]);
-        let details = EventHandler::extract_optional_string(&parsed["details"]);
-        let category = EventHandler::extract_optional_string(&parsed["category"]);
+        if !parsed.is_object() {
+            return Err(crate::error::AppError::Internal(
+                "expected object".to_string(),
+            ));
+        }
 
-        Ok(ParsedStructuredEvent {
-            time,
-            location,
-            actor,
-            cause,
-            process,
-            result,
-            background,
-            details,
-            category,
-        })
+        Ok(parsed)
     }
 
-    /// Helper function for testing parse_relevance_response
     fn parse_relevance_response_test(
         response: &str,
     ) -> crate::error::AppResult<RelevanceCheckResult> {
         let json_str = EventHandler::extract_json(response);
-
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+        let parsed: Value = serde_json::from_str(&json_str).map_err(|e| {
             crate::error::AppError::Internal(format!("Invalid JSON response from LLM: {}", e))
         })?;
 
-        let is_relevant = parsed["is_relevant"].as_bool().unwrap_or(true);
-        let relevance_score = parsed["relevance_score"]
-            .as_f64()
-            .map(|f| f as f32)
-            .unwrap_or(if is_relevant { 1.0 } else { 0.0 });
-        let reason = parsed["reason"]
-            .as_str()
-            .unwrap_or("No reason provided")
-            .to_string();
-        let matched_categories = parsed["matched_categories"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let related_memory_indices = parsed["related_memory_indices"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .collect()
-            })
-            .unwrap_or_default();
-
         Ok(RelevanceCheckResult {
-            is_relevant,
-            relevance_score,
-            reason,
-            matched_categories,
-            related_memory_indices,
+            is_relevant: parsed["is_relevant"].as_bool().unwrap_or(true),
+            relevance_score: parsed["relevance_score"]
+                .as_f64()
+                .map(|f| f as f32)
+                .unwrap_or(if parsed["is_relevant"].as_bool().unwrap_or(true) {
+                    1.0
+                } else {
+                    0.0
+                }),
+            reason: parsed["reason"]
+                .as_str()
+                .unwrap_or("No reason provided")
+                .to_string(),
+            matched_categories: parsed["matched_categories"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            related_memory_indices: parsed["related_memory_indices"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
-    }
-
-    #[test]
-    fn test_relevance_check_prompt_contains_placeholders() {
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{system_name}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{purpose}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{domain}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{target_audience}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{event_categories}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{memory_focus}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{boundaries}"));
-        assert!(RELEVANCE_CHECK_PROMPT.contains("{content}"));
     }
 
     #[test]
@@ -822,77 +597,9 @@ mod tests {
         }"#;
 
         let result = parse_relevance_response_test(response).unwrap();
-
         assert!(result.is_relevant);
         assert!((result.relevance_score - 0.85).abs() < 0.01);
         assert_eq!(result.reason, "事件内容与房产推荐业务相关");
-        assert_eq!(result.matched_categories, vec!["咨询", "看房"]);
-    }
-
-    #[test]
-    fn test_parse_relevance_response_not_relevant() {
-        let response = r#"{
-            "is_relevant": false,
-            "relevance_score": 0.15,
-            "reason": "事件内容与房产业务无关，是关于编程语言的讨论",
-            "matched_categories": []
-        }"#;
-
-        let result = parse_relevance_response_test(response).unwrap();
-
-        assert!(!result.is_relevant);
-        assert!((result.relevance_score - 0.15).abs() < 0.01);
-        assert!(result.reason.contains("编程语言"));
-        assert!(result.matched_categories.is_empty());
-    }
-
-    #[test]
-    fn test_parse_relevance_response_with_code_block() {
-        let response = r#"```json
-{
-    "is_relevant": false,
-    "relevance_score": 0.1,
-    "reason": "内容与系统业务领域不相关",
-    "matched_categories": []
-}
-```"#;
-
-        let result = parse_relevance_response_test(response).unwrap();
-
-        assert!(!result.is_relevant);
-        assert!((result.relevance_score - 0.1).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_parse_relevance_response_defaults() {
-        // Test with minimal response - should use defaults
-        let response = r#"{"reason": "Some reason"}"#;
-
-        let result = parse_relevance_response_test(response).unwrap();
-
-        // Default is_relevant is true
-        assert!(result.is_relevant);
-        // Default score for relevant is 1.0
-        assert!((result.relevance_score - 1.0).abs() < 0.01);
-        assert_eq!(result.reason, "Some reason");
-        assert!(result.matched_categories.is_empty());
-    }
-
-    #[test]
-    fn test_parse_relevance_response_with_related_memories() {
-        let response = r#"{
-            "is_relevant": true,
-            "relevance_score": 0.75,
-            "reason": "事件与用户历史记忆相关，可能是财务状况更新",
-            "matched_categories": [],
-            "related_memory_indices": [1, 3, 5]
-        }"#;
-
-        let result = parse_relevance_response_test(response).unwrap();
-
-        assert!(result.is_relevant);
-        assert!((result.relevance_score - 0.75).abs() < 0.01);
-        assert_eq!(result.related_memory_indices, vec![1, 3, 5]);
     }
 
     #[test]
@@ -906,56 +613,31 @@ mod tests {
     fn test_format_context_memories_single() {
         let memory = create_test_memory(
             "我想买一套海景房，但是价钱太贵了买不起",
-            Some("personal.finance.budget"),
+            serde_json::json!({
+                "memory_type": "house_budget",
+                "status": "insufficient_budget"
+            }),
             false,
         );
-        let memories = vec![memory];
-        let result = EventHandler::format_context_memories(&memories);
-
-        assert!(result.contains("1."));
-        assert!(result.contains("[personal.finance.budget]"));
+        let result = EventHandler::format_context_memories(&[memory]);
+        assert!(result.contains("\"memory_type\":\"house_budget\""));
         assert!(result.contains("买不起"));
-        assert!(!result.contains("[长期记忆]"));
     }
 
-    #[test]
-    fn test_format_context_memories_with_global() {
-        let memory1 = create_test_memory("我喜欢海景房", Some("personal.preference.housing"), true);
-        let memory2 = create_test_memory("预算有限", Some("personal.finance.budget"), false);
-        let memories = vec![memory1, memory2];
-        let result = EventHandler::format_context_memories(&memories);
-
-        assert!(result.contains("1."));
-        assert!(result.contains("2."));
-        assert!(result.contains("[长期记忆]"));
-        assert!(result.contains("海景房"));
-        assert!(result.contains("预算有限"));
-    }
-
-    #[test]
-    fn test_format_context_memories_no_category() {
-        let memory = create_test_memory("一些内容", None, false);
-        let memories = vec![memory];
-        let result = EventHandler::format_context_memories(&memories);
-
-        assert!(result.contains("[未分类]"));
-    }
-
-    /// Helper function to create a test memory
-    fn create_test_memory(content: &str, category: Option<&str>, is_global: bool) -> Memory {
+    fn create_test_memory(content: &str, metadata: Value, is_global: bool) -> Memory {
         Memory {
             id: uuid::Uuid::new_v4(),
             profile_id: uuid::Uuid::new_v4(),
-            owner_id: "test_owner".to_string(),
+            owner_id: "owner123".to_string(),
             scope_id: if is_global {
                 None
             } else {
-                Some("test_scope".to_string())
+                Some("scope123".to_string())
             },
             content: content.to_string(),
-            category: category.map(|s| s.to_string()),
-            tags: None,
-            importance: 0.5,
+            metadata,
+            schema_version: 1,
+            importance: 0.8,
             confidence: 0.8,
             root_memory_id: None,
             version_number: 1,

@@ -10,6 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::Type;
 use std::fmt;
 use utoipa::ToSchema;
@@ -110,6 +111,10 @@ pub struct Event {
     pub context: Option<String>,
     /// LLM-generated summary of the event
     pub summary: Option<String>,
+    /// Profile-aware structured analysis result for this event
+    pub analysis_payload: Option<Value>,
+    /// Schema version used to generate the analysis payload
+    pub analysis_schema_version: Option<i32>,
     /// Recommended event source classification.
     pub source: Option<EventSource>,
     /// Current event processing status
@@ -142,6 +147,8 @@ impl Event {
             content: input.content,
             context: input.context,
             summary: None,
+            analysis_payload: None,
+            analysis_schema_version: None,
             source: input.source,
             processing_status: ProcessingStatus::Pending,
             error_message: None,
@@ -157,6 +164,23 @@ impl Event {
     /// Mark the event as processed with a summary
     pub fn mark_processed(&mut self, summary: String) {
         self.summary = Some(summary);
+        self.processing_status = ProcessingStatus::Completed;
+        self.error_message = None;
+        self.processed_at = Some(Utc::now());
+        self.skipped = false;
+        self.skip_reason = None;
+    }
+
+    /// Mark the event as processed with summary and analysis payload.
+    pub fn mark_processed_with_analysis(
+        &mut self,
+        summary: String,
+        analysis_payload: Option<Value>,
+        analysis_schema_version: Option<i32>,
+    ) {
+        self.summary = Some(summary);
+        self.analysis_payload = analysis_payload;
+        self.analysis_schema_version = analysis_schema_version;
         self.processing_status = ProcessingStatus::Completed;
         self.error_message = None;
         self.processed_at = Some(Utc::now());
@@ -327,6 +351,8 @@ mod tests {
         assert!(!event.skipped);
         assert!(event.processed_at.is_none());
         assert!(event.summary.is_none());
+        assert!(event.analysis_payload.is_none());
+        assert!(event.analysis_schema_version.is_none());
     }
 
     #[test]
@@ -358,6 +384,34 @@ mod tests {
             event.summary,
             Some("User changed theme preference".to_string())
         );
+    }
+
+    #[test]
+    fn test_event_mark_processed_with_analysis() {
+        let input = valid_event_input();
+        let mut event = Event::new(input);
+        let analysis_payload = serde_json::json!({
+            "intent": "update_preference",
+            "metadata_hint": {
+                "memory_type": "theme_preference",
+                "value": "dark"
+            }
+        });
+
+        event.mark_processed_with_analysis(
+            "User changed theme preference".to_string(),
+            Some(analysis_payload.clone()),
+            Some(2),
+        );
+
+        assert_eq!(event.processing_status, ProcessingStatus::Completed);
+        assert_eq!(
+            event.summary,
+            Some("User changed theme preference".to_string())
+        );
+        assert_eq!(event.analysis_payload, Some(analysis_payload));
+        assert_eq!(event.analysis_schema_version, Some(2));
+        assert!(event.processed_at.is_some());
     }
 
     #[test]

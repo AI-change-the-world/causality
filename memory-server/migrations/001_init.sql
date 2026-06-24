@@ -12,14 +12,11 @@ CREATE TYPE status AS ENUM ('active', 'cooldown', 'candidate', 'superseded', 'ar
 -- Embedding generation status
 CREATE TYPE embedding_status AS ENUM ('pending', 'completed', 'failed');
 
--- Processing status for LLM memory processing
-CREATE TYPE processing_status AS ENUM ('pending', 'completed', 'failed', 'skipped');
+-- Processing status for event and memory processing
+CREATE TYPE processing_status AS ENUM ('pending', 'processing', 'completed', 'failed', 'skipped');
 
 -- Provider type (for both embedding and LLM providers)
 CREATE TYPE provider_type AS ENUM ('openai', 'azure', 'local');
-
--- Memory category for LLM classification
-CREATE TYPE memory_category AS ENUM ('user_preference', 'behavior_pattern', 'business_rule', 'factual_knowledge', 'other');
 
 -- Relation type between events and memories
 CREATE TYPE event_memory_relation_type AS ENUM ('created_from', 'reinforced_by');
@@ -40,6 +37,12 @@ CREATE TABLE system_profiles (
     boundaries TEXT[] NOT NULL DEFAULT '{}',
     -- 事件提取 prompt (完整的 prompt 模板)
     extraction_prompt TEXT NOT NULL DEFAULT '',
+    -- Profile-driven metadata schema contract
+    metadata_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+    schema_status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    schema_confirmed_at TIMESTAMPTZ,
+    schema_generation_prompt TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -68,6 +71,8 @@ CREATE TABLE events (
     skipped BOOLEAN NOT NULL DEFAULT false,
     skip_reason TEXT,
     relevance_score REAL,
+    analysis_payload JSONB,
+    analysis_schema_version INTEGER,
     -- Timestamps
     event_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -97,8 +102,8 @@ CREATE TABLE memories (
     
     -- Content fields (immutable after creation)
     content TEXT NOT NULL,
-    category VARCHAR(500),  -- hierarchical: work.code.eslint
-    tags TEXT[],
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    schema_version INTEGER NOT NULL DEFAULT 1,
     importance REAL NOT NULL DEFAULT 0.5,
     confidence REAL NOT NULL DEFAULT 1.0,
     
@@ -167,35 +172,6 @@ CREATE TABLE event_memory_relations (
 );
 
 -- ============================================================================
--- STRUCTURED EVENTS TABLE (六要素 + 两辅助)
--- ============================================================================
-
-CREATE TABLE structured_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_id UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-    -- 六要素
-    time_element TEXT,
-    location_element TEXT,
-    actor_element VARCHAR(255) NOT NULL,
-    cause_element TEXT,
-    process_element TEXT,
-    result_element TEXT,
-    -- 两辅助
-    background_element TEXT,
-    details_element TEXT,
-    -- 分类
-    category VARCHAR(100),
-    -- 时间戳
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- 一个事件只有一个结构化记录
-    UNIQUE(event_id)
-);
-
-CREATE INDEX idx_structured_events_event ON structured_events(event_id);
-CREATE INDEX idx_structured_events_category ON structured_events(category);
-CREATE INDEX idx_structured_events_actor ON structured_events(actor_element);
-
--- ============================================================================
 -- AUDIT LOG TABLE
 -- ============================================================================
 
@@ -254,8 +230,8 @@ CREATE INDEX idx_memories_owner_scope ON memories(owner_id, scope_id);
 CREATE INDEX idx_memories_status ON memories(status);
 CREATE INDEX idx_memories_global ON memories(owner_id, is_global) WHERE is_global = true;
 
--- Category index for prefix queries
-CREATE INDEX idx_memories_category ON memories(category);
+-- Metadata index for JSONB retrieval
+CREATE INDEX idx_memories_metadata ON memories USING GIN(metadata);
 
 -- Lifecycle indexes
 CREATE INDEX idx_memories_decay_score ON memories(decay_score);
@@ -269,9 +245,6 @@ CREATE INDEX idx_memories_created_at ON memories(created_at);
 
 -- Full-text search index
 CREATE INDEX idx_memories_content_tsv ON memories USING GIN(content_tsv);
-
--- Tags index
-CREATE INDEX idx_memories_tags ON memories USING GIN(tags) WHERE tags IS NOT NULL;
 
 -- ============================================================================
 -- INDEXES FOR EVENT-MEMORY RELATIONS
@@ -363,6 +336,4 @@ INSERT INTO lifecycle_config (key, value) VALUES
         "min_reinforcements": 3,
         "min_confidence": 0.7,
         "min_age_hours": 24
-    }'),
-    ('compression_prompt', '"你是一个记忆压缩助手。请从以下对话/操作记录中提取关键信息，生成简洁的结构化记忆。\n\n要求：\n1. 保留核心事实和用户偏好\n2. 去除冗余和无关信息\n3. 使用简洁的陈述句\n4. 保持原意不变\n\n原始内容：\n{content}\n\n压缩后的记忆："'),
-    ('classification_prompt', '"请将以下记忆分类到最合适的类别：\n- user_preference: 用户偏好（如喜好、习惯设置）\n- behavior_pattern: 行为模式（如工作习惯、操作方式）\n- business_rule: 业务规则（如流程、规定）\n- factual_knowledge: 事实知识（如日期、数据）\n- other: 其他\n\n记忆内容：\n{content}\n\n请只返回类别名称："');
+    }');
