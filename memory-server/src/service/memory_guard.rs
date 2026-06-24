@@ -14,7 +14,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::domain::{
-    CreateEventInput, CreateMemoryInput, CreateMemoryValidation, Event, EventSource, Memory,
+    CreateEventInput, CreateMemoryInput, CreateMemoryValidation, EmbeddingStatus, Event,
+    EventSource, Memory,
 };
 use crate::embedding::{EmbeddingProvider, EmbeddingRequest};
 use crate::error::{AppError, AppResult};
@@ -550,46 +551,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                         .await
                         .unwrap_or(memory);
 
-                    // Generate embedding with the configured provider
-                    let embedding_request = EmbeddingRequest::new(&memory.content);
-                    let embedding_response = context
-                        .embedding_provider
-                        .embed(embedding_request)
-                        .await
-                        .map_err(|e| {
-                            AppError::Internal(format!("Embedding generation failed: {}", e))
-                        })?;
-
-                    // Store in Qdrant
-                    let payload = crate::repository::VectorPayload {
-                        profile_id: memory.profile_id,
-                        owner_id: memory.owner_id.clone(),
-                        memory_id: memory.id,
-                        scope_id: memory.scope_id.clone(),
-                        category: memory.category.clone(),
-                        status: memory.status.to_string(),
-                        is_global: memory.is_global,
-                    };
-
-                    context
-                        .qdrant_repo
-                        .upsert_vector(
-                            &context.embedding_provider_name,
-                            memory.id,
-                            embedding_response.embedding,
-                            payload,
-                        )
-                        .await?;
-
-                    // Update memory with embedding status and provider in database
-                    memory = self
-                        .memory_repo
-                        .update_embedding_status_and_provider(
-                            memory.id,
-                            crate::domain::EmbeddingStatus::Completed,
-                            Some(&context.embedding_provider_name),
-                        )
-                        .await?;
+                    memory = self.upsert_event_memory_vector(&context, memory).await?;
 
                     debug!(
                         memory_id = %memory.id,
@@ -653,45 +615,22 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     superseded_id,
                     ..
                 } => {
-                    let embedding_request = EmbeddingRequest::new(&new_memory.content);
-                    let embedding_response = context
-                        .embedding_provider
-                        .embed(embedding_request)
-                        .await
-                        .map_err(|e| {
-                            AppError::Internal(format!("Embedding generation failed: {}", e))
-                        })?;
-
-                    // Store in Qdrant
-                    let payload = crate::repository::VectorPayload {
-                        profile_id: new_memory.profile_id,
-                        owner_id: new_memory.owner_id.clone(),
-                        memory_id: new_memory.id,
-                        scope_id: new_memory.scope_id.clone(),
-                        category: new_memory.category.clone(),
-                        status: new_memory.status.to_string(),
-                        is_global: new_memory.is_global,
-                    };
-
-                    context
-                        .qdrant_repo
-                        .upsert_vector(
-                            &context.embedding_provider_name,
-                            new_memory.id,
-                            embedding_response.embedding,
-                            payload,
-                        )
-                        .await?;
-
-                    // Update new memory with embedding status and provider in database
                     let _updated_memory = self
-                        .memory_repo
-                        .update_embedding_status_and_provider(
-                            new_memory.id,
-                            crate::domain::EmbeddingStatus::Completed,
-                            Some(&context.embedding_provider_name),
-                        )
+                        .upsert_event_memory_vector(&context, new_memory.clone())
                         .await?;
+
+                    if let Err(e) = context
+                        .qdrant_repo
+                        .delete_vector(&context.embedding_provider_name, superseded_id)
+                        .await
+                    {
+                        warn!(
+                            memory_id = %superseded_id,
+                            provider = %context.embedding_provider_name,
+                            error = %e,
+                            "Failed to delete superseded memory vector"
+                        );
+                    }
 
                     debug!(
                         new_memory_id = %new_memory.id,
@@ -948,6 +887,72 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         }
 
         context_parts.join("\n")
+    }
+
+    async fn upsert_event_memory_vector(
+        &self,
+        context: &EventProcessingContext,
+        mut memory: Memory,
+    ) -> AppResult<Memory> {
+        let embedding_request = EmbeddingRequest::new(&memory.content);
+
+        let embedding_response = match context.embedding_provider.embed(embedding_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                warn!(
+                    memory_id = %memory.id,
+                    error = %e,
+                    "Embedding generation failed after memory DB write"
+                );
+                return self
+                    .memory_repo
+                    .update_embedding_status_and_provider(memory.id, EmbeddingStatus::Failed, None)
+                    .await;
+            }
+        };
+
+        let payload = crate::repository::VectorPayload {
+            profile_id: memory.profile_id,
+            owner_id: memory.owner_id.clone(),
+            memory_id: memory.id,
+            scope_id: memory.scope_id.clone(),
+            category: memory.category.clone(),
+            status: memory.status.to_string(),
+            is_global: memory.is_global,
+        };
+
+        if let Err(e) = context
+            .qdrant_repo
+            .upsert_vector(
+                &context.embedding_provider_name,
+                memory.id,
+                embedding_response.embedding,
+                payload,
+            )
+            .await
+        {
+            warn!(
+                memory_id = %memory.id,
+                provider = %context.embedding_provider_name,
+                error = %e,
+                "Qdrant upsert failed after memory DB write"
+            );
+            return self
+                .memory_repo
+                .update_embedding_status_and_provider(memory.id, EmbeddingStatus::Failed, None)
+                .await;
+        }
+
+        memory = self
+            .memory_repo
+            .update_embedding_status_and_provider(
+                memory.id,
+                EmbeddingStatus::Completed,
+                Some(&context.embedding_provider_name),
+            )
+            .await?;
+
+        Ok(memory)
     }
 }
 

@@ -136,7 +136,7 @@ impl MemoryMatcher {
             profile_id: Some(profile_id),
             owner_id: Some(owner_id.to_string()),
             scope_id: scope_id.map(|s| s.to_string()),
-            include_global: Some(scope_id.is_some()),
+            include_global: Some(true),
             statuses: Some(vec!["active".to_string()]),
             ..Default::default()
         };

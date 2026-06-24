@@ -91,6 +91,42 @@ impl EventRepository {
         Ok(row.into())
     }
 
+    /// Atomically claim a pending event for processing.
+    ///
+    /// This prevents duplicate workers or repeated requests from processing the
+    /// same event concurrently.
+    pub async fn claim_for_processing(&self, profile_id: Uuid, id: Uuid) -> AppResult<Event> {
+        let row = sqlx::query_as::<_, EventRow>(
+            r#"
+            UPDATE events
+            SET processing_status = 'processing'::processing_status,
+                error_message = NULL,
+                processed_at = NULL,
+                skipped = false,
+                skip_reason = NULL,
+                relevance_score = NULL
+            WHERE id = $1
+              AND profile_id = $2
+              AND processing_status = 'pending'::processing_status
+            RETURNING
+                id, profile_id, owner_id, scope_id, content, context,
+                summary, source, processing_status, error_message, processed_at,
+                skipped, skip_reason, relevance_score, event_time, created_at
+            "#,
+        )
+        .bind(id)
+        .bind(profile_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            AppError::Validation(
+                "event is not pending or is already claimed for processing".to_string(),
+            )
+        })?;
+
+        Ok(row.into())
+    }
+
     /// Mark an event as processed with a summary
     pub async fn mark_processed(&self, id: Uuid, summary: &str) -> AppResult<Event> {
         let row = sqlx::query_as::<_, EventRow>(

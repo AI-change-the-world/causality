@@ -5,7 +5,8 @@
 
 use qdrant_client::qdrant::{
     vectors_config::Config, Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance,
-    Filter, PointId, PointStruct, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    Filter, PointId, PointStruct, SearchPointsBuilder, SetPayloadPointsBuilder,
+    UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use serde::{Deserialize, Serialize};
@@ -263,6 +264,42 @@ impl QdrantRepository {
         Ok(())
     }
 
+    /// Update payload metadata for an existing memory vector.
+    pub async fn update_payload(
+        &self,
+        provider_name: &str,
+        memory_id: Uuid,
+        payload: VectorPayload,
+    ) -> AppResult<()> {
+        let collection_name = Self::collection_name(provider_name);
+
+        {
+            let cache = self.collections.read().await;
+            if !cache.contains_key(&collection_name) {
+                return Err(AppError::VectorDb(format!(
+                    "Collection {} does not exist",
+                    collection_name
+                )));
+            }
+        }
+
+        self.client
+            .set_payload(
+                SetPayloadPointsBuilder::new(&collection_name, payload.to_qdrant_payload())
+                    .points_selector([memory_id.to_string()]),
+            )
+            .await
+            .map_err(|e| AppError::VectorDb(format!("Failed to update payload: {}", e)))?;
+
+        debug!(
+            collection = %collection_name,
+            memory_id = %memory_id,
+            "Updated vector payload"
+        );
+
+        Ok(())
+    }
+
     /// Search for similar vectors in a single collection
     pub async fn search(
         &self,
@@ -497,7 +534,7 @@ impl VectorFilter {
             } else {
                 must.push(Condition::matches(FIELD_SCOPE_ID, scope_id.clone()));
             }
-        } else if self.include_global.unwrap_or(false) {
+        } else if self.include_global.unwrap_or(true) && self.is_global.is_none() {
             must.push(Condition::matches(FIELD_IS_GLOBAL, true));
         }
 
@@ -579,7 +616,30 @@ mod tests {
     fn test_vector_filter_empty() {
         let filter = VectorFilter::default();
         let qdrant_filter = filter.to_qdrant_filter();
-        assert!(qdrant_filter.must.is_empty());
+        assert_eq!(qdrant_filter.must.len(), 1);
+    }
+
+    #[test]
+    fn test_vector_filter_without_scope_defaults_to_global_only() {
+        let filter = VectorFilter {
+            profile_id: Some(Uuid::new_v4()),
+            owner_id: Some("owner123".to_string()),
+            ..Default::default()
+        };
+        let qdrant_filter = filter.to_qdrant_filter();
+
+        assert_eq!(qdrant_filter.must.len(), 3);
+    }
+
+    #[test]
+    fn test_vector_filter_explicit_is_global_overrides_default_scope_policy() {
+        let filter = VectorFilter {
+            is_global: Some(false),
+            ..Default::default()
+        };
+        let qdrant_filter = filter.to_qdrant_filter();
+
+        assert_eq!(qdrant_filter.must.len(), 1);
     }
 
     #[test]

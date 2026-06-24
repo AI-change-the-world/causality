@@ -282,6 +282,38 @@ impl MemoryRepository {
         Ok(row.into())
     }
 
+    /// Find retrievable memories whose embeddings should be created or rebuilt.
+    pub async fn find_embeddings_to_rebuild(
+        &self,
+        profile_id: Uuid,
+        owner_id: Option<&str>,
+        statuses: &[EmbeddingStatus],
+        limit: i64,
+    ) -> AppResult<Vec<Memory>> {
+        let rows = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                SELECT {}
+                FROM memories
+                WHERE profile_id = $1
+                  AND ($2::text IS NULL OR owner_id = $2)
+                  AND is_current_version = true
+                  AND status NOT IN ('superseded', 'archived')
+                  AND embedding_status = ANY($3)
+                ORDER BY updated_at ASC
+                LIMIT $4
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(profile_id)
+        .bind(owner_id)
+        .bind(statuses)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// Mark a memory as superseded by a new version
     pub async fn update_superseded(&self, id: Uuid, superseded_by_id: Uuid) -> AppResult<Memory> {
         let row = sqlx::query_as::<_, MemoryRow>(&format!(
@@ -387,9 +419,11 @@ impl MemoryRepository {
                   AND is_current_version = true
                   AND status NOT IN ('superseded', 'archived')
                   AND (
-                    $3::text IS NULL
-                    OR scope_id = $3
-                    OR ($4 = true AND is_global = true)
+                    ($3::text IS NULL AND is_global = true)
+                    OR (
+                      $3::text IS NOT NULL
+                      AND (scope_id = $3 OR ($4 = true AND is_global = true))
+                    )
                   )
                   AND ($5::text IS NULL OR category LIKE $5 || '%')
                 ORDER BY decay_score DESC, updated_at DESC
@@ -562,8 +596,10 @@ impl MemoryRepository {
               AND status NOT IN ('superseded', 'archived')
               AND (
                 ($4::text IS NULL AND is_global = true)
-                OR scope_id = $4
-                OR ($7 = true AND is_global = true)
+                OR (
+                  $4::text IS NOT NULL
+                  AND (scope_id = $4 OR ($7 = true AND is_global = true))
+                )
               )
             ORDER BY rank DESC
             LIMIT $5
@@ -833,8 +869,10 @@ impl MemoryRepository {
               AND content_tsv @@ plainto_tsquery('simple', $3)
               AND (
                 ($4::text IS NULL AND is_global = true)
-                OR scope_id = $4
-                OR ($5 = true AND is_global = true)
+                OR (
+                  $4::text IS NOT NULL
+                  AND (scope_id = $4 OR ($5 = true AND is_global = true))
+                )
               )
             ORDER BY rank DESC
             LIMIT $6
@@ -907,9 +945,9 @@ impl MemoryRepository {
         let result = sqlx::query(
             r#"
             UPDATE memories
-            SET decay_score = (1.0 + ln(hit_count + 1) * $2)
-                            * exp(-EXTRACT(EPOCH FROM (NOW() - COALESCE(last_hit_at, created_at))) / 86400.0 / $3)
-                            * CASE WHEN is_global THEN $4 ELSE 1.0 END,
+            SET decay_score = (1.0 + ln(hit_count + 1) * $3)
+                            * exp(-EXTRACT(EPOCH FROM (NOW() - COALESCE(last_hit_at, created_at))) / 86400.0 / $4)
+                            * CASE WHEN is_global THEN $5 ELSE 1.0 END,
                 updated_at = NOW()
             WHERE profile_id = $1
               AND owner_id = $2

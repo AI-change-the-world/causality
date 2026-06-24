@@ -298,21 +298,11 @@ pub async fn create_memory(
     Path(profile_id): Path<Uuid>,
     Json(request): Json<CreateMemoryApiRequest>,
 ) -> AppResult<(StatusCode, Json<CreateMemoryResponse>)> {
-    use crate::repository::VectorPayload;
-
     let input = request.into_domain_input(profile_id);
 
     let mut memory = state.memory_guard.create_memory(input, None).await?;
 
-    let payload = VectorPayload {
-        profile_id: memory.profile_id,
-        owner_id: memory.owner_id.clone(),
-        memory_id: memory.id,
-        scope_id: memory.scope_id.clone(),
-        category: memory.category.clone(),
-        is_global: memory.is_global,
-        status: memory.status.to_string(),
-    };
+    let payload = vector_payload(&memory);
 
     let embedding_provider_name = state.embedding_provider_name.clone();
 
@@ -473,6 +463,7 @@ pub async fn delete_memory(
     ensure_memory_profile(&existing, profile_id)?;
 
     let memory = state.memory_guard.delete_memory(id, None).await?;
+    sync_archived_vector(&state, &memory).await;
     Ok(Json(GetMemoryResponse::from(memory)))
 }
 
@@ -598,6 +589,7 @@ pub async fn promote_memory(
         .lifecycle_manager
         .promote_memory(id, &request.reason)
         .await?;
+    sync_memory_payload(&state, &promoted).await;
 
     let response = PromoteMemoryResponse {
         memory: GetMemoryResponse::from(promoted.clone()),
@@ -616,6 +608,50 @@ fn ensure_memory_profile(memory: &Memory, profile_id: Uuid) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+async fn sync_archived_vector(state: &AppState, memory: &Memory) {
+    if let Some(provider) = &memory.embedding_provider {
+        if let Err(e) = state.qdrant_repo.delete_vector(provider, memory.id).await {
+            tracing::warn!(
+                memory_id = %memory.id,
+                provider = %provider,
+                error = %e,
+                "Failed to delete archived memory vector"
+            );
+        }
+    }
+}
+
+async fn sync_memory_payload(state: &AppState, memory: &Memory) {
+    if let Some(provider) = &memory.embedding_provider {
+        let payload = vector_payload(memory);
+
+        if let Err(e) = state
+            .qdrant_repo
+            .update_payload(provider, memory.id, payload)
+            .await
+        {
+            tracing::warn!(
+                memory_id = %memory.id,
+                provider = %provider,
+                error = %e,
+                "Failed to update memory vector payload"
+            );
+        }
+    }
+}
+
+pub(crate) fn vector_payload(memory: &Memory) -> crate::repository::VectorPayload {
+    crate::repository::VectorPayload {
+        profile_id: memory.profile_id,
+        owner_id: memory.owner_id.clone(),
+        memory_id: memory.id,
+        scope_id: memory.scope_id.clone(),
+        category: memory.category.clone(),
+        is_global: memory.is_global,
+        status: memory.status.to_string(),
+    }
 }
 
 #[cfg(test)]

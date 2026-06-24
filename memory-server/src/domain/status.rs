@@ -103,6 +103,8 @@ impl std::fmt::Display for EmbeddingStatus {
 pub enum ProcessingStatus {
     /// Waiting for LLM processing
     Pending,
+    /// Currently claimed by a worker or request.
+    Processing,
     /// LLM processing completed successfully
     Completed,
     /// LLM processing failed
@@ -121,6 +123,7 @@ impl std::fmt::Display for ProcessingStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessingStatus::Pending => write!(f, "pending"),
+            ProcessingStatus::Processing => write!(f, "processing"),
             ProcessingStatus::Completed => write!(f, "completed"),
             ProcessingStatus::Failed => write!(f, "failed"),
             ProcessingStatus::Skipped => write!(f, "skipped"),
@@ -404,6 +407,11 @@ mod tests {
     #[test]
     fn test_processing_status_default() {
         assert_eq!(ProcessingStatus::default(), ProcessingStatus::Skipped);
+    }
+
+    #[test]
+    fn test_processing_status_processing_display() {
+        assert_eq!(ProcessingStatus::Processing.to_string(), "processing");
     }
 
     #[test]

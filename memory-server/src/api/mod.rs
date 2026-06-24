@@ -92,6 +92,7 @@ pub struct AppState {
         retrieval::auto_retrieve_memories,
         admin::run_eviction,
         admin::update_decay_scores,
+        admin::rebuild_embeddings,
         audit::query_audit_logs,
         health::health_check,
         health::metrics,
@@ -132,6 +133,9 @@ pub struct AppState {
         admin::DecayConfigRequest,
         admin::DecayUpdateResponse,
         admin::DecayConfigResponse,
+        admin::RebuildEmbeddingsRequest,
+        admin::RebuildEmbeddingsResponse,
+        admin::RebuildEmbeddingFailure,
         // Audit types
         audit::AuditQueryRequest,
         audit::AuditQueryResponse,

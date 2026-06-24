@@ -15,7 +15,7 @@ use super::{
 };
 use crate::domain::{CreateEventInput, CreateEventValidation, Event, Memory};
 use crate::embedding::EmbeddingProvider;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::llm::LlmProvider;
 use crate::repository::{QdrantRepository, StructuredEventRepository};
 
@@ -125,19 +125,11 @@ impl EventIngestionService {
         profile_id: Uuid,
         event_id: Uuid,
     ) -> AppResult<EventIngestionResult> {
-        let event = self.memory_guard.event_repo().get_by_id(event_id).await?;
-        if event.profile_id != profile_id {
-            return Err(AppError::Validation(
-                "event does not belong to the requested system profile".to_string(),
-            ));
-        }
-
-        if event.is_terminal() {
-            return Err(AppError::Validation(format!(
-                "event has already reached terminal status: {}",
-                event.processing_status
-            )));
-        }
+        let event = self
+            .memory_guard
+            .event_repo()
+            .claim_for_processing(profile_id, event_id)
+            .await?;
 
         let result = self.process_loaded_event(event).await;
         if let Err(error) = &result {
@@ -157,22 +149,12 @@ impl EventIngestionService {
         profile_id: Uuid,
         event_id: Uuid,
     ) -> AppResult<EventIngestionResult> {
-        let event = self
-            .memory_guard
+        self.memory_guard
             .event_repo()
             .reset_for_retry(profile_id, event_id)
             .await?;
 
-        let result = self.process_loaded_event(event).await;
-        if let Err(error) = &result {
-            let _ = self
-                .memory_guard
-                .event_repo()
-                .mark_failed(event_id, &error.to_string())
-                .await;
-        }
-
-        result
+        self.process_existing_event(profile_id, event_id).await
     }
 
     async fn process_loaded_event(&self, event: Event) -> AppResult<EventIngestionResult> {
