@@ -41,10 +41,14 @@ Memory Server 只负责提供稳定、可治理的基础能力：
 - promote / archive / supersede 的关键路径已开始同步 Qdrant payload 或删除旧 vector。
 - Qdrant vector filter 在没有 `scope_id` 时默认只预召回 global，避免候选槽位被其他 scope 污染。
 - 增加同步小批量修复接口：`POST /api/v1/systems/{profile_id}/admin/embeddings/rebuild`。
+- create / reinforce / supersede 与 event-memory relation 已改为 PostgreSQL 事务内原子写入。
+- supersede 会锁定旧 current version，并新增唯一索引防止同一 root 出现多个 current memory。
+- event retry 会先检查既有 event-memory relation，若已有副作用则恢复为 completed，避免重复 reconcile。
+- event processing 中 audit 写入改为 best-effort，审计失败不再导致 memory 已写但 event 失败。
 
 仍需继续：
 
-- 事件处理的 PostgreSQL 写入还没有完整事务化，version chain 并发保护仍需单独做。
+- event terminal status 更新仍在 reconcile 事务外，后续可继续收敛。
 - Qdrant 同步目前是同步补偿 + rebuild，不是完整 outbox / background worker。
 - lifecycle batch transition 后的 Qdrant 状态同步仍需覆盖。
 - bucket retrieval、memory pack、candidate memory、README 更新仍未实现。

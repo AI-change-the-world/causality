@@ -17,7 +17,7 @@ use crate::domain::{
     InferenceType, Memory,
 };
 use crate::error::AppResult;
-use crate::repository::{EventRepository, MemoryRepository};
+use crate::repository::MemoryRepository;
 use crate::service::MatchResult;
 
 /// Extracted memory content from LLM processing
@@ -143,7 +143,6 @@ impl Default for ReconcilerConfig {
 /// Memory Reconciler service
 pub struct MemoryReconciler<C: ConsistencyChecker> {
     memory_repo: MemoryRepository,
-    event_repo: EventRepository,
     consistency_checker: C,
     config: ReconcilerConfig,
 }
@@ -152,27 +151,20 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
     /// Create a new MemoryReconciler
     pub fn new(
         memory_repo: MemoryRepository,
-        event_repo: EventRepository,
         consistency_checker: C,
         config: ReconcilerConfig,
     ) -> Self {
         Self {
             memory_repo,
-            event_repo,
             consistency_checker,
             config,
         }
     }
 
     /// Create with default configuration
-    pub fn with_defaults(
-        memory_repo: MemoryRepository,
-        event_repo: EventRepository,
-        consistency_checker: C,
-    ) -> Self {
+    pub fn with_defaults(memory_repo: MemoryRepository, consistency_checker: C) -> Self {
         Self::new(
             memory_repo,
-            event_repo,
             consistency_checker,
             ReconcilerConfig::default(),
         )
@@ -296,11 +288,11 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
         };
 
         let memory = Memory::new_from_event(input);
-        let created = self.memory_repo.create(&memory).await?;
-
-        // Create event-memory relation
-        let relation = EventMemoryRelation::created_from(event.id, created.id);
-        let relation = self.event_repo.create_relation(&relation).await?;
+        let relation = EventMemoryRelation::created_from(event.id, memory.id);
+        let (created, relation) = self
+            .memory_repo
+            .create_with_relation(&memory, &relation)
+            .await?;
 
         info!(
             memory_id = %created.id,
@@ -316,15 +308,15 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
 
     /// Reinforce an existing memory (consistent match)
     async fn reinforce(&self, event: &Event, existing: &Memory) -> AppResult<ReconcileOutcome> {
-        // Reinforce the memory (increase confidence, increment hit count)
-        let _updated = self
-            .memory_repo
-            .reinforce(existing.id, self.config.reinforce_confidence_delta)
-            .await?;
-
-        // Create event-memory relation
         let relation = EventMemoryRelation::reinforced_by(event.id, existing.id);
-        let relation = self.event_repo.create_relation(&relation).await?;
+        let (_updated, relation) = self
+            .memory_repo
+            .reinforce_with_relation(
+                existing.id,
+                self.config.reinforce_confidence_delta,
+                &relation,
+            )
+            .await?;
 
         info!(
             memory_id = %existing.id,
@@ -348,15 +340,11 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
         old_memory: &Memory,
         consistency: &ConsistencyResult,
     ) -> AppResult<ReconcileOutcome> {
-        // Determine root_memory_id for the version chain
-        let root_id = old_memory.root_memory_id.unwrap_or(old_memory.id);
-        let new_version = old_memory.version_number + 1;
-
         // Create the superseding memory input
         let input = CreateSupersedingMemoryInput {
             old_memory_id: old_memory.id,
-            root_memory_id: root_id,
-            version_number: new_version,
+            root_memory_id: old_memory.root_memory_id.unwrap_or(old_memory.id),
+            version_number: old_memory.version_number + 1,
             profile_id: old_memory.profile_id,
             owner_id: old_memory.owner_id.clone(),
             scope_id: old_memory.scope_id.clone(),
@@ -374,35 +362,31 @@ impl<C: ConsistencyChecker> MemoryReconciler<C> {
             inference_reasoning: extracted.inference_reasoning.clone(),
         };
 
-        // Create the new version
         let new_memory = Memory::new_superseding(input);
-        let created = self.memory_repo.create(&new_memory).await?;
-        let created = self
+        let relation = EventMemoryRelation::created_from(event.id, new_memory.id);
+        let (created, superseded, relation) = self
             .memory_repo
-            .update_conflict_metadata(created.id, &consistency.reason, consistency.confidence)
+            .supersede_with_relation(
+                old_memory.id,
+                &new_memory,
+                &consistency.reason,
+                consistency.confidence,
+                &relation,
+            )
             .await?;
-
-        // Update the old memory to mark it as superseded
-        self.memory_repo
-            .update_superseded(old_memory.id, created.id)
-            .await?;
-
-        // Create event-memory relation for the new memory
-        let relation = EventMemoryRelation::created_from(event.id, created.id);
-        let relation = self.event_repo.create_relation(&relation).await?;
 
         info!(
             new_memory_id = %created.id,
-            old_memory_id = %old_memory.id,
-            root_memory_id = %root_id,
-            version = new_version,
+            old_memory_id = %superseded.id,
+            root_memory_id = ?created.root_memory_id,
+            version = created.version_number,
             event_id = %event.id,
             "Created superseding memory version"
         );
 
         Ok(ReconcileOutcome::Supersede {
             new_memory: created,
-            superseded_id: old_memory.id,
+            superseded_id: superseded.id,
             relation,
         })
     }

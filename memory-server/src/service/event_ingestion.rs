@@ -13,7 +13,9 @@ use super::{
     AlwaysConsistentChecker, CreateFromEventRequest, EventHandler, EventProcessingContext,
     MemoryGuard, MemoryMatcher, MemoryProcessor, ProfileService, RelevanceCheckResult,
 };
-use crate::domain::{CreateEventInput, CreateEventValidation, Event, Memory};
+use crate::domain::{
+    CreateEventInput, CreateEventValidation, Event, EventMemoryRelationType, Memory,
+};
 use crate::embedding::EmbeddingProvider;
 use crate::error::AppResult;
 use crate::llm::LlmProvider;
@@ -131,6 +133,10 @@ impl EventIngestionService {
             .claim_for_processing(profile_id, event_id)
             .await?;
 
+        if let Some(recovered) = self.recover_if_relations_exist(&event).await? {
+            return Ok(recovered);
+        }
+
         let result = self.process_loaded_event(event).await;
         if let Err(error) = &result {
             let _ = self
@@ -155,6 +161,86 @@ impl EventIngestionService {
             .await?;
 
         self.process_existing_event(profile_id, event_id).await
+    }
+
+    async fn recover_if_relations_exist(
+        &self,
+        event: &Event,
+    ) -> AppResult<Option<EventIngestionResult>> {
+        let relations = self
+            .memory_guard
+            .event_repo()
+            .get_relations_for_event(event.id)
+            .await?;
+
+        if relations.is_empty() {
+            return Ok(None);
+        }
+
+        let memory_ids: Vec<Uuid> = relations
+            .iter()
+            .map(|relation| relation.memory_id)
+            .collect();
+        let memories = self
+            .memory_guard
+            .memory_repo()
+            .get_by_ids(&memory_ids)
+            .await?;
+
+        let mut created_memory_ids = Vec::new();
+        let mut reinforced_memory_ids = Vec::new();
+        let mut superseded_memory_ids = Vec::new();
+
+        for relation in &relations {
+            match relation.relation_type {
+                EventMemoryRelationType::CreatedFrom => {
+                    created_memory_ids.push(relation.memory_id);
+                    if let Some(memory) = memories
+                        .iter()
+                        .find(|memory| memory.id == relation.memory_id)
+                    {
+                        if let Some(superseded_id) = memory.supersedes {
+                            superseded_memory_ids.push(superseded_id);
+                        }
+                    }
+                }
+                EventMemoryRelationType::ReinforcedBy => {
+                    reinforced_memory_ids.push(relation.memory_id);
+                }
+            }
+        }
+
+        created_memory_ids.sort_unstable();
+        created_memory_ids.dedup();
+        reinforced_memory_ids.sort_unstable();
+        reinforced_memory_ids.dedup();
+        superseded_memory_ids.sort_unstable();
+        superseded_memory_ids.dedup();
+
+        let processed_event = self
+            .memory_guard
+            .event_repo()
+            .mark_processed(
+                event.id,
+                event
+                    .summary
+                    .as_deref()
+                    .unwrap_or("Recovered completed event from existing memory relations"),
+            )
+            .await?;
+
+        Ok(Some(EventIngestionResult {
+            event: processed_event,
+            memories_created: created_memory_ids.len(),
+            memories_reinforced: reinforced_memory_ids.len(),
+            memories_superseded: superseded_memory_ids.len(),
+            created_memory_ids,
+            reinforced_memory_ids,
+            superseded_memory_ids,
+            skipped: false,
+            skip_reason: None,
+            relevance_score: None,
+        }))
     }
 
     async fn process_loaded_event(&self, event: Event) -> AppResult<EventIngestionResult> {

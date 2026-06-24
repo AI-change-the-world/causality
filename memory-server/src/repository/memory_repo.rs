@@ -10,10 +10,13 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Row};
+use sqlx::{FromRow, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::domain::{EmbeddingStatus, InferenceType, Memory, ProcessingStatus, Status};
+use crate::domain::{
+    EmbeddingStatus, EventMemoryRelation, EventMemoryRelationType, InferenceType, Memory,
+    ProcessingStatus, Status,
+};
 use crate::error::{AppError, AppResult};
 
 /// Result of a full-text search query
@@ -62,6 +65,13 @@ impl MemoryRepository {
 
     /// Create a new memory in the database
     pub async fn create(&self, memory: &Memory) -> AppResult<Memory> {
+        Self::insert_memory(&self.pool, memory).await
+    }
+
+    async fn insert_memory<'e, E>(executor: E, memory: &Memory) -> AppResult<Memory>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
         let inference_type_str = memory.inference_type.as_ref().map(|t| t.to_string());
 
         let row = sqlx::query_as::<_, MemoryRow>(
@@ -123,8 +133,217 @@ impl MemoryRepository {
         .bind(&memory.promotion_reason)
         .bind(memory.created_at)
         .bind(memory.updated_at)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?;
+
+        Ok(row.into())
+    }
+
+    async fn insert_relation<'e, E>(
+        executor: E,
+        relation: &EventMemoryRelation,
+    ) -> AppResult<EventMemoryRelation>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let row = sqlx::query_as::<_, RelationRow>(
+            r#"
+            INSERT INTO event_memory_relations (
+                id, event_id, memory_id, relation_type, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (event_id, memory_id) DO UPDATE
+            SET relation_type = EXCLUDED.relation_type
+            RETURNING id, event_id, memory_id, relation_type, created_at
+            "#,
+        )
+        .bind(relation.id)
+        .bind(relation.event_id)
+        .bind(relation.memory_id)
+        .bind(&relation.relation_type)
+        .bind(relation.created_at)
+        .fetch_one(executor)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    async fn reinforce_memory<'e, E>(
+        executor: E,
+        id: Uuid,
+        confidence_delta: f32,
+    ) -> AppResult<Memory>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                UPDATE memories
+                SET confidence = LEAST(confidence + $2, 1.0),
+                    hit_count = hit_count + 1,
+                    last_hit_at = NOW(),
+                    reinforcement_count = reinforcement_count + 1,
+                    last_reinforced_at = NOW(),
+                    status = CASE WHEN status = 'cooldown' THEN 'active'::status ELSE status END,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .bind(confidence_delta)
+        .fetch_optional(executor)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
+    }
+
+    /// Atomically create a memory and its source event relation.
+    pub async fn create_with_relation(
+        &self,
+        memory: &Memory,
+        relation: &EventMemoryRelation,
+    ) -> AppResult<(Memory, EventMemoryRelation)> {
+        let mut tx = self.pool.begin().await?;
+
+        let created = Self::insert_memory(&mut *tx, memory).await?;
+        let relation = Self::insert_relation(&mut *tx, relation).await?;
+
+        tx.commit().await?;
+
+        Ok((created, relation))
+    }
+
+    /// Atomically reinforce a memory and record the supporting event relation.
+    pub async fn reinforce_with_relation(
+        &self,
+        id: Uuid,
+        confidence_delta: f32,
+        relation: &EventMemoryRelation,
+    ) -> AppResult<(Memory, EventMemoryRelation)> {
+        let mut tx = self.pool.begin().await?;
+
+        let reinforced = Self::reinforce_memory(&mut *tx, id, confidence_delta).await?;
+        let relation = Self::insert_relation(&mut *tx, relation).await?;
+
+        tx.commit().await?;
+
+        Ok((reinforced, relation))
+    }
+
+    /// Atomically create a superseding version, update the old version, and
+    /// create the source event relation.
+    pub async fn supersede_with_relation(
+        &self,
+        old_memory_id: Uuid,
+        new_memory_template: &Memory,
+        conflict_reason: &str,
+        consistency_confidence: f32,
+        relation: &EventMemoryRelation,
+    ) -> AppResult<(Memory, Memory, EventMemoryRelation)> {
+        let mut tx = self.pool.begin().await?;
+
+        let old_memory = Self::lock_current_memory(&mut tx, old_memory_id).await?;
+        let root_id = old_memory.root_memory_id.unwrap_or(old_memory.id);
+        let mut new_memory = new_memory_template.clone();
+        new_memory.profile_id = old_memory.profile_id;
+        new_memory.owner_id = old_memory.owner_id.clone();
+        new_memory.scope_id = old_memory.scope_id.clone();
+        new_memory.root_memory_id = Some(root_id);
+        new_memory.version_number = old_memory.version_number + 1;
+        new_memory.supersedes = Some(old_memory.id);
+        new_memory.superseded_by = None;
+        new_memory.is_current_version = true;
+        new_memory.is_global = old_memory.is_global;
+        new_memory.conflict_reason = Some(conflict_reason.to_string());
+        new_memory.consistency_confidence = Some(consistency_confidence);
+
+        Self::retire_current_version(&mut *tx, old_memory.id).await?;
+        let created = Self::insert_memory(&mut *tx, &new_memory).await?;
+        let superseded = Self::set_superseded_by(&mut *tx, old_memory.id, created.id).await?;
+        let relation = Self::insert_relation(&mut *tx, relation).await?;
+
+        tx.commit().await?;
+
+        Ok((created, superseded, relation))
+    }
+
+    async fn lock_current_memory(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+    ) -> AppResult<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                SELECT {}
+                FROM memories
+                WHERE id = $1
+                  AND is_current_version = true
+                  AND status != 'superseded'
+                FOR UPDATE
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::Validation(
+                "memory is no longer the current version and cannot be superseded".to_string(),
+            )
+        })?;
+
+        Ok(row.into())
+    }
+
+    async fn retire_current_version<'e, E>(executor: E, id: Uuid) -> AppResult<Memory>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                UPDATE memories
+                SET is_current_version = false,
+                    status = 'superseded',
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND is_current_version = true
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
+
+        Ok(row.into())
+    }
+
+    async fn set_superseded_by<'e, E>(
+        executor: E,
+        id: Uuid,
+        superseded_by_id: Uuid,
+    ) -> AppResult<Memory>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+                UPDATE memories
+                SET superseded_by = $2,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING {}
+                "#,
+            MEMORY_COLUMNS
+        ))
+        .bind(id)
+        .bind(superseded_by_id)
+        .fetch_optional(executor)
+        .await?
+        .ok_or(AppError::MemoryNotFound(id))?;
 
         Ok(row.into())
     }
@@ -1080,8 +1299,10 @@ impl MemoryRepository {
                   AND embedding_provider IS NOT NULL
                   AND (
                     ($3::text IS NULL AND is_global = true)
-                    OR scope_id = $3
-                    OR ($4 = true AND is_global = true)
+                    OR (
+                      $3::text IS NOT NULL
+                      AND (scope_id = $3 OR ($4 = true AND is_global = true))
+                    )
                   )
                 ORDER BY embedding_provider, decay_score DESC
                 "#,
@@ -1154,6 +1375,27 @@ struct MemoryRow {
     // Timestamps
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct RelationRow {
+    id: Uuid,
+    event_id: Uuid,
+    memory_id: Uuid,
+    relation_type: EventMemoryRelationType,
+    created_at: DateTime<Utc>,
+}
+
+impl From<RelationRow> for EventMemoryRelation {
+    fn from(row: RelationRow) -> Self {
+        EventMemoryRelation {
+            id: row.id,
+            event_id: row.event_id,
+            memory_id: row.memory_id,
+            relation_type: row.relation_type,
+            created_at: row.created_at,
+        }
+    }
 }
 
 impl From<MemoryRow> for Memory {

@@ -197,11 +197,8 @@ impl MemoryGuard<super::AlwaysConsistentChecker> {
         audit_enabled: bool,
     ) -> Self {
         // Create a default reconciler with AlwaysConsistentChecker
-        let reconciler = MemoryReconciler::with_defaults(
-            memory_repo.clone(),
-            event_repo.clone(),
-            super::AlwaysConsistentChecker,
-        );
+        let reconciler =
+            MemoryReconciler::with_defaults(memory_repo.clone(), super::AlwaysConsistentChecker);
         MemoryGuard {
             memory_repo,
             event_repo,
@@ -561,20 +558,17 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     );
 
                     // Create audit log
-                    if self.audit_enabled {
-                        let new_value = serde_json::to_value(&memory).ok();
-                        self.audit_repo
-                            .create(
-                                memory.profile_id,
-                                memory.id,
-                                AuditOperation::Create,
-                                actor_id.clone(),
-                                None,
-                                new_value,
-                                Some(format!("Created from event {}", event.id)),
-                            )
-                            .await?;
-                    }
+                    let new_value = serde_json::to_value(&memory).ok();
+                    self.create_event_audit_log(
+                        memory.profile_id,
+                        memory.id,
+                        AuditOperation::Create,
+                        actor_id.clone(),
+                        None,
+                        new_value,
+                        Some(format!("Created from event {}", event.id)),
+                    )
+                    .await;
 
                     created_memory_ids.push(memory.id);
                 }
@@ -591,22 +585,19 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     );
 
                     // Create audit log
-                    if self.audit_enabled {
-                        self.audit_repo
-                            .create(
-                                event.profile_id,
-                                memory_id,
-                                AuditOperation::Update,
-                                actor_id.clone(),
-                                None,
-                                None,
-                                Some(format!(
-                                    "Reinforced by event {}, confidence +{}",
-                                    event.id, confidence_delta
-                                )),
-                            )
-                            .await?;
-                    }
+                    self.create_event_audit_log(
+                        event.profile_id,
+                        memory_id,
+                        AuditOperation::Update,
+                        actor_id.clone(),
+                        None,
+                        None,
+                        Some(format!(
+                            "Reinforced by event {}, confidence +{}",
+                            event.id, confidence_delta
+                        )),
+                    )
+                    .await;
 
                     reinforced_memory_ids.push(memory_id);
                 }
@@ -640,40 +631,34 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     );
 
                     // Create audit logs
-                    if self.audit_enabled {
-                        // Log for new memory
-                        let new_value = serde_json::to_value(&new_memory).ok();
-                        self.audit_repo
-                            .create(
-                                new_memory.profile_id,
-                                new_memory.id,
-                                AuditOperation::Create,
-                                actor_id.clone(),
-                                None,
-                                new_value,
-                                Some(format!(
-                                    "Superseded memory {} from event {}",
-                                    superseded_id, event.id
-                                )),
-                            )
-                            .await?;
+                    let new_value = serde_json::to_value(&new_memory).ok();
+                    self.create_event_audit_log(
+                        new_memory.profile_id,
+                        new_memory.id,
+                        AuditOperation::Create,
+                        actor_id.clone(),
+                        None,
+                        new_value,
+                        Some(format!(
+                            "Superseded memory {} from event {}",
+                            superseded_id, event.id
+                        )),
+                    )
+                    .await;
 
-                        // Log for superseded memory
-                        self.audit_repo
-                            .create(
-                                event.profile_id,
-                                superseded_id,
-                                AuditOperation::Update,
-                                actor_id.clone(),
-                                None,
-                                None,
-                                Some(format!(
-                                    "Superseded by memory {} from event {}",
-                                    new_memory.id, event.id
-                                )),
-                            )
-                            .await?;
-                    }
+                    self.create_event_audit_log(
+                        event.profile_id,
+                        superseded_id,
+                        AuditOperation::Update,
+                        actor_id.clone(),
+                        None,
+                        None,
+                        Some(format!(
+                            "Superseded by memory {} from event {}",
+                            new_memory.id, event.id
+                        )),
+                    )
+                    .await;
 
                     created_memory_ids.push(new_memory.id);
                     superseded_memory_ids.push(superseded_id);
@@ -953,6 +938,37 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             .await?;
 
         Ok(memory)
+    }
+
+    async fn create_event_audit_log(
+        &self,
+        profile_id: Uuid,
+        memory_id: Uuid,
+        operation: AuditOperation,
+        actor_id: Option<String>,
+        old_value: Option<serde_json::Value>,
+        new_value: Option<serde_json::Value>,
+        reason: Option<String>,
+    ) {
+        if !self.audit_enabled {
+            return;
+        }
+
+        if let Err(e) = self
+            .audit_repo
+            .create(
+                profile_id, memory_id, operation, actor_id, old_value, new_value, reason,
+            )
+            .await
+        {
+            warn!(
+                profile_id = %profile_id,
+                memory_id = %memory_id,
+                operation = %operation,
+                error = %e,
+                "Failed to write event memory audit log"
+            );
+        }
     }
 }
 
