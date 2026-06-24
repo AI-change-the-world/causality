@@ -63,6 +63,8 @@ def setup_logger() -> None:
     logger.add(
         sys.stderr,
         colorize=True,
+        backtrace=False,
+        diagnose=False,
         format=(
             "<green>{time:HH:mm:ss}</green> | "
             "<level>{level: <8}</level> | "
@@ -174,24 +176,23 @@ def nested_get(data: dict[str, Any], path: str, default: Any = None) -> Any:
 
 def load_openai_config(config_path: Path) -> OpenAIConfig:
     data = load_yaml(config_path)
-    endpoint = (
-        os.getenv("OPENAI_BASE_URL")
-        or os.getenv("MEMORY_SERVER__LLM__ENDPOINT")
-        or nested_get(data, "llm.endpoint")
-        or "https://api.openai.com/v1"
-    )
-    model = (
-        os.getenv("OPENAI_MODEL")
-        or os.getenv("MEMORY_SERVER__LLM__MODEL")
-        or nested_get(data, "llm.model")
-        or "gpt-4o-mini"
-    )
-    api_key = (
-        os.getenv("OPENAI_API_KEY")
-        or os.getenv("MEMORY_SERVER__LLM__API_KEY")
-        or nested_get(data, "llm.api_key")
-        or ""
-    )
+    endpoint = nested_get(data, "llm.endpoint")
+    model = nested_get(data, "llm.model")
+    api_key = nested_get(data, "llm.api_key")
+
+    missing = [
+        field
+        for field, value in {
+            "llm.endpoint": endpoint,
+            "llm.model": model,
+            "llm.api_key": api_key,
+        }.items()
+        if value in (None, "")
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Missing required OpenAI config in {config_path}: {', '.join(missing)}"
+        )
 
     return OpenAIConfig(
         endpoint=str(endpoint).rstrip("/"),
@@ -593,7 +594,7 @@ def interactive_loop(
             answer = ask_openai(openai_config, identity, question, memories, timeout)
             logger.success("OpenAI answer:\n{}", answer)
         except Exception as exc:
-            logger.exception("operation failed: {}", exc)
+            logger.error("operation failed: {}", exc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -655,7 +656,7 @@ def main() -> int:
     setup_logger()
     args = parse_args()
     base_url = "http://localhost:8080"
-    config_path = Path("../memory-server/config/config.yaml") 
+    config_path = Path("../memory-server/config/config.yaml")
 
     logger.info("reading OpenAI config from: {}", config_path)
     openai_config = load_openai_config(config_path)

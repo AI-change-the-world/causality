@@ -3,25 +3,21 @@
 //! Implements the LlmProvider trait for Openai's Chat Completion API.
 //! Uses async-openai library with streaming to avoid timeouts.
 
-use async_openai::{
-    config::OpenAIConfig,
-    types::{
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, ResponseFormat as OpenAIResponseFormat,
-    },
-    Client,
-};
+use async_openai::{config::OpenAIConfig, error::OpenAIError, Client};
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde_json::{json, Value};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use super::{
-    ChatMessage, ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderConfig,
-    LlmProviderType, LlmRetryConfig, ResponseFormat, Role,
+    ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderConfig, LlmProviderType,
+    LlmRetryConfig, ResponseFormat, Role,
 };
+
+type JsonStream = Pin<Box<dyn futures::Stream<Item = Result<Value, OpenAIError>> + Send>>;
 
 /// Openai LLM Provider
 ///
@@ -76,39 +72,49 @@ impl OpenAILlmProvider {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Convert ChatMessage to Openai message format
-    fn to_openai_message(msg: &ChatMessage) -> Result<ChatCompletionRequestMessage, LlmError> {
-        match msg.role {
-            Role::System => Ok(ChatCompletionRequestSystemMessageArgs::default()
-                .content(msg.content.clone())
-                .build()
-                .map_err(|e| LlmError::InvalidResponse(e.to_string()))?
-                .into()),
-            Role::User => Ok(ChatCompletionRequestUserMessageArgs::default()
-                .content(msg.content.clone())
-                .build()
-                .map_err(|e| LlmError::InvalidResponse(e.to_string()))?
-                .into()),
-            Role::Assistant => Ok(ChatCompletionRequestAssistantMessageArgs::default()
-                .content(msg.content.clone())
-                .build()
-                .map_err(|e| LlmError::InvalidResponse(e.to_string()))?
-                .into()),
+    fn role_name(role: Role) -> &'static str {
+        match role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
         }
+    }
+
+    fn build_chat_payload(&self, request: &ChatRequest, model: &str, temperature: f32) -> Value {
+        let messages: Vec<Value> = request
+            .messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": Self::role_name(message.role),
+                    "content": message.content,
+                })
+            })
+            .collect();
+
+        let mut payload = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": true,
+            "enable_thinking": false,
+        });
+
+        if let Some(max_tokens) = request.max_tokens {
+            payload["max_tokens"] = json!(max_tokens);
+        }
+
+        if request.response_format == ResponseFormat::JsonObject {
+            payload["response_format"] = json!({ "type": "json_object" });
+        }
+
+        payload
     }
 
     /// Make a single chat request with streaming (without retry)
     async fn make_request(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let model = request.model.as_deref().unwrap_or(&self.model);
         let temperature = request.temperature.unwrap_or(self.temperature);
-
-        // Convert messages
-        let messages: Result<Vec<ChatCompletionRequestMessage>, LlmError> = request
-            .messages
-            .iter()
-            .map(Self::to_openai_message)
-            .collect();
-        let messages = messages?;
 
         debug!(
             provider = %self.name,
@@ -119,28 +125,11 @@ impl OpenAILlmProvider {
             "Making Openai chat request with streaming"
         );
 
-        // Build request
-        let mut request_builder = CreateChatCompletionRequestArgs::default();
-        request_builder
-            .model(model)
-            .messages(messages)
-            .temperature(temperature)
-            .stream(true);
-
-        // Set response format if JSON is requested
-        if request.response_format == ResponseFormat::JsonObject {
-            request_builder.response_format(OpenAIResponseFormat::JsonObject);
-        }
-
-        let openai_request = request_builder
-            .build()
-            .map_err(|e| LlmError::InvalidResponse(e.to_string()))?;
-
-        // Create streaming request
-        let mut stream = self
+        let payload = self.build_chat_payload(request, model, temperature);
+        let mut stream: JsonStream = self
             .client
             .chat()
-            .create_stream(openai_request)
+            .create_stream_byot(payload)
             .await
             .map_err(Self::map_openai_error)?;
 
@@ -152,18 +141,20 @@ impl OpenAILlmProvider {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(response) => {
-                    // Update model if provided
-                    if !response.model.is_empty() {
-                        model_used = response.model.clone();
+                    if let Some(response_model) = response["model"].as_str() {
+                        if !response_model.is_empty() {
+                            model_used = response_model.to_string();
+                        }
                     }
 
-                    // Process choices
-                    for choice in &response.choices {
-                        if let Some(ref delta_content) = choice.delta.content {
-                            content.push_str(delta_content);
-                        }
-                        if let Some(ref reason) = choice.finish_reason {
-                            finish_reason = Some(format!("{:?}", reason));
+                    if let Some(choices) = response["choices"].as_array() {
+                        for choice in choices {
+                            if let Some(delta_content) = choice["delta"]["content"].as_str() {
+                                content.push_str(delta_content);
+                            }
+                            if let Some(reason) = choice["finish_reason"].as_str() {
+                                finish_reason = Some(reason.to_string());
+                            }
                         }
                     }
                 }
@@ -190,22 +181,27 @@ impl OpenAILlmProvider {
     }
 
     /// Map async-openai error to LlmError
-    fn map_openai_error(e: async_openai::error::OpenAIError) -> LlmError {
+    fn map_openai_error(e: OpenAIError) -> LlmError {
         match e {
-            async_openai::error::OpenAIError::ApiError(api_err) => {
+            OpenAIError::ApiError(api_err) => {
                 // Check for rate limit
-                if api_err.message.to_lowercase().contains("rate limit") {
+                if api_err
+                    .api_error
+                    .message
+                    .to_lowercase()
+                    .contains("rate limit")
+                {
                     LlmError::RateLimitExceeded {
                         retry_after_ms: 1000,
                     }
                 } else {
                     LlmError::ApiError {
-                        status: 400,
-                        message: api_err.message,
+                        status: api_err.status_code.as_u16(),
+                        message: api_err.api_error.message,
                     }
                 }
             }
-            async_openai::error::OpenAIError::StreamError(msg) => {
+            OpenAIError::StreamError(msg) => {
                 LlmError::InvalidResponse(format!("Stream error: {}", msg))
             }
             _ => LlmError::InvalidResponse(e.to_string()),
@@ -351,6 +347,35 @@ mod tests {
     }
 
     #[test]
+    fn test_build_chat_payload_disables_thinking() {
+        let config = test_config();
+        let provider = OpenAILlmProvider::new(config).unwrap();
+        let request = ChatRequest::with_system("system prompt", "user prompt");
+
+        let payload = provider.build_chat_payload(&request, "qwen3-max", 0.1);
+
+        assert_eq!(payload["model"], "qwen3-max");
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["enable_thinking"], false);
+        assert_eq!(payload["messages"][0]["role"], "system");
+        assert_eq!(payload["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn test_build_chat_payload_json_response_format() {
+        let config = test_config();
+        let provider = OpenAILlmProvider::new(config).unwrap();
+        let request = ChatRequest::new("return json")
+            .with_response_format(ResponseFormat::JsonObject)
+            .with_max_tokens(128);
+
+        let payload = provider.build_chat_payload(&request, "qwen3-max", 0.1);
+
+        assert_eq!(payload["response_format"]["type"], "json_object");
+        assert_eq!(payload["max_tokens"], 128);
+    }
+
+    #[test]
     fn test_custom_retry_config() {
         let config = test_config();
         let retry_config = LlmRetryConfig {
@@ -378,26 +403,5 @@ mod tests {
         let result = provider.chat(request).await;
 
         assert!(matches!(result, Err(LlmError::Disabled(_))));
-    }
-
-    #[test]
-    fn test_to_openai_message_system() {
-        let msg = ChatMessage::system("You are helpful");
-        let result = OpenAILlmProvider::to_openai_message(&msg);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_to_openai_message_user() {
-        let msg = ChatMessage::user("Hello");
-        let result = OpenAILlmProvider::to_openai_message(&msg);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_to_openai_message_assistant() {
-        let msg = ChatMessage::assistant("Hi there!");
-        let result = OpenAILlmProvider::to_openai_message(&msg);
-        assert!(result.is_ok());
     }
 }

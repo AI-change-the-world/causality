@@ -54,7 +54,7 @@ metrics-exporter-prometheus = "0.13"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Openai API client
-async-openai = "0.27"
+async-openai = { version = "0.41", features = ["byot", "chat-completion"] }
 futures = "0.3"
 
 # Error handling
