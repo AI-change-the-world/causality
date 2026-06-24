@@ -22,6 +22,8 @@ struct OpenAIEmbeddingRequest {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 /// Openai embedding API response
@@ -135,6 +137,7 @@ impl OpenAIProvider {
             input: text.to_string(),
             model: model.to_string(),
             encoding_format: Some("float".to_string()),
+            dimensions: Some(self.dimension),
         };
 
         debug!(

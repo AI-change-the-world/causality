@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         "Initializing Qdrant client"
     );
 
-    let qdrant_repo = QdrantRepository::new(&config.qdrant.url)
+    let qdrant_repo = QdrantRepository::new(&config.qdrant.url, &config.qdrant.collection_name)
         .await
         .map_err(|e| {
             error!(error = %e, "Failed to initialize Qdrant client");
@@ -130,29 +130,47 @@ async fn main() -> anyhow::Result<()> {
         "Global Embedding provider initialized"
     );
 
-    // Ensure Qdrant collection exists for the embedding provider
-    if !qdrant_repo
-        .collection_exists(&embedding_provider_name)
+    // Ensure Qdrant collection exists for the embedding provider.
+    let expected_dimension = config.embedding.dimension;
+    let collection_name = qdrant_repo.configured_collection_name(&embedding_provider_name);
+    if let Some(existing_dimension) = qdrant_repo
+        .get_collection_dimension(&embedding_provider_name)
         .await
     {
+        if existing_dimension != expected_dimension {
+            error!(
+                collection = %collection_name,
+                expected_dimension = expected_dimension,
+                existing_dimension = existing_dimension,
+                "Qdrant collection dimension mismatch"
+            );
+            return Err(anyhow::anyhow!(
+                "Qdrant collection {} dimension mismatch: config expects {}, existing collection has {}. Delete/recreate the collection or change embedding.dimension.",
+                collection_name,
+                expected_dimension,
+                existing_dimension
+            ));
+        }
+
         info!(
-            collection = %embedding_provider_name,
-            dimension = config.embedding.dimension,
+            collection = %collection_name,
+            dimension = existing_dimension,
+            "Qdrant collection already exists"
+        );
+    } else {
+        info!(
+            collection = %collection_name,
+            dimension = expected_dimension,
             "Creating Qdrant collection"
         );
         qdrant_repo
-            .create_collection(&embedding_provider_name, config.embedding.dimension)
+            .create_collection(&embedding_provider_name, expected_dimension)
             .await
             .map_err(|e| {
                 error!(error = %e, "Failed to create Qdrant collection");
                 anyhow::anyhow!("Qdrant collection creation error: {}", e)
             })?;
         info!("Qdrant collection created");
-    } else {
-        info!(
-            collection = %embedding_provider_name,
-            "Qdrant collection already exists"
-        );
     }
 
     // Create repositories

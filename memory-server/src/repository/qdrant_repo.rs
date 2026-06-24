@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
-/// Collection naming prefix
-const COLLECTION_PREFIX: &str = "memories_";
+/// Default collection base name when no configured base is provided.
+const DEFAULT_COLLECTION_BASE: &str = "memories";
 
 /// Payload field names
 const FIELD_MEMORY_ID: &str = "memory_id";
@@ -44,19 +44,22 @@ pub struct VectorSearchResult {
 pub struct QdrantRepository {
     /// Qdrant client
     client: Arc<Qdrant>,
+    /// Configured base name for provider-specific collections
+    collection_base: String,
     /// Cache of collection names and their dimensions
     collections: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl QdrantRepository {
     /// Create a new QdrantRepository
-    pub async fn new(url: &str) -> AppResult<Self> {
+    pub async fn new(url: &str, collection_base: &str) -> AppResult<Self> {
         let client = Qdrant::from_url(url)
             .build()
             .map_err(|e| AppError::VectorDb(format!("Failed to create Qdrant client: {}", e)))?;
 
         let repo = Self {
             client: Arc::new(client),
+            collection_base: Self::sanitize_collection_part(collection_base),
             collections: Arc::new(RwLock::new(HashMap::new())),
         };
 
@@ -75,9 +78,10 @@ impl QdrantRepository {
             .map_err(|e| AppError::VectorDb(format!("Failed to list collections: {}", e)))?;
 
         let mut cache = self.collections.write().await;
+        let collection_prefix = self.collection_prefix();
 
         for collection in collections.collections {
-            if collection.name.starts_with(COLLECTION_PREFIX) {
+            if collection.name.starts_with(&collection_prefix) {
                 // Get collection info to retrieve dimension
                 if let Ok(info) = self.client.collection_info(&collection.name).await {
                     if let Some(config) = info.result.and_then(|r| r.config) {
@@ -108,12 +112,49 @@ impl QdrantRepository {
 
     /// Get collection name for a provider
     pub fn collection_name(provider_name: &str) -> String {
-        format!("{}{}", COLLECTION_PREFIX, provider_name.replace('-', "_"))
+        Self::collection_name_with_base(DEFAULT_COLLECTION_BASE, provider_name)
+    }
+
+    /// Get configured collection name for a provider.
+    pub fn configured_collection_name(&self, provider_name: &str) -> String {
+        Self::collection_name_with_base(&self.collection_base, provider_name)
+    }
+
+    fn collection_name_with_base(collection_base: &str, provider_name: &str) -> String {
+        format!(
+            "{}_{}",
+            Self::sanitize_collection_part(collection_base),
+            Self::sanitize_collection_part(provider_name)
+        )
+    }
+
+    fn collection_prefix(&self) -> String {
+        format!("{}_", self.collection_base)
+    }
+
+    fn sanitize_collection_part(value: &str) -> String {
+        let sanitized: String = value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        let sanitized = sanitized.trim_matches('_');
+        if sanitized.is_empty() {
+            DEFAULT_COLLECTION_BASE.to_string()
+        } else {
+            sanitized.to_string()
+        }
     }
 
     /// Create a collection for an embedding provider
     pub async fn create_collection(&self, provider_name: &str, dimension: usize) -> AppResult<()> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
 
         // Check if collection already exists
         {
@@ -166,7 +207,7 @@ impl QdrantRepository {
 
     /// Delete a collection for an embedding provider
     pub async fn delete_collection(&self, provider_name: &str) -> AppResult<()> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
 
         self.client
             .delete_collection(&collection_name)
@@ -186,14 +227,14 @@ impl QdrantRepository {
 
     /// Check if a collection exists
     pub async fn collection_exists(&self, provider_name: &str) -> bool {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
         let cache = self.collections.read().await;
         cache.contains_key(&collection_name)
     }
 
     /// Get collection dimension
     pub async fn get_collection_dimension(&self, provider_name: &str) -> Option<usize> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
         let cache = self.collections.read().await;
         cache.get(&collection_name).copied()
     }
@@ -212,7 +253,7 @@ impl QdrantRepository {
         embedding: Vec<f32>,
         payload: VectorPayload,
     ) -> AppResult<()> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
 
         // Verify collection exists
         {
@@ -247,7 +288,7 @@ impl QdrantRepository {
 
     /// Delete a vector for a memory
     pub async fn delete_vector(&self, provider_name: &str, memory_id: Uuid) -> AppResult<()> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
 
         let point_id: PointId = memory_id.to_string().into();
         self.client
@@ -271,7 +312,7 @@ impl QdrantRepository {
         memory_id: Uuid,
         payload: VectorPayload,
     ) -> AppResult<()> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
 
         {
             let cache = self.collections.read().await;
@@ -308,7 +349,7 @@ impl QdrantRepository {
         limit: usize,
         filter: Option<VectorFilter>,
     ) -> AppResult<Vec<VectorSearchResult>> {
-        let collection_name = Self::collection_name(provider_name);
+        let collection_name = self.configured_collection_name(provider_name);
 
         let mut search_builder =
             SearchPointsBuilder::new(&collection_name, query_vector, limit as u64)
@@ -593,6 +634,17 @@ mod tests {
         assert_eq!(
             QdrantRepository::collection_name("text-embedding-3-small"),
             "memories_text_embedding_3_small"
+        );
+    }
+
+    #[test]
+    fn test_collection_name_uses_configured_base() {
+        assert_eq!(
+            QdrantRepository::collection_name_with_base(
+                "user-memories",
+                "openai-text-embedding-3-small"
+            ),
+            "user_memories_openai_text_embedding_3_small"
         );
     }
 

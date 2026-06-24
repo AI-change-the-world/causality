@@ -654,8 +654,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     setup_logger()
     args = parse_args()
-    base_url = "localhost:8080"
-    config_path = "../memory-server/config/config.yaml"
+    base_url = "http://localhost:8080"
+    config_path = Path("../memory-server/config/config.yaml") 
 
     logger.info("reading OpenAI config from: {}", config_path)
     openai_config = load_openai_config(config_path)

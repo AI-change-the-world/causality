@@ -32,7 +32,7 @@ embedding:
   endpoint: "https://api.openai.com/v1"
   api_key: ""  # Set via environment variable for security
   model: "text-embedding-3-small"
-  dimension: 1536
+  dimension: 1024
 
 lifecycle:
   cooldown_check_interval_seconds: 3600
