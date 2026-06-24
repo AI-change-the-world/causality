@@ -83,6 +83,7 @@ pub struct AppState {
         memory::update_memory,
         memory::delete_memory,
         memory::get_memory_history,
+        memory::resolve_current_memory,
         memory::promote_memory,
         event::create_event,
         event::create_event_async,
@@ -109,6 +110,7 @@ pub struct AppState {
         memory::UpdateMemoryApiRequest,
         memory::MemoryHistoryResponse,
         memory::MemoryVersionResponse,
+        memory::ResolveCurrentMemoryResponse,
         memory::PromoteMemoryRequest,
         memory::PromoteMemoryResponse,
         // Event processing types

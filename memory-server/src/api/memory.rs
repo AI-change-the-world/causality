@@ -195,12 +195,39 @@ impl From<UpdateMemoryApiRequest> for UpdateMemoryRequest {
 pub struct MemoryHistoryResponse {
     /// Root memory ID (the first version in the chain)
     pub root_memory_id: Uuid,
+    /// Requested memory ID
+    pub requested_memory_id: Uuid,
     /// Current version ID
     pub current_version_id: Option<Uuid>,
+    /// Zero-based position of the requested memory in the version chain
+    pub requested_index: Option<usize>,
+    /// Previous version in the chain, if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version_id: Option<Uuid>,
+    /// Next version that superseded the requested memory, if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_version_id: Option<Uuid>,
+    /// Number of supersede hops from the requested memory to current
+    pub hops_to_current: usize,
     /// Total number of versions
     pub total_versions: usize,
+    /// Path from the requested memory to the current version (inclusive)
+    pub lineage_to_current: Vec<Uuid>,
     /// All versions ordered by version_number
     pub versions: Vec<MemoryVersionResponse>,
+}
+
+/// Response for resolving any memory version to the latest current version.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ResolveCurrentMemoryResponse {
+    /// Requested memory ID
+    pub requested_memory_id: Uuid,
+    /// Latest current memory
+    pub current_memory: GetMemoryResponse,
+    /// Number of supersede hops from requested to current
+    pub hops_to_current: usize,
+    /// Inclusive path of memory IDs from requested to current
+    pub lineage_to_current: Vec<Uuid>,
 }
 
 /// A single version in the memory history
@@ -271,6 +298,7 @@ pub fn memory_routes() -> Router<AppState> {
         .route("/{id}", put(update_memory))
         .route("/{id}", delete(delete_memory))
         .route("/{id}/history", get(get_memory_history))
+        .route("/{id}/resolve-current", get(resolve_current_memory))
         .route("/{id}/promote", post(promote_memory))
 }
 
@@ -469,8 +497,8 @@ pub async fn delete_memory(
 
 /// GET /api/v1/systems/{profile_id}/memories/{id}/history - Get memory version history
 ///
-/// Returns the complete version history of a memory, including all versions
-/// and their associated source events.
+/// Returns the complete version history of a memory, including all versions,
+/// source events, and the supersede lineage around the requested node.
 #[utoipa::path(
     get,
     path = "/api/v1/systems/{profile_id}/memories/{id}/history",
@@ -488,22 +516,25 @@ pub async fn get_memory_history(
     State(state): State<AppState>,
     Path((profile_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<MemoryHistoryResponse>> {
-    // Get the memory to find its root_memory_id
     let memory = state.memory_guard.get_memory(id).await?;
     ensure_memory_profile(&memory, profile_id)?;
     let root_id = memory.root_memory_id.unwrap_or(memory.id);
-
-    // Get all versions in the chain
     let history = state.retrieval_engine.get_memory_history(root_id).await?;
-
-    // Find the current version
     let current_version_id = history
         .versions
         .iter()
         .find(|v| v.is_current_version)
         .map(|v| v.id);
+    let requested_index = history.versions.iter().position(|v| v.id == id);
+    let previous_version_id =
+        requested_index.and_then(|idx| idx.checked_sub(1).map(|prev| history.versions[prev].id));
+    let next_version_id =
+        requested_index.and_then(|idx| history.versions.get(idx + 1).map(|next| next.id));
+    let lineage_to_current: Vec<Uuid> = requested_index
+        .map(|idx| history.versions[idx..].iter().map(|version| version.id).collect())
+        .unwrap_or_default();
+    let hops_to_current = lineage_to_current.len().saturating_sub(1);
 
-    // Convert to response format with source event info
     let mut versions = Vec::with_capacity(history.versions.len());
     for version in history.versions {
         let (source_event_content, source_event_time) =
@@ -537,9 +568,57 @@ pub async fn get_memory_history(
 
     let response = MemoryHistoryResponse {
         root_memory_id: root_id,
+        requested_memory_id: id,
         current_version_id,
+        requested_index,
+        previous_version_id,
+        next_version_id,
+        hops_to_current,
         total_versions: versions.len(),
+        lineage_to_current,
         versions,
+    };
+
+    Ok(Json(response))
+}
+
+/// GET /api/v1/systems/{profile_id}/memories/{id}/resolve-current - Resolve to latest current version
+///
+/// Follows the supersede chain from the requested memory until the latest
+/// current version is reached, returning the resolved memory directly.
+#[utoipa::path(
+    get,
+    path = "/api/v1/systems/{profile_id}/memories/{id}/resolve-current",
+    tag = "memories",
+    params(
+        ("profile_id" = Uuid, Path, description = "System profile ID"),
+        ("id" = Uuid, Path, description = "Memory ID (any version in the chain)")
+    ),
+    responses(
+        (status = 200, description = "Current memory resolved", body = ResolveCurrentMemoryResponse),
+        (status = 404, description = "Memory not found", body = crate::error::ErrorResponse),
+        (status = 500, description = "Broken supersede chain", body = crate::error::ErrorResponse)
+    )
+)]
+pub async fn resolve_current_memory(
+    State(state): State<AppState>,
+    Path((profile_id, id)): Path<(Uuid, Uuid)>,
+) -> AppResult<Json<ResolveCurrentMemoryResponse>> {
+    let memory = state.memory_guard.get_memory(id).await?;
+    ensure_memory_profile(&memory, profile_id)?;
+
+    let resolution = state.retrieval_engine.resolve_to_current_memory(id).await?;
+    ensure_memory_profile(&resolution.current_memory, profile_id)?;
+
+    let response = ResolveCurrentMemoryResponse {
+        requested_memory_id: id,
+        current_memory: GetMemoryResponse::from(resolution.current_memory),
+        hops_to_current: resolution.lineage_to_current.len().saturating_sub(1),
+        lineage_to_current: resolution
+            .lineage_to_current
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect(),
     };
 
     Ok(Json(response))
@@ -769,6 +848,85 @@ mod tests {
         assert_eq!(response.status, memory.status);
         assert_eq!(response.embedding_status, memory.embedding_status);
         assert_eq!(response.processing_status, memory.processing_status);
+    }
+
+    #[test]
+    fn test_history_response_serialization_includes_lineage_fields() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let current = Uuid::new_v4();
+
+        let response = MemoryHistoryResponse {
+            root_memory_id: first,
+            requested_memory_id: second,
+            current_version_id: Some(current),
+            requested_index: Some(1),
+            previous_version_id: Some(first),
+            next_version_id: Some(current),
+            hops_to_current: 1,
+            total_versions: 3,
+            lineage_to_current: vec![second, current],
+            versions: vec![],
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["requested_memory_id"], second.to_string());
+        assert_eq!(json["requested_index"], 1);
+        assert_eq!(json["previous_version_id"], first.to_string());
+        assert_eq!(json["next_version_id"], current.to_string());
+        assert_eq!(json["hops_to_current"], 1);
+        assert_eq!(json["lineage_to_current"][0], second.to_string());
+        assert_eq!(json["lineage_to_current"][1], current.to_string());
+    }
+
+    #[test]
+    fn test_resolve_current_response_serialization() {
+        let requested = Uuid::new_v4();
+        let current = Uuid::new_v4();
+
+        let response = ResolveCurrentMemoryResponse {
+            requested_memory_id: requested,
+            current_memory: GetMemoryResponse {
+                id: current,
+                owner_id: "owner123".to_string(),
+                scope_id: Some("scope456".to_string()),
+                content: "current".to_string(),
+                category: Some("work.code".to_string()),
+                tags: None,
+                importance: 0.8,
+                confidence: 0.9,
+                root_memory_id: Some(requested),
+                version_number: 2,
+                is_current_version: true,
+                supersedes: Some(requested),
+                superseded_by: None,
+                is_global: false,
+                hit_count: 0,
+                last_hit_at: None,
+                reinforcement_count: 0,
+                last_reinforced_at: None,
+                decay_score: 1.0,
+                source_event_id: None,
+                status: Status::Active,
+                embedding_status: EmbeddingStatus::Completed,
+                embedding_provider: Some("openai".to_string()),
+                processing_status: ProcessingStatus::Completed,
+                llm_provider: Some("openai".to_string()),
+                conflict_reason: None,
+                consistency_confidence: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            hops_to_current: 1,
+            lineage_to_current: vec![requested, current],
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["requested_memory_id"], requested.to_string());
+        assert_eq!(json["current_memory"]["id"], current.to_string());
+        assert_eq!(json["hops_to_current"], 1);
+        assert_eq!(json["lineage_to_current"][0], requested.to_string());
+        assert_eq!(json["lineage_to_current"][1], current.to_string());
     }
 
     #[test]

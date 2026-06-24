@@ -41,6 +41,6 @@ pub use memory_reconciler::{
 };
 pub use profile_service::ProfileService;
 pub use retrieval_engine::{
-    CategoryQuery, MemoryEvidence, MemoryHistory, RetrievalEngine, RetrieveRequest,
-    RetrieveResponse, RetrievedMemory,
+    CategoryQuery, CurrentMemoryResolution, MemoryEvidence, MemoryHistory, RetrievalEngine,
+    RetrieveRequest, RetrieveResponse, RetrievedMemory,
 };

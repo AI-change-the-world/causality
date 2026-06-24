@@ -17,6 +17,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -24,7 +25,7 @@ use crate::api::memory::GetMemoryResponse;
 use crate::api::AppState;
 use crate::domain::{Event, EventSource, Memory};
 use crate::error::AppResult;
-use crate::service::RetrieveRequest;
+use crate::service::{CurrentMemoryResolution, MemoryHistory, RetrieveRequest, RetrievedMemory};
 
 /// Request body for memory retrieval
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -174,6 +175,15 @@ impl From<Memory> for VersionResponse {
     }
 }
 
+/// A lineage path from one matched node to the current memory returned to the caller.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LineageSourceResponse {
+    /// Originally matched memory ID before lineage collapse
+    pub source_memory_id: String,
+    /// Inclusive path from the source memory to the returned current memory
+    pub lineage_to_current: Vec<String>,
+}
+
 /// A retrieved memory with scores
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RetrievedMemoryResponse {
@@ -195,6 +205,9 @@ pub struct RetrievedMemoryResponse {
     /// Version history for this memory (if include_history was true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryResponse>,
+    /// Source matches merged into this current memory via supersede lineage collapse
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_lineage_sources: Option<Vec<LineageSourceResponse>>,
 }
 
 /// Response for memory retrieval
@@ -389,30 +402,11 @@ pub async fn retrieve_memories(
         )
         .await?;
 
-    let memories: Vec<RetrievedMemoryResponse> = result
-        .memories
+    let collapsed = collapse_retrieved_memories_to_current(&state, profile_id, result.memories).await?;
+
+    let memories = collapsed
         .into_iter()
-        .map(|rm| {
-            let evidence = rm.evidence.map(|e| EvidenceResponse {
-                events: e.events.into_iter().map(Into::into).collect(),
-                total_count: e.total_count,
-            });
-
-            let history = rm.history.map(|h| HistoryResponse {
-                versions: h.versions.into_iter().map(Into::into).collect(),
-                current_version_id: h.current_version.map(|m| m.id.to_string()),
-            });
-
-            RetrievedMemoryResponse {
-                memory: rm.memory.into(),
-                score: rm.score,
-                similarity: rm.similarity,
-                text_match_score: rm.text_match_score,
-                highlights: rm.highlights,
-                evidence,
-                history,
-            }
-        })
+        .map(collapsed_retrieved_memory_to_response)
         .collect();
 
     let response = RetrieveApiResponse {
@@ -421,6 +415,156 @@ pub async fn retrieve_memories(
     };
 
     Ok(Json(response))
+}
+
+#[derive(Debug, Clone)]
+struct CollapsedRetrievedMemory {
+    retrieved: RetrievedMemory,
+    merged_lineage_sources: Vec<LineageSourceResponse>,
+}
+
+fn collapsed_retrieved_memory_to_response(
+    collapsed: CollapsedRetrievedMemory,
+) -> RetrievedMemoryResponse {
+    let rm = collapsed.retrieved;
+    let evidence = rm.evidence.map(|e| EvidenceResponse {
+        events: e.events.into_iter().map(Into::into).collect(),
+        total_count: e.total_count,
+    });
+
+    let history = rm.history.map(|h| HistoryResponse {
+        versions: h.versions.into_iter().map(Into::into).collect(),
+        current_version_id: h.current_version.map(|m| m.id.to_string()),
+    });
+
+    RetrievedMemoryResponse {
+        memory: rm.memory.into(),
+        score: rm.score,
+        similarity: rm.similarity,
+        text_match_score: rm.text_match_score,
+        highlights: rm.highlights,
+        evidence,
+        history,
+        merged_lineage_sources: Some(collapsed.merged_lineage_sources),
+    }
+}
+
+async fn collapse_retrieved_memories_to_current(
+    state: &AppState,
+    profile_id: Uuid,
+    memories: Vec<RetrievedMemory>,
+) -> AppResult<Vec<CollapsedRetrievedMemory>> {
+    let mut collapsed_by_current: HashMap<Uuid, CollapsedRetrievedMemory> = HashMap::new();
+    let mut order: Vec<Uuid> = Vec::new();
+
+    for retrieved in memories {
+        let resolution = state
+            .retrieval_engine
+            .resolve_to_current_memory(retrieved.memory.id)
+            .await?;
+
+        if resolution.current_memory.profile_id != profile_id {
+            continue;
+        }
+
+        let current_id = resolution.current_memory.id;
+        let source = lineage_source_response(&resolution);
+
+        match collapsed_by_current.get_mut(&current_id) {
+            Some(existing) => {
+                existing.retrieved.score = existing.retrieved.score.max(retrieved.score);
+                existing.retrieved.similarity = existing.retrieved.similarity.max(retrieved.similarity);
+                existing.retrieved.text_match_score = max_option_f32(
+                    existing.retrieved.text_match_score,
+                    retrieved.text_match_score,
+                );
+                if existing.retrieved.highlights.is_none() {
+                    existing.retrieved.highlights = retrieved.highlights.clone();
+                }
+                if existing.retrieved.evidence.is_none() {
+                    existing.retrieved.evidence = retrieved.evidence.clone();
+                }
+                if existing.retrieved.history.is_none() {
+                    existing.retrieved.history = retrieved.history.clone();
+                }
+                if !existing
+                    .merged_lineage_sources
+                    .iter()
+                    .any(|item| item.source_memory_id == source.source_memory_id)
+                {
+                    existing.merged_lineage_sources.push(source);
+                }
+            }
+            None => {
+                order.push(current_id);
+
+                let mut current_retrieved = retrieved.clone();
+                current_retrieved.memory = resolution.current_memory.clone();
+                current_retrieved.history = merge_history_with_lineage(
+                    current_retrieved.history,
+                    &resolution,
+                );
+
+                collapsed_by_current.insert(
+                    current_id,
+                    CollapsedRetrievedMemory {
+                        retrieved: current_retrieved,
+                        merged_lineage_sources: vec![source],
+                    },
+                );
+            }
+        }
+    }
+
+    let mut collapsed: Vec<CollapsedRetrievedMemory> = order
+        .into_iter()
+        .filter_map(|id| collapsed_by_current.remove(&id))
+        .collect();
+
+    collapsed.sort_by(|a, b| {
+        b.retrieved
+            .score
+            .partial_cmp(&a.retrieved.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(collapsed)
+}
+
+fn lineage_source_response(resolution: &CurrentMemoryResolution) -> LineageSourceResponse {
+    LineageSourceResponse {
+        source_memory_id: resolution.requested_memory.id.to_string(),
+        lineage_to_current: resolution
+            .lineage_to_current
+            .iter()
+            .map(|memory| memory.id.to_string())
+            .collect(),
+    }
+}
+
+fn merge_history_with_lineage(
+    history: Option<MemoryHistory>,
+    resolution: &CurrentMemoryResolution,
+) -> Option<MemoryHistory> {
+    history.or_else(|| {
+        Some(MemoryHistory {
+            versions: resolution
+                .lineage_to_current
+                .iter()
+                .cloned()
+                .collect(),
+            current_version: Some(resolution.current_memory.clone()),
+        })
+    })
+}
+
+fn max_option_f32(left: Option<f32>, right: Option<f32>) -> Option<f32> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// POST /api/v1/systems/{profile_id}/memories/retrieve/auto - Auto retrieve with query parsing
@@ -786,5 +930,65 @@ mod tests {
         assert!(markdown.contains("infer: 用户喜欢深色模式"));
         assert!(markdown.contains("score: 0.95"));
         assert!(markdown.contains("tags: dark_mode, ui"));
+    }
+
+    #[test]
+    fn test_retrieved_memory_response_serializes_lineage_sources() {
+        let response = RetrievedMemoryResponse {
+            memory: GetMemoryResponse {
+                id: Uuid::new_v4(),
+                owner_id: "owner123".to_string(),
+                scope_id: Some("scope456".to_string()),
+                content: "用户更喜欢 Rust".to_string(),
+                category: Some("preference.tech.programming_language".to_string()),
+                tags: None,
+                importance: 0.9,
+                confidence: 0.9,
+                root_memory_id: Some(Uuid::new_v4()),
+                version_number: 2,
+                is_current_version: true,
+                supersedes: Some(Uuid::new_v4()),
+                superseded_by: None,
+                is_global: false,
+                hit_count: 0,
+                last_hit_at: None,
+                reinforcement_count: 0,
+                last_reinforced_at: None,
+                decay_score: 1.0,
+                source_event_id: None,
+                status: crate::domain::Status::Active,
+                embedding_status: crate::domain::EmbeddingStatus::Completed,
+                embedding_provider: Some("openai".to_string()),
+                processing_status: crate::domain::ProcessingStatus::Completed,
+                llm_provider: Some("openai".to_string()),
+                conflict_reason: None,
+                consistency_confidence: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            score: 0.91,
+            similarity: 0.88,
+            text_match_score: Some(0.77),
+            highlights: None,
+            evidence: None,
+            history: None,
+            merged_lineage_sources: Some(vec![LineageSourceResponse {
+                source_memory_id: "old-memory-id".to_string(),
+                lineage_to_current: vec![
+                    "old-memory-id".to_string(),
+                    "current-memory-id".to_string(),
+                ],
+            }]),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["merged_lineage_sources"][0]["source_memory_id"],
+            "old-memory-id"
+        );
+        assert_eq!(
+            json["merged_lineage_sources"][0]["lineage_to_current"][1],
+            "current-memory-id"
+        );
     }
 }

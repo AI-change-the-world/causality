@@ -16,13 +16,13 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::RetrievalConfig;
 use crate::domain::{Event, Memory, Status};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::repository::{AuditOperation, AuditRepository, EventRepository, MemoryRepository};
 
 /// Category query type for hierarchical category matching
@@ -125,6 +125,17 @@ pub struct MemoryHistory {
     pub versions: Vec<Memory>,
     /// The current (latest) version
     pub current_version: Option<Memory>,
+}
+
+/// Resolution from any memory in a supersede chain to the latest current version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentMemoryResolution {
+    /// The memory requested by the caller
+    pub requested_memory: Memory,
+    /// The latest current version reached by traversal
+    pub current_memory: Memory,
+    /// Inclusive path from the requested memory to the current version
+    pub lineage_to_current: Vec<Memory>,
 }
 
 /// A memory with retrieval scores and optional evidence/history
@@ -241,6 +252,8 @@ impl RetrievalEngine {
         let fulltext_weight = request
             .fulltext_weight
             .unwrap_or(self.config.score_weights.fulltext);
+        let query_has_search_text = !request.query.trim().is_empty();
+        let require_search_signal = query_has_search_text && (use_vector || use_fulltext);
 
         // Step 1: Structured filtering (PostgreSQL)
         // - profile_id (required for system namespace isolation)
@@ -301,12 +314,13 @@ impl RetrievalEngine {
         // Step 4: Compute composite scores
         let mut scored_memories: Vec<RetrievedMemory> = candidates
             .into_iter()
-            .map(|memory| {
-                // Get similarity from Qdrant results, default to 0.5 if not found
+            .filter_map(|memory| {
+                // When a query is present, require at least one retrieval signal
+                // so unrelated current memories cannot surface purely on metadata.
                 let similarity = if use_vector {
-                    similarity_map.get(&memory.id).copied().unwrap_or(0.5)
+                    similarity_map.get(&memory.id).copied()
                 } else {
-                    0.0
+                    None
                 };
 
                 // Get full-text score
@@ -316,6 +330,18 @@ impl RetrievalEngine {
                     None
                 };
 
+                if require_search_signal
+                    && !Self::has_retrieval_signal(
+                        similarity,
+                        text_match_score,
+                        use_vector,
+                        use_fulltext,
+                    )
+                {
+                    return None;
+                }
+
+                let similarity = similarity.unwrap_or(0.0);
                 let score = self.compute_composite_score_with_fulltext(
                     &memory,
                     similarity,
@@ -325,7 +351,7 @@ impl RetrievalEngine {
                     use_fulltext,
                 );
 
-                RetrievedMemory {
+                Some(RetrievedMemory {
                     memory,
                     score,
                     similarity,
@@ -333,7 +359,7 @@ impl RetrievalEngine {
                     highlights: None,
                     evidence: None,
                     history: None,
-                }
+                })
             })
             .collect();
 
@@ -443,6 +469,17 @@ impl RetrievalEngine {
     /// With cooldown penalty applied if status is Cooldown
     pub fn compute_composite_score(&self, memory: &Memory, similarity: f32) -> f32 {
         self.compute_composite_score_with_fulltext(memory, similarity, 0.0, 0.0, true, false)
+    }
+
+    fn has_retrieval_signal(
+        similarity: Option<f32>,
+        fulltext_score: Option<f32>,
+        use_vector: bool,
+        use_fulltext: bool,
+    ) -> bool {
+        let has_vector_signal = use_vector && similarity.is_some_and(|score| score > 0.0);
+        let has_fulltext_signal = use_fulltext && fulltext_score.is_some_and(|score| score > 0.0);
+        has_vector_signal || has_fulltext_signal
     }
 
     /// Compute composite score for a memory with full-text search support
@@ -593,6 +630,69 @@ impl RetrievalEngine {
             current_version,
         })
     }
+
+    /// Resolve any memory in a supersede chain to the latest current version.
+    ///
+    /// Traverses `superseded_by` links until a memory marked as current is reached.
+    /// Returns the inclusive path so callers can both jump to latest and inspect
+    /// every transition in between.
+    pub async fn resolve_to_current_memory(
+        &self,
+        memory_id: Uuid,
+    ) -> AppResult<CurrentMemoryResolution> {
+        const MAX_SUPERSEDE_HOPS: usize = 128;
+
+        let requested_memory = self.memory_repo.get_by_id(memory_id).await?;
+        let mut current = requested_memory.clone();
+        let mut lineage_to_current = Vec::new();
+        let mut visited = HashSet::new();
+
+        for _ in 0..=MAX_SUPERSEDE_HOPS {
+            if !visited.insert(current.id) {
+                return Err(AppError::Internal(format!(
+                    "Cycle detected while resolving supersede chain from memory {}",
+                    memory_id
+                )));
+            }
+
+            lineage_to_current.push(current.clone());
+
+            if current.is_current_version {
+                return Ok(CurrentMemoryResolution {
+                    requested_memory,
+                    current_memory: current,
+                    lineage_to_current,
+                });
+            }
+
+            let next_id = current.superseded_by.ok_or_else(|| {
+                AppError::Internal(format!(
+                    "Broken supersede chain: memory {} is not current but has no superseded_by successor",
+                    current.id
+                ))
+            })?;
+
+            current = match self.memory_repo.get_by_id(next_id).await {
+                Ok(memory) => memory,
+                Err(AppError::MemoryNotFound(_)) => {
+                    return Err(AppError::Internal(format!(
+                        "Broken supersede chain: memory {} points to missing successor {}",
+                        lineage_to_current
+                            .last()
+                            .map(|memory| memory.id)
+                            .unwrap_or(memory_id),
+                        next_id
+                    )));
+                }
+                Err(other) => return Err(other),
+            };
+        }
+
+        Err(AppError::Internal(format!(
+            "Supersede chain from memory {} exceeded max depth {}",
+            memory_id, MAX_SUPERSEDE_HOPS
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -725,5 +825,57 @@ mod tests {
             query.as_prefix_pattern(),
             Some("work.code.eslint".to_string())
         );
+    }
+
+    #[test]
+    fn test_has_retrieval_signal_requires_an_actual_match() {
+        assert!(!RetrievalEngine::has_retrieval_signal(
+            None, None, true, true
+        ));
+        assert!(!RetrievalEngine::has_retrieval_signal(
+            Some(0.0),
+            Some(0.0),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_has_retrieval_signal_accepts_vector_only_match() {
+        assert!(RetrievalEngine::has_retrieval_signal(
+            Some(0.42),
+            None,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_has_retrieval_signal_accepts_fulltext_only_match() {
+        assert!(RetrievalEngine::has_retrieval_signal(
+            None,
+            Some(0.18),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_current_memory_resolution_serialization() {
+        let requested = test_memory(Status::Superseded);
+        let mut current = test_memory(Status::Active);
+        current.is_current_version = true;
+
+        let resolution = CurrentMemoryResolution {
+            requested_memory: requested.clone(),
+            current_memory: current.clone(),
+            lineage_to_current: vec![requested.clone(), current.clone()],
+        };
+
+        let json = serde_json::to_value(&resolution).unwrap();
+        assert_eq!(json["requested_memory"]["id"], requested.id.to_string());
+        assert_eq!(json["current_memory"]["id"], current.id.to_string());
+        assert_eq!(json["lineage_to_current"][0]["id"], requested.id.to_string());
+        assert_eq!(json["lineage_to_current"][1]["id"], current.id.to_string());
     }
 }
