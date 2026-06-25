@@ -490,6 +490,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             "Extracted memories from event successfully"
         );
 
+        let mut working_context_memories = context.context_memories.clone();
+
         // Track results
         let mut created_memory_ids = Vec::new();
         let mut reinforced_memory_ids = Vec::new();
@@ -517,7 +519,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
             let matches = Self::merge_schema_aware_matches(
                 vector_matches,
                 extracted,
-                &context.context_memories,
+                &working_context_memories,
                 &context.profile.metadata_schema,
             );
 
@@ -566,6 +568,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     )
                     .await;
 
+                    Self::upsert_working_context_memory(&mut working_context_memories, &memory);
                     created_memory_ids.push(memory.id);
                 }
                 ReconcileOutcome::Reinforce {
@@ -656,6 +659,11 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     )
                     .await;
 
+                    Self::replace_superseded_context_memory(
+                        &mut working_context_memories,
+                        superseded_id,
+                        &new_memory,
+                    );
                     created_memory_ids.push(new_memory.id);
                     superseded_memory_ids.push(superseded_id);
                 }
@@ -932,6 +940,26 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
         });
         matches.truncate(20);
         matches
+    }
+
+    fn upsert_working_context_memory(context_memories: &mut Vec<Memory>, memory: &Memory) {
+        if let Some(existing) = context_memories.iter_mut().find(|item| item.id == memory.id) {
+            *existing = memory.clone();
+        } else {
+            context_memories.push(memory.clone());
+        }
+    }
+
+    fn replace_superseded_context_memory(
+        context_memories: &mut Vec<Memory>,
+        superseded_id: Uuid,
+        new_memory: &Memory,
+    ) {
+        if let Some(existing) = context_memories.iter_mut().find(|item| item.id == superseded_id) {
+            existing.mark_superseded(new_memory.id);
+        }
+
+        Self::upsert_working_context_memory(context_memories, new_memory);
     }
 
     fn stable_schema_match_fields(metadata_schema: &Value) -> Vec<String> {
@@ -1246,5 +1274,77 @@ mod tests {
         );
 
         assert!(score.is_none());
+    }
+
+    #[test]
+    fn test_replace_superseded_context_memory_marks_old_and_adds_new() {
+        let profile_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let old_memory = Memory::new_from_event(crate::domain::CreateMemoryFromEventInput {
+            profile_id,
+            owner_id: "user-1".to_string(),
+            scope_id: Some("scope-1".to_string()),
+            content: "用户觉得300万的房子有点贵".to_string(),
+            metadata: json!({
+                "memory_type": "housing_preference",
+                "preference_category": "budget"
+            }),
+            schema_version: 1,
+            importance: 0.8,
+            confidence: 0.9,
+            source_event_id: event_id,
+            embedding_provider: None,
+            llm_provider: None,
+            inference_type: crate::domain::InferenceType::Preference,
+            inference_confidence: 0.9,
+            inference_reasoning: "预算偏好".to_string(),
+        });
+
+        let new_memory = Memory::new_superseding(crate::domain::CreateSupersedingMemoryInput {
+            old_memory_id: old_memory.id,
+            root_memory_id: old_memory.root_memory_id.unwrap_or(old_memory.id),
+            version_number: old_memory.version_number + 1,
+            profile_id,
+            owner_id: "user-1".to_string(),
+            scope_id: Some("scope-1".to_string()),
+            content: "用户税后预算能力提高，愿意为了居住体验考虑更高预算".to_string(),
+            metadata: json!({
+                "memory_type": "housing_preference",
+                "preference_category": "budget"
+            }),
+            schema_version: 1,
+            importance: 0.9,
+            confidence: 0.95,
+            is_global: false,
+            source_event_id: event_id,
+            embedding_provider: None,
+            llm_provider: None,
+            inference_type: crate::domain::InferenceType::Preference,
+            inference_confidence: 0.95,
+            inference_reasoning: "预算变化".to_string(),
+        });
+
+        let mut context_memories = vec![old_memory.clone()];
+        MemoryGuard::<AlwaysConsistentChecker>::replace_superseded_context_memory(
+            &mut context_memories,
+            old_memory.id,
+            &new_memory,
+        );
+
+        let old_entry = context_memories
+            .iter()
+            .find(|memory| memory.id == old_memory.id)
+            .expect("old memory should remain for lineage");
+        assert!(!old_entry.is_current_version);
+        assert_eq!(old_entry.status, crate::domain::Status::Superseded);
+        assert_eq!(old_entry.superseded_by, Some(new_memory.id));
+
+        let new_entry = context_memories
+            .iter()
+            .find(|memory| memory.id == new_memory.id)
+            .expect("new memory should be added");
+        assert!(new_entry.is_current_version);
+        assert_eq!(new_entry.status, crate::domain::Status::Active);
+        assert_eq!(new_entry.supersedes, Some(old_memory.id));
     }
 }

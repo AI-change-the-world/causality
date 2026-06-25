@@ -40,7 +40,7 @@ const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据
         "description": "该类型 memory 的定义",
         "fields": {
           "memory_type": { "type": "string", "required": true, "filterable": true },
-          "example_field": { "type": "string", "required": false, "filterable": true }
+          "example_field": { "type": "string", "required": false, "filterable": true, "enum": ["example_a", "example_b"] }
         },
         "candidate_match_fields": ["memory_type"],
         "conflict_fields": ["memory_type"],
@@ -72,7 +72,12 @@ const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据
 - metadata_schema 必须是业务专属的 schema proposal，不要使用固定通用字段凑数
 - metadata_schema 中的字段要以记忆检索、候选缩圈、冲突判断为目标
 - metadata_schema 的字段设计要和 extraction_prompt 对齐：如果 extraction_prompt 会要求识别预算变化、约束变更、决策阶段、偏好对象，那么 schema 应提供相应的 filterable 字段或分组字段
+- 对荐房、导购、筛选这类“同一类别下会出现多个具体选项”的业务，不要只给粗粒度 category 字段；应额外提供能够区分具体对象/目标的字段，如 preference_target / object / location_value / style_value，避免“湖边”和“海边”都坍缩成同一个 location 偏好
+- candidate_match_fields / conflict_fields / lineage_group_fields 在这类业务中应优先包含“具体对象/目标字段”，否则系统无法正确判断是同一偏好被反转，还是新增了另一个并存偏好
+- 如果某些字段存在稳定值域（如 memory_type、preference_category、sentiment、decision_stage、event_type），应尽量在 metadata_schema.fields.<field>.enum 中显式给出枚举值，方便调用方和后端做一致校验
 - schema_generation_prompt 必须能直接指导下游生成符合 schema 的 metadata JSON
+- schema_generation_prompt 必须引用这些 canonical 枚举值，明确要求下游不要使用自然语言近义词替代 schema 里的标准值
+- schema_generation_prompt 还应明确：当用户表达的是某个具体偏好对象（如湖边、海边、学区、朝南、法式风格）时，必须同时保留“类别”和“具体对象值”，不要只保留粗粒度 category
 - 如果用户描述的是垂直业务，请优先生成贴近该领域的 event_type / object / preference / constraint / stage / risk 结构，不要退回通用空泛字段
 - 不要输出 markdown，不要附加解释，只返回 JSON"#;
 

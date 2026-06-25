@@ -239,6 +239,16 @@ pub struct RetrievalConfig {
     pub max_top_k: usize,
     #[serde(default = "default_cooldown_penalty")]
     pub cooldown_penalty: f32,
+    #[serde(default = "default_adaptive_expansion_enabled")]
+    pub adaptive_expansion_enabled: bool,
+    #[serde(default = "default_short_memory_char_threshold")]
+    pub short_memory_char_threshold: usize,
+    #[serde(default = "default_short_memory_context_budget_chars")]
+    pub short_memory_context_budget_chars: usize,
+    #[serde(default = "default_short_memory_max_results")]
+    pub short_memory_max_results: usize,
+    #[serde(default = "default_short_memory_score_slack")]
+    pub short_memory_score_slack: f32,
     #[serde(default)]
     pub score_weights: ScoreWeights,
 }
@@ -253,6 +263,26 @@ fn default_max_top_k() -> usize {
 
 fn default_cooldown_penalty() -> f32 {
     0.5
+}
+
+fn default_adaptive_expansion_enabled() -> bool {
+    true
+}
+
+fn default_short_memory_char_threshold() -> usize {
+    120
+}
+
+fn default_short_memory_context_budget_chars() -> usize {
+    2400
+}
+
+fn default_short_memory_max_results() -> usize {
+    20
+}
+
+fn default_short_memory_score_slack() -> f32 {
+    0.08
 }
 
 /// Score weights for composite scoring
@@ -308,6 +338,11 @@ impl Default for RetrievalConfig {
             default_top_k: default_top_k(),
             max_top_k: default_max_top_k(),
             cooldown_penalty: default_cooldown_penalty(),
+            adaptive_expansion_enabled: default_adaptive_expansion_enabled(),
+            short_memory_char_threshold: default_short_memory_char_threshold(),
+            short_memory_context_budget_chars: default_short_memory_context_budget_chars(),
+            short_memory_max_results: default_short_memory_max_results(),
+            short_memory_score_slack: default_short_memory_score_slack(),
             score_weights: ScoreWeights::default(),
         }
     }
@@ -397,6 +432,11 @@ impl AppConfig {
             .set_default("retrieval.default_top_k", 10)?
             .set_default("retrieval.max_top_k", 100)?
             .set_default("retrieval.cooldown_penalty", 0.5)?
+            .set_default("retrieval.adaptive_expansion_enabled", true)?
+            .set_default("retrieval.short_memory_char_threshold", 120)?
+            .set_default("retrieval.short_memory_context_budget_chars", 2400)?
+            .set_default("retrieval.short_memory_max_results", 20)?
+            .set_default("retrieval.short_memory_score_slack", 0.08)?
             .set_default("matching.match_similarity_threshold", 0.70)?
             .set_default("matching.conflict_check_similarity_threshold", 0.70)?
             .set_default("matching.max_match_candidates", 10)?
@@ -428,6 +468,11 @@ impl AppConfig {
             .set_default("retrieval.default_top_k", 10)?
             .set_default("retrieval.max_top_k", 100)?
             .set_default("retrieval.cooldown_penalty", 0.5)?
+            .set_default("retrieval.adaptive_expansion_enabled", true)?
+            .set_default("retrieval.short_memory_char_threshold", 120)?
+            .set_default("retrieval.short_memory_context_budget_chars", 2400)?
+            .set_default("retrieval.short_memory_max_results", 20)?
+            .set_default("retrieval.short_memory_score_slack", 0.08)?
             .set_default("matching.match_similarity_threshold", 0.70)?
             .set_default("matching.conflict_check_similarity_threshold", 0.70)?
             .set_default("matching.max_match_candidates", 10)?

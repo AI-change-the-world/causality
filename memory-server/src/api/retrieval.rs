@@ -376,7 +376,7 @@ pub async fn retrieve_memories(
                 let vector_limit = if metadata_filter_applied {
                     top_k.saturating_mul(20).clamp(top_k, 1000)
                 } else {
-                    top_k.saturating_mul(2)
+                    top_k.saturating_mul(4).clamp(top_k, 400)
                 };
                 let search_results = match state
                     .qdrant_repo
@@ -679,7 +679,7 @@ pub async fn auto_retrieve_memories(
                 .search(
                     embedding_provider_name,
                     query_embedding.embedding,
-                    top_k * 2,
+                    top_k.saturating_mul(4).clamp(top_k, 400),
                     Some(filter),
                 )
                 .await

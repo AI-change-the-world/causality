@@ -342,8 +342,8 @@ impl RetrievalEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Take top-K
-        scored_memories.truncate(top_k);
+        let selected_count = Self::adaptive_result_count(&scored_memories, top_k, &self.config);
+        scored_memories.truncate(selected_count);
 
         // Step 6: Get highlights if requested
         if highlight && use_fulltext && !request.query.trim().is_empty() {
@@ -444,6 +444,56 @@ impl RetrievalEngine {
         let has_vector_signal = use_vector && similarity.is_some_and(|score| score > 0.0);
         let has_fulltext_signal = use_fulltext && fulltext_score.is_some_and(|score| score > 0.0);
         has_vector_signal || has_fulltext_signal
+    }
+
+    fn adaptive_result_count(
+        scored_memories: &[RetrievedMemory],
+        requested_top_k: usize,
+        config: &RetrievalConfig,
+    ) -> usize {
+        let base_count = requested_top_k.min(scored_memories.len());
+        if !config.adaptive_expansion_enabled || base_count == 0 {
+            return base_count;
+        }
+
+        let expansion_cap = config
+            .short_memory_max_results
+            .max(requested_top_k)
+            .min(scored_memories.len());
+        if expansion_cap <= base_count {
+            return base_count;
+        }
+
+        let base_slice = &scored_memories[..base_count];
+        let total_chars: usize = base_slice.iter().map(|item| item.memory.content.chars().count()).sum();
+        let avg_chars = total_chars / base_count;
+        if avg_chars > config.short_memory_char_threshold
+            || total_chars >= config.short_memory_context_budget_chars
+        {
+            return base_count;
+        }
+
+        let score_floor = base_slice
+            .last()
+            .map(|item| item.score - config.short_memory_score_slack)
+            .unwrap_or(0.0);
+
+        let mut selected_count = base_count;
+        let mut accumulated_chars = total_chars;
+        for item in scored_memories.iter().skip(base_count).take(expansion_cap - base_count) {
+            let content_chars = item.memory.content.chars().count();
+            if accumulated_chars + content_chars > config.short_memory_context_budget_chars {
+                break;
+            }
+            if item.score < score_floor {
+                break;
+            }
+
+            accumulated_chars += content_chars;
+            selected_count += 1;
+        }
+
+        selected_count
     }
 
     /// Compute composite score for a memory with full-text search support
@@ -671,6 +721,11 @@ mod tests {
             default_top_k: 10,
             max_top_k: 100,
             cooldown_penalty: 0.5,
+            adaptive_expansion_enabled: true,
+            short_memory_char_threshold: 120,
+            short_memory_context_budget_chars: 2400,
+            short_memory_max_results: 20,
+            short_memory_score_slack: 0.08,
             score_weights: ScoreWeights {
                 similarity: 0.35,
                 importance: 0.25,
@@ -826,5 +881,49 @@ mod tests {
             requested.id.to_string()
         );
         assert_eq!(json["lineage_to_current"][1]["id"], current.id.to_string());
+    }
+
+    #[test]
+    fn test_adaptive_result_count_expands_for_short_memories() {
+        let config = test_config();
+        let mut results = Vec::new();
+        for score in [0.92_f32, 0.88, 0.85, 0.83, 0.81] {
+            let mut memory = test_memory(Status::Active);
+            memory.content = "short memory".to_string();
+            results.push(RetrievedMemory {
+                memory,
+                score,
+                similarity: score,
+                text_match_score: None,
+                highlights: None,
+                evidence: None,
+                history: None,
+            });
+        }
+
+        let selected = RetrievalEngine::adaptive_result_count(&results, 2, &config);
+        assert!(selected > 2);
+    }
+
+    #[test]
+    fn test_adaptive_result_count_keeps_base_for_long_memories() {
+        let config = test_config();
+        let mut results = Vec::new();
+        for score in [0.92_f32, 0.88, 0.85, 0.83] {
+            let mut memory = test_memory(Status::Active);
+            memory.content = "x".repeat(200);
+            results.push(RetrievedMemory {
+                memory,
+                score,
+                similarity: score,
+                text_match_score: None,
+                highlights: None,
+                evidence: None,
+                history: None,
+            });
+        }
+
+        let selected = RetrievalEngine::adaptive_result_count(&results, 2, &config);
+        assert_eq!(selected, 2);
     }
 }

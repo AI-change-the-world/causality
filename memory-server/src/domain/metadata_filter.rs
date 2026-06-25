@@ -84,6 +84,7 @@ impl MetadataFilter {
         }
 
         let filterable_fields = filterable_fields_from_schema(metadata_schema);
+        let field_constraints = field_constraints_from_schema(metadata_schema);
         if filterable_fields.is_empty() {
             return Err(AppError::Validation(
                 "metadata_filter requires profile metadata_schema.filterable_fields".to_string(),
@@ -104,7 +105,7 @@ impl MetadataFilter {
                         field
                     )));
                 }
-                predicate.validate(field)?;
+                predicate.validate(field, field_constraints.get(field))?;
             }
         }
 
@@ -122,9 +123,11 @@ impl MetadataFilter {
 }
 
 impl MetadataFilterPredicate {
-    fn validate(&self, field: &str) -> AppResult<()> {
+    fn validate(&self, field: &str, constraint: Option<&FieldConstraint>) -> AppResult<()> {
         match self {
-            MetadataFilterPredicate::Eq(_) => Ok(()),
+            MetadataFilterPredicate::Eq(value) => {
+                validate_field_value_against_constraint(field, value, constraint)
+            }
             MetadataFilterPredicate::Operators(operators) => {
                 let operator_count = usize::from(operators.eq.is_some())
                     + usize::from(operators.ne.is_some())
@@ -150,6 +153,18 @@ impl MetadataFilterPredicate {
                             "metadata_filter field '{}'.in supports at most {} values",
                             field, MAX_IN_VALUES
                         )));
+                    }
+                }
+
+                if let Some(value) = &operators.eq {
+                    validate_field_value_against_constraint(field, value, constraint)?;
+                }
+                if let Some(value) = &operators.ne {
+                    validate_field_value_against_constraint(field, value, constraint)?;
+                }
+                if let Some(values) = &operators.in_values {
+                    for value in values {
+                        validate_field_value_against_constraint(field, value, constraint)?;
                     }
                 }
 
@@ -244,6 +259,103 @@ fn filterable_fields_from_schema(metadata_schema: &Value) -> BTreeSet<String> {
     fields
 }
 
+#[derive(Debug, Clone)]
+enum FieldConstraint {
+    Enum(Vec<Value>),
+}
+
+#[derive(Debug, Clone)]
+enum FieldConstraintState {
+    Collecting(Vec<Value>),
+    Unconstrained,
+}
+
+fn field_constraints_from_schema(metadata_schema: &Value) -> BTreeMap<String, FieldConstraint> {
+    let mut states: BTreeMap<String, FieldConstraintState> = BTreeMap::new();
+
+    if let Some(entity_types) = metadata_schema
+        .get("entity_types")
+        .and_then(|value| value.as_object())
+    {
+        for entity in entity_types.values() {
+            let Some(entity_fields) = entity.get("fields").and_then(|value| value.as_object()) else {
+                continue;
+            };
+
+            for (field_name, field_schema) in entity_fields {
+                let is_filterable = field_schema
+                    .get("filterable")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if !is_filterable {
+                    continue;
+                }
+
+                let state = states
+                    .entry(field_name.clone())
+                    .or_insert(FieldConstraintState::Collecting(Vec::new()));
+
+                if matches!(state, FieldConstraintState::Unconstrained) {
+                    continue;
+                }
+
+                let Some(enum_values) = field_schema.get("enum").and_then(|value| value.as_array()) else {
+                    *state = FieldConstraintState::Unconstrained;
+                    continue;
+                };
+
+                if enum_values.is_empty() {
+                    *state = FieldConstraintState::Unconstrained;
+                    continue;
+                }
+
+                if let FieldConstraintState::Collecting(existing) = state {
+                    for value in enum_values {
+                        if !existing.iter().any(|item| item == value) {
+                            existing.push(value.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    states
+        .into_iter()
+        .filter_map(|(field, state)| match state {
+            FieldConstraintState::Collecting(values) if !values.is_empty() => {
+                Some((field, FieldConstraint::Enum(values)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn validate_field_value_against_constraint(
+    field: &str,
+    value: &Value,
+    constraint: Option<&FieldConstraint>,
+) -> AppResult<()> {
+    let Some(constraint) = constraint else {
+        return Ok(());
+    };
+
+    match constraint {
+        FieldConstraint::Enum(allowed_values) => {
+            if allowed_values.iter().any(|allowed| allowed == value) {
+                return Ok(());
+            }
+
+            Err(AppError::Validation(format!(
+                "metadata_filter field '{}' value {} is not allowed by profile schema enum {}",
+                field,
+                value,
+                Value::Array(allowed_values.clone())
+            )))
+        }
+    }
+}
+
 fn lookup_metadata_value<'a>(metadata: &'a Value, field: &str) -> Option<&'a Value> {
     let object = metadata.as_object()?;
     if let Some(value) = object.get(field) {
@@ -281,8 +393,32 @@ mod tests {
 
     fn schema() -> Value {
         json!({
-            "filterable_fields": ["memory_type", "subject", "topics"],
-            "entity_types": {}
+            "filterable_fields": ["memory_type", "subject", "topics", "sentiment"],
+            "entity_types": {
+                "housing_preference": {
+                    "fields": {
+                        "memory_type": {
+                            "type": "string",
+                            "required": true,
+                            "filterable": true,
+                            "enum": ["housing_preference"]
+                        },
+                        "subject": {
+                            "type": "string",
+                            "filterable": true
+                        },
+                        "topics": {
+                            "type": "array",
+                            "filterable": true
+                        },
+                        "sentiment": {
+                            "type": "string",
+                            "filterable": true,
+                            "enum": ["positive", "negative", "neutral"]
+                        }
+                    }
+                }
+            }
         })
     }
 
@@ -290,7 +426,7 @@ mod tests {
     fn validates_filterable_fields() {
         let filter: MetadataFilter = serde_json::from_value(json!({
             "where": [
-                {"memory_type": {"eq": "preference"}},
+                {"memory_type": {"eq": "housing_preference"}},
                 {"subject": {"in": ["rust", "cpp"]}}
             ]
         }))
@@ -340,5 +476,29 @@ mod tests {
 
         assert!(filter.matches(&json!({"memory_type": "fact"})));
         assert!(!filter.matches(&json!({"subject": "rust"})));
+    }
+
+    #[test]
+    fn rejects_values_outside_schema_enum() {
+        let filter: MetadataFilter = serde_json::from_value(json!({
+            "where": [{"sentiment": {"eq": "积极"}}]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            filter.validate_against_schema(&schema()),
+            Err(AppError::Validation(message))
+            if message.contains("sentiment") && message.contains("not allowed")
+        ));
+    }
+
+    #[test]
+    fn accepts_values_inside_schema_enum() {
+        let filter: MetadataFilter = serde_json::from_value(json!({
+            "where": [{"sentiment": {"eq": "positive"}}]
+        }))
+        .unwrap();
+
+        assert!(filter.validate_against_schema(&schema()).is_ok());
     }
 }

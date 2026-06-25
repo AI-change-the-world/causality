@@ -582,6 +582,7 @@ def build_metadata_filter_with_openai(
     timeout: int,
 ) -> dict[str, Any]:
     schema = profile.get("metadata_schema") or {}
+    schema_generation_prompt = profile.get("schema_generation_prompt") or ""
     filterable_fields = schema.get("filterable_fields") or []
     if not filterable_fields:
         logger.warning("profile schema has no filterable_fields; skip filter planning")
@@ -600,6 +601,8 @@ def build_metadata_filter_with_openai(
                 "只能使用 metadata_schema.filterable_fields 中声明的字段。"
                 "如果问题不能可靠映射到 schema 字段，返回空 filter：{\"where\": []}。"
                 "不要为了显得聪明而杜撰 schema 中没有的字段或枚举值。"
+                "如果 schema_generation_prompt 或 metadata_schema 给了字段允许值，你必须使用其中的 canonical value，而不是用户问题里的自然语言别名。"
+                "例如用户说“购房能力”，如果 schema 里只有 budget，就应该映射为 budget；如果无法可靠映射，则返回空 filter。"
             ),
         },
         {
@@ -609,6 +612,7 @@ def build_metadata_filter_with_openai(
                 f"profile domain: {profile.get('domain')}\n"
                 f"filterable_fields: {pretty_json(filterable_fields)}\n"
                 f"metadata_schema:\n{pretty_json(schema)}\n\n"
+                f"schema_generation_prompt:\n{schema_generation_prompt}\n\n"
                 f"用户问题：{question}\n\n"
                 "请返回：\n"
                 "{\n"
