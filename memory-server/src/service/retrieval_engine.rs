@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::RetrievalConfig;
-use crate::domain::{Event, Memory, Status};
+use crate::domain::{Event, Memory, MetadataFilter, Status};
 use crate::error::{AppError, AppResult};
 use crate::repository::{AuditOperation, AuditRepository, EventRepository, MemoryRepository};
 
@@ -49,6 +49,9 @@ pub struct RetrieveRequest {
     pub use_vector: Option<bool>,
     /// Custom weight for full-text search score (overrides config)
     pub fulltext_weight: Option<f32>,
+    /// Profile-defined metadata filter used to narrow candidates before scoring
+    #[serde(default)]
+    pub metadata_filter: Option<MetadataFilter>,
     /// Whether to return highlighted snippets (default: false)
     #[serde(default)]
     pub highlight: Option<bool>,
@@ -121,8 +124,10 @@ pub struct RetrievedMemory {
 pub struct RetrieveResponse {
     /// Retrieved memories sorted by score
     pub memories: Vec<RetrievedMemory>,
-    /// Total candidates after structured filtering
+    /// Total candidates after namespace/scope filtering, before metadata filtering
     pub total_candidates: usize,
+    /// Total candidates after metadata filtering
+    pub filtered_candidates: usize,
 }
 
 /// RetrievalEngine service for memory search and retrieval
@@ -191,6 +196,7 @@ impl RetrievalEngine {
             use_vector = ?request.use_vector,
             include_evidence = ?request.include_evidence,
             include_history = ?request.include_history,
+            metadata_filter = ?request.metadata_filter,
             "Retrieving memories"
         );
 
@@ -216,27 +222,30 @@ impl RetrievalEngine {
         // - status NOT IN ('superseded', 'archived') (default)
         // - scope_id + is_global combined query
         let include_global = request.scope_id.is_some(); // Include global when scope is specified
-        let candidates = self
+        let (candidates, total_candidates) = self
             .memory_repo
-            .find_for_retrieval_by_profile(
+            .find_for_retrieval_by_profile_with_metadata_filter(
                 request.profile_id,
                 &request.owner_id,
                 request.scope_id.as_deref(),
                 include_global,
+                request.metadata_filter.as_ref(),
             )
             .await?;
 
-        let total_candidates = candidates.len();
+        let filtered_candidates = candidates.len();
 
         debug!(
             total_candidates = total_candidates,
+            filtered_candidates = filtered_candidates,
             "Structured filtering complete"
         );
 
         if candidates.is_empty() {
             return Ok(RetrieveResponse {
                 memories: vec![],
-                total_candidates: 0,
+                total_candidates,
+                filtered_candidates: 0,
             });
         }
 
@@ -383,12 +392,14 @@ impl RetrievalEngine {
         info!(
             returned = scored_memories.len(),
             total_candidates = total_candidates,
+            filtered_candidates = filtered_candidates,
             "Retrieval complete"
         );
 
         Ok(RetrieveResponse {
             memories: scored_memories,
             total_candidates,
+            filtered_candidates,
         })
     }
 

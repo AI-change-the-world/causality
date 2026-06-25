@@ -525,6 +525,7 @@ impl LlmConsistencyChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::InferenceType;
 
     #[test]
     fn test_reconciler_config_default() {

@@ -11,12 +11,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{postgres::PgRow, FromRow, PgPool, Postgres, Row, Transaction};
+use sqlx::{postgres::PgRow, FromRow, PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use crate::domain::{
     EmbeddingStatus, EventMemoryRelation, EventMemoryRelationType, InferenceType, Memory,
-    ProcessingStatus, Status,
+    MetadataFilter, MetadataFilterOperators, MetadataFilterPredicate, ProcessingStatus, Status,
 };
 use crate::error::{AppError, AppResult};
 
@@ -656,6 +656,218 @@ impl MemoryRepository {
         .await?;
 
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Find retrieval candidates and apply an optional profile-defined metadata filter in SQL.
+    ///
+    /// Returns `(memories_after_metadata_filter, total_before_metadata_filter)`.
+    pub async fn find_for_retrieval_by_profile_with_metadata_filter(
+        &self,
+        profile_id: Uuid,
+        owner_id: &str,
+        scope_id: Option<&str>,
+        include_global: bool,
+        metadata_filter: Option<&MetadataFilter>,
+    ) -> AppResult<(Vec<Memory>, usize)> {
+        let total_before_metadata = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM memories
+            WHERE profile_id = $1
+              AND owner_id = $2
+              AND is_current_version = true
+              AND status NOT IN ('superseded', 'archived')
+              AND (
+                ($3::text IS NULL AND is_global = true)
+                OR (
+                  $3::text IS NOT NULL
+                  AND (scope_id = $3 OR ($4 = true AND is_global = true))
+                )
+              )
+            "#,
+        )
+        .bind(profile_id)
+        .bind(owner_id)
+        .bind(scope_id)
+        .bind(include_global)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {} FROM memories WHERE profile_id = ",
+            MEMORY_COLUMNS
+        ));
+        builder.push_bind(profile_id);
+        builder.push(" AND owner_id = ");
+        builder.push_bind(owner_id);
+        builder.push(
+            " AND is_current_version = true
+              AND status NOT IN ('superseded', 'archived')
+              AND ((",
+        );
+        builder.push_bind(scope_id);
+        builder.push("::text IS NULL AND is_global = true) OR (");
+        builder.push_bind(scope_id);
+        builder.push("::text IS NOT NULL AND (scope_id = ");
+        builder.push_bind(scope_id);
+        builder.push(" OR (");
+        builder.push_bind(include_global);
+        builder.push(" = true AND is_global = true))))");
+
+        if let Some(filter) = metadata_filter {
+            if !filter.is_empty() {
+                builder.push(" AND ");
+                Self::push_metadata_filter_sql(&mut builder, filter);
+            }
+        }
+
+        builder.push(" ORDER BY decay_score DESC, updated_at DESC LIMIT 1000");
+
+        let rows = builder
+            .build_query_as::<MemoryRow>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok((
+            rows.into_iter().map(Into::into).collect(),
+            total_before_metadata as usize,
+        ))
+    }
+
+    fn push_metadata_filter_sql(builder: &mut QueryBuilder<'_, Postgres>, filter: &MetadataFilter) {
+        if filter.is_empty() {
+            builder.push("TRUE");
+            return;
+        }
+
+        builder.push("(");
+        for (clause_index, clause) in filter.clauses.iter().enumerate() {
+            if clause_index > 0 {
+                builder.push(" AND ");
+            }
+
+            builder.push("(");
+            for (predicate_index, (field, predicate)) in clause.0.iter().enumerate() {
+                if predicate_index > 0 {
+                    builder.push(" AND ");
+                }
+                Self::push_metadata_predicate_sql(builder, field, predicate);
+            }
+            builder.push(")");
+        }
+        builder.push(")");
+    }
+
+    fn push_metadata_predicate_sql(
+        builder: &mut QueryBuilder<'_, Postgres>,
+        field: &str,
+        predicate: &MetadataFilterPredicate,
+    ) {
+        match predicate {
+            MetadataFilterPredicate::Eq(expected) => {
+                Self::push_metadata_value_matches_sql(builder, field, expected);
+            }
+            MetadataFilterPredicate::Operators(operators) => {
+                Self::push_metadata_operators_sql(builder, field, operators);
+            }
+        }
+    }
+
+    fn push_metadata_operators_sql(
+        builder: &mut QueryBuilder<'_, Postgres>,
+        field: &str,
+        operators: &MetadataFilterOperators,
+    ) {
+        let mut wrote_predicate = false;
+        builder.push("(");
+
+        if let Some(exists) = operators.exists {
+            Self::push_and_if_needed(builder, &mut wrote_predicate);
+            Self::push_metadata_exists_sql(builder, field, exists);
+        }
+
+        if let Some(expected) = &operators.eq {
+            Self::push_and_if_needed(builder, &mut wrote_predicate);
+            Self::push_metadata_value_matches_sql(builder, field, expected);
+        }
+
+        if let Some(expected) = &operators.ne {
+            Self::push_and_if_needed(builder, &mut wrote_predicate);
+            builder.push("(");
+            Self::push_metadata_path_expr(builder, field);
+            builder.push(" IS NOT NULL AND NOT ");
+            Self::push_metadata_value_matches_sql(builder, field, expected);
+            builder.push(")");
+        }
+
+        if let Some(values) = &operators.in_values {
+            Self::push_and_if_needed(builder, &mut wrote_predicate);
+            builder.push("(");
+            for (index, expected) in values.iter().enumerate() {
+                if index > 0 {
+                    builder.push(" OR ");
+                }
+                Self::push_metadata_value_matches_sql(builder, field, expected);
+            }
+            builder.push(")");
+        }
+
+        if !wrote_predicate {
+            builder.push("TRUE");
+        }
+
+        builder.push(")");
+    }
+
+    fn push_and_if_needed(builder: &mut QueryBuilder<'_, Postgres>, wrote_predicate: &mut bool) {
+        if *wrote_predicate {
+            builder.push(" AND ");
+        }
+        *wrote_predicate = true;
+    }
+
+    fn push_metadata_exists_sql(
+        builder: &mut QueryBuilder<'_, Postgres>,
+        field: &str,
+        exists: bool,
+    ) {
+        builder.push("(");
+        Self::push_metadata_path_expr(builder, field);
+        if exists {
+            builder.push(" IS NOT NULL AND ");
+            Self::push_metadata_path_expr(builder, field);
+            builder.push(" <> 'null'::jsonb");
+        } else {
+            builder.push(" IS NULL OR ");
+            Self::push_metadata_path_expr(builder, field);
+            builder.push(" = 'null'::jsonb");
+        }
+        builder.push(")");
+    }
+
+    fn push_metadata_value_matches_sql(
+        builder: &mut QueryBuilder<'_, Postgres>,
+        field: &str,
+        expected: &Value,
+    ) {
+        builder.push("(");
+        Self::push_metadata_path_expr(builder, field);
+        builder.push(" = ");
+        builder.push_bind(expected.clone());
+        builder.push("::jsonb OR (jsonb_typeof(");
+        Self::push_metadata_path_expr(builder, field);
+        builder.push(") = 'array' AND ");
+        Self::push_metadata_path_expr(builder, field);
+        builder.push(" @> jsonb_build_array(");
+        builder.push_bind(expected.clone());
+        builder.push("::jsonb)))");
+    }
+
+    fn push_metadata_path_expr(builder: &mut QueryBuilder<'_, Postgres>, field: &str) {
+        let path: Vec<String> = field.split('.').map(str::to_string).collect();
+        builder.push("(metadata #> ");
+        builder.push_bind(path);
+        builder.push("::text[])");
     }
 
     /// Find context memories for event processing

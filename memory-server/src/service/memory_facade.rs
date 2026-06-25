@@ -110,6 +110,7 @@ impl MemoryFacade {
             use_fulltext: Some(true),
             use_vector: Some(true),
             fulltext_weight: None,
+            metadata_filter: None,
             highlight: Some(false),
             include_evidence: Some(false),
             include_history: Some(false),

@@ -127,6 +127,10 @@ pub struct AppState {
         retrieval::AutoRetrieveApiRequest,
         retrieval::AutoRetrieveApiResponse,
         retrieval::AutoRetrieveRecord,
+        crate::domain::MetadataFilter,
+        crate::domain::MetadataFilterClause,
+        crate::domain::MetadataFilterOperators,
+        crate::domain::MetadataFilterPredicate,
         // Admin types
         admin::EvictionRequest,
         admin::EvictionResponse,

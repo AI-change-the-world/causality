@@ -32,7 +32,7 @@ const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据
   "event_categories": ["可能的事件类型列表"],
   "memory_focus": ["需要关注的记忆类型"],
   "boundaries": ["系统不处理的内容"],
-  "extraction_prompt": "一段完整的 prompt，用于指导 LLM 将原始事件解析为该业务系统专属的 JSON 分析结果。输出应偏向 event analysis payload，而不是固定六要素。prompt 里要明确提取哪些事件字段、如何归纳意图、对象、状态变化、风险、结论等。",
+  "extraction_prompt": "一段完整的 prompt，用于指导 LLM 将原始事件解析为该业务系统专属的 JSON 分析结果。输出应偏向 event analysis payload，而不是固定六要素。prompt 里要明确提取哪些事件字段、如何归纳意图、对象、状态变化、风险、结论等，并且要能识别业务内高价值的隐含变化信号。",
   "metadata_schema": {
     "version": 1,
     "entity_types": {
@@ -63,9 +63,17 @@ const PARSE_PROFILE_PROMPT: &str = r#"你是一个系统配置助手。请根据
 - memory_focus 应该是对该业务有价值的用户信息类型
 - boundaries 应该明确系统的边界，避免功能发散
 - extraction_prompt 应该是一个完整的、可直接使用的 prompt 模板，输出事件分析 JSON
+- extraction_prompt 不要只是泛化摘要器，而要像该业务领域的分析引擎
+- extraction_prompt 必须明确：什么信息即使是隐含表达，也应该被识别为“条件变化/预算变化/目标变化/决策状态变化”
+- extraction_prompt 必须优先服务后续记忆抽取、记忆更新、候选缩圈和冲突判断，而不是只做对话总结
+- extraction_prompt 必须告诉下游模型：如果一句话反映了用户资源能力变化、约束放宽/收紧、偏好强化/反转、决策推进/停滞，这属于高价值事件，不应轻易输出空对象
+- 如果业务描述中存在“推荐、选购、筛选、决策、咨询、偏好、约束、预算、风险、阶段”这类语义，extraction_prompt 应显式覆盖这些维度
+- 对带有状态变化的业务（如荐房、导购、教育规划、旅行决策），extraction_prompt 应能识别“以前/现在”“原本/后来”“预算紧/预算放宽”“不接受/现在可考虑”这类变化表达
 - metadata_schema 必须是业务专属的 schema proposal，不要使用固定通用字段凑数
 - metadata_schema 中的字段要以记忆检索、候选缩圈、冲突判断为目标
+- metadata_schema 的字段设计要和 extraction_prompt 对齐：如果 extraction_prompt 会要求识别预算变化、约束变更、决策阶段、偏好对象，那么 schema 应提供相应的 filterable 字段或分组字段
 - schema_generation_prompt 必须能直接指导下游生成符合 schema 的 metadata JSON
+- 如果用户描述的是垂直业务，请优先生成贴近该领域的 event_type / object / preference / constraint / stage / risk 结构，不要退回通用空泛字段
 - 不要输出 markdown，不要附加解释，只返回 JSON"#;
 
 /// Service for managing SystemProfile
@@ -426,6 +434,7 @@ impl ProfileService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn test_extract_json_from_code_block() {

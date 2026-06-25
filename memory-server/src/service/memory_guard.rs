@@ -9,6 +9,8 @@
 //! Requirements: 2.1, 3.1, 3.2, 3.3, 3.4
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -445,7 +447,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
         // Step 2: Build a schema-aware extraction request
         let extract_request = if let Some(ref analysis) = event_analysis {
-            let enhanced_context = Self::build_enhanced_context(event, &analysis.payload);
+            let enhanced_context =
+                Self::build_enhanced_context(event, &analysis.payload, &context.context_memories);
             ExtractFromEventRequest::with_context(
                 event.content.clone(),
                 enhanced_context,
@@ -464,7 +467,10 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                 context.profile.schema_generation_prompt.clone(),
                 context.profile.schema_version,
             );
-            request.context = event.context.clone();
+            request.context = Some(Self::build_raw_extraction_context(
+                event,
+                &context.context_memories,
+            ));
             request
         };
 
@@ -498,7 +504,7 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                 .await
                 .map_err(|e| AppError::Internal(format!("Embedding generation failed: {}", e)))?;
 
-            let matches = context
+            let vector_matches = context
                 .memory_matcher
                 .find_similar(
                     event.profile_id,
@@ -508,6 +514,12 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
                     &context.embedding_provider_name,
                 )
                 .await?;
+            let matches = Self::merge_schema_aware_matches(
+                vector_matches,
+                extracted,
+                &context.context_memories,
+                &context.profile.metadata_schema,
+            );
 
             debug!(
                 match_count = matches.len(),
@@ -822,7 +834,11 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
     ///
     /// Combines the original event context with analysis payload
     /// to provide richer context for memory extraction.
-    fn build_enhanced_context(event: &Event, analysis_payload: &serde_json::Value) -> String {
+    fn build_enhanced_context(
+        event: &Event,
+        analysis_payload: &Value,
+        context_memories: &[Memory],
+    ) -> String {
         let mut context_parts = Vec::new();
 
         // Add original context if present
@@ -832,8 +848,205 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 
         context_parts.push("事件分析结果(JSON):".to_string());
         context_parts.push(analysis_payload.to_string());
+        Self::push_context_memories(&mut context_parts, context_memories);
 
         context_parts.join("\n")
+    }
+
+    fn build_raw_extraction_context(event: &Event, context_memories: &[Memory]) -> String {
+        let mut context_parts = Vec::new();
+
+        if let Some(ref ctx) = event.context {
+            context_parts.push(format!("原始上下文: {}", ctx));
+        }
+
+        Self::push_context_memories(&mut context_parts, context_memories);
+        context_parts.join("\n")
+    }
+
+    fn push_context_memories(context_parts: &mut Vec<String>, context_memories: &[Memory]) {
+        if context_memories.is_empty() {
+            return;
+        }
+
+        context_parts
+            .push("用户历史记忆（用于判断是否需要强化、放宽、推翻或更新旧记忆）:".to_string());
+        for (index, memory) in context_memories.iter().take(30).enumerate() {
+            context_parts.push(format!(
+                "{}. id={} version={} current={} metadata={} content={}",
+                index + 1,
+                memory.id,
+                memory.version_number,
+                memory.is_current_version,
+                memory.metadata,
+                memory.content
+            ));
+        }
+    }
+
+    fn merge_schema_aware_matches(
+        vector_matches: Vec<super::MatchResult>,
+        extracted: &super::ExtractedMemory,
+        context_memories: &[Memory],
+        metadata_schema: &Value,
+    ) -> Vec<super::MatchResult> {
+        let schema_match_fields = Self::stable_schema_match_fields(metadata_schema);
+        if schema_match_fields.is_empty() {
+            return vector_matches;
+        }
+
+        let mut matches_by_id: HashMap<Uuid, super::MatchResult> = HashMap::new();
+        for item in vector_matches {
+            matches_by_id.insert(item.memory.id, item);
+        }
+
+        for memory in context_memories {
+            if !memory.is_current_version || memory.status != crate::domain::Status::Active {
+                continue;
+            }
+
+            let Some(schema_score) = Self::schema_metadata_match_score(
+                &extracted.metadata,
+                &memory.metadata,
+                &schema_match_fields,
+            ) else {
+                continue;
+            };
+
+            matches_by_id
+                .entry(memory.id)
+                .and_modify(|item| {
+                    item.similarity_score = item.similarity_score.max(schema_score);
+                })
+                .or_insert_with(|| super::MatchResult {
+                    memory: memory.clone(),
+                    similarity_score: schema_score,
+                });
+        }
+
+        let mut matches: Vec<super::MatchResult> = matches_by_id.into_values().collect();
+        matches.sort_by(|a, b| {
+            b.similarity_score
+                .partial_cmp(&a.similarity_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(20);
+        matches
+    }
+
+    fn stable_schema_match_fields(metadata_schema: &Value) -> Vec<String> {
+        let mut fields = BTreeSet::new();
+        let volatile_fields = [
+            "sentiment",
+            "polarity",
+            "status",
+            "state",
+            "decision_stage",
+            "constraint_flag",
+        ];
+
+        if let Some(entity_types) = metadata_schema
+            .get("entity_types")
+            .and_then(|value| value.as_object())
+        {
+            for entity in entity_types.values() {
+                for key in [
+                    "lineage_group_fields",
+                    "candidate_match_fields",
+                    "conflict_fields",
+                ] {
+                    if let Some(items) = entity.get(key).and_then(|value| value.as_array()) {
+                        for item in items {
+                            if let Some(field) = item.as_str() {
+                                if !volatile_fields.contains(&field) {
+                                    fields.insert(field.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(filterable_fields) = metadata_schema
+            .get("filterable_fields")
+            .and_then(|value| value.as_array())
+        {
+            for item in filterable_fields {
+                if let Some(field) = item.as_str() {
+                    if matches!(
+                        field,
+                        "subject"
+                            | "topic"
+                            | "object"
+                            | "entity_type"
+                            | "preference_category"
+                            | "category"
+                            | "memory_type"
+                    ) {
+                        fields.insert(field.to_string());
+                    }
+                }
+            }
+        }
+
+        fields.into_iter().collect()
+    }
+
+    fn schema_metadata_match_score(
+        new_metadata: &Value,
+        existing_metadata: &Value,
+        fields: &[String],
+    ) -> Option<f32> {
+        let mut matched_fields = 0usize;
+        let mut matched_non_type_fields = 0usize;
+
+        for field in fields {
+            let Some(new_value) = Self::lookup_metadata_value(new_metadata, field) else {
+                continue;
+            };
+            let Some(existing_value) = Self::lookup_metadata_value(existing_metadata, field) else {
+                continue;
+            };
+            if !Self::metadata_values_overlap(new_value, existing_value) {
+                continue;
+            }
+
+            matched_fields += 1;
+            if field != "memory_type" && field != "entity_type" {
+                matched_non_type_fields += 1;
+            }
+        }
+
+        if matched_non_type_fields == 0 {
+            return None;
+        }
+
+        Some((0.88 + matched_fields as f32 * 0.03).min(0.97))
+    }
+
+    fn lookup_metadata_value<'a>(metadata: &'a Value, field: &str) -> Option<&'a Value> {
+        if let Some(value) = metadata.as_object()?.get(field) {
+            return Some(value);
+        }
+
+        let mut current = metadata;
+        for part in field.split('.') {
+            current = current.get(part)?;
+        }
+        Some(current)
+    }
+
+    fn metadata_values_overlap(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::Array(left_items), Value::Array(right_items)) => left_items
+                .iter()
+                .any(|left| right_items.iter().any(|right| left == right)),
+            (Value::Array(items), value) | (value, Value::Array(items)) => {
+                items.iter().any(|item| item == value)
+            }
+            _ => left == right,
+        }
     }
 
     async fn upsert_event_memory_vector(
@@ -936,6 +1149,8 @@ impl<C: ConsistencyChecker> MemoryGuard<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::AlwaysConsistentChecker;
+    use serde_json::json;
 
     #[test]
     fn test_update_request_validation_valid() {
@@ -980,5 +1195,56 @@ mod tests {
             decay_score: None,
         };
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_schema_metadata_match_scores_domain_group_fields() {
+        let metadata_schema = json!({
+            "entity_types": {
+                "housing_preference": {
+                    "candidate_match_fields": ["preference_category", "sentiment"],
+                    "lineage_group_fields": ["preference_category", "decision_stage"],
+                    "conflict_fields": ["preference_category", "sentiment"]
+                }
+            },
+            "filterable_fields": ["memory_type", "preference_category", "sentiment"]
+        });
+        let fields =
+            MemoryGuard::<AlwaysConsistentChecker>::stable_schema_match_fields(&metadata_schema);
+
+        let score = MemoryGuard::<AlwaysConsistentChecker>::schema_metadata_match_score(
+            &json!({
+                "memory_type": "housing_preference",
+                "preference_category": "budget",
+                "sentiment": "positive"
+            }),
+            &json!({
+                "memory_type": "housing_preference",
+                "preference_category": "budget",
+                "sentiment": "negative"
+            }),
+            &fields,
+        );
+
+        assert!(score.is_some());
+    }
+
+    #[test]
+    fn test_schema_metadata_match_ignores_type_only_match() {
+        let fields = vec!["memory_type".to_string(), "preference_category".to_string()];
+
+        let score = MemoryGuard::<AlwaysConsistentChecker>::schema_metadata_match_score(
+            &json!({
+                "memory_type": "housing_preference",
+                "preference_category": "budget"
+            }),
+            &json!({
+                "memory_type": "housing_preference",
+                "preference_category": "style"
+            }),
+            &fields,
+        );
+
+        assert!(score.is_none());
     }
 }

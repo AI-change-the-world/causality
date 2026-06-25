@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::api::memory::GetMemoryResponse;
 use crate::api::AppState;
-use crate::domain::{Event, EventSource, Memory};
+use crate::domain::{Event, EventSource, Memory, MetadataFilter};
 use crate::error::AppResult;
 use crate::service::{CurrentMemoryResolution, MemoryHistory, RetrieveRequest, RetrievedMemory};
 
@@ -41,6 +41,9 @@ pub struct RetrieveApiRequest {
     /// Advanced retrieval controls. Omit for the standard recall path.
     #[serde(default)]
     pub options: RetrieveOptions,
+    /// Profile-defined metadata filter used to narrow candidates before scoring.
+    #[serde(default)]
+    pub metadata_filter: Option<MetadataFilter>,
 }
 
 /// Advanced retrieval options for callers that need scoring/debug controls.
@@ -80,6 +83,7 @@ impl RetrieveApiRequest {
             use_fulltext: options.use_fulltext,
             use_vector: options.use_vector,
             fulltext_weight: options.fulltext_weight,
+            metadata_filter: self.metadata_filter,
             highlight: options.highlight,
             include_evidence: options.include_evidence,
             include_history: options.include_history,
@@ -220,6 +224,10 @@ pub struct RetrievalTraceResponse {
     pub vector_candidate_count: usize,
     /// Number of candidates after structured filtering
     pub structured_candidate_count: usize,
+    /// Whether a profile-defined metadata filter was supplied and applied
+    pub metadata_filter_applied: bool,
+    /// Number of candidates after metadata filtering
+    pub metadata_filtered_candidate_count: usize,
     /// Number of final results after lineage collapse
     pub final_result_count: usize,
 }
@@ -323,6 +331,10 @@ pub async fn retrieve_memories(
     use tracing::{debug, warn};
 
     let request_body = request;
+    if let Some(metadata_filter) = &request_body.metadata_filter {
+        let profile = state.profile_service.get_by_id(profile_id).await?;
+        metadata_filter.validate_against_schema(&profile.metadata_schema)?;
+    }
 
     debug!(
         profile_id = %profile_id,
@@ -336,6 +348,10 @@ pub async fn retrieve_memories(
     let top_k = request_body.top_k.unwrap_or(10);
     let use_vector = request_body.options.use_vector.unwrap_or(true);
     let use_fulltext = request_body.options.use_fulltext.unwrap_or(true);
+    let metadata_filter_applied = request_body
+        .metadata_filter
+        .as_ref()
+        .is_some_and(|filter| !filter.is_empty());
     let mut all_similarities: Vec<(uuid::Uuid, f32)> = Vec::new();
 
     // Step 1: Try vector search if enabled
@@ -357,12 +373,17 @@ pub async fn retrieve_memories(
                 };
 
                 // Search in the global provider's Qdrant collection
+                let vector_limit = if metadata_filter_applied {
+                    top_k.saturating_mul(20).clamp(top_k, 1000)
+                } else {
+                    top_k.saturating_mul(2)
+                };
                 let search_results = match state
                     .qdrant_repo
                     .search(
                         embedding_provider_name,
                         query_embedding.embedding,
-                        top_k * 2, // Get more candidates for filtering
+                        vector_limit,
                         Some(filter),
                     )
                     .await
@@ -438,7 +459,9 @@ pub async fn retrieve_memories(
             used_fulltext: use_fulltext,
             scope_id: request_body.scope_id,
             vector_candidate_count,
-            structured_candidate_count: result.total_candidates,
+            structured_candidate_count: result.filtered_candidates,
+            metadata_filter_applied,
+            metadata_filtered_candidate_count: result.filtered_candidates,
             final_result_count,
         },
     };
@@ -697,6 +720,7 @@ pub async fn auto_retrieve_memories(
         use_fulltext: Some(true),
         use_vector: Some(has_vector_results),
         fulltext_weight: None,
+        metadata_filter: None,
         highlight: Some(true),
         include_evidence: None,
         include_history: None,
@@ -754,7 +778,9 @@ pub async fn auto_retrieve_memories(
             used_fulltext: true,
             scope_id: request_body.scope_id,
             vector_candidate_count,
-            structured_candidate_count: result.total_candidates,
+            structured_candidate_count: result.filtered_candidates,
+            metadata_filter_applied: false,
+            metadata_filtered_candidate_count: result.filtered_candidates,
             final_result_count: result.memories.len(),
         },
         markdown,
@@ -796,6 +822,12 @@ mod tests {
             owner_id: "owner123".to_string(),
             scope_id: Some("scope456".to_string()),
             top_k: Some(20),
+            metadata_filter: Some(
+                serde_json::from_value(serde_json::json!({
+                    "where": [{"memory_type": {"eq": "preference"}}]
+                }))
+                .unwrap(),
+            ),
             options: RetrieveOptions {
                 min_score: Some(0.5),
                 min_confidence: Some(0.7),
@@ -829,6 +861,10 @@ mod tests {
             retrieve_request.fulltext_weight,
             api_request.options.fulltext_weight
         );
+        assert_eq!(
+            retrieve_request.metadata_filter,
+            api_request.metadata_filter
+        );
         assert_eq!(retrieve_request.highlight, api_request.options.highlight);
         assert_eq!(
             retrieve_request.include_evidence,
@@ -849,6 +885,7 @@ mod tests {
             scope_id: None,
             top_k: None,
             options: RetrieveOptions::default(),
+            metadata_filter: None,
         };
 
         let retrieve_request = api_request.into_service_request(profile_id);
@@ -863,6 +900,7 @@ mod tests {
         assert!(retrieve_request.use_fulltext.is_none());
         assert!(retrieve_request.use_vector.is_none());
         assert!(retrieve_request.fulltext_weight.is_none());
+        assert!(retrieve_request.metadata_filter.is_none());
         assert!(retrieve_request.highlight.is_none());
         assert!(retrieve_request.include_evidence.is_none());
         assert!(retrieve_request.include_history.is_none());
@@ -878,6 +916,25 @@ mod tests {
         let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
         assert_eq!(api_request.query, "test query");
         assert_eq!(api_request.owner_id, "owner123");
+        assert!(api_request.metadata_filter.is_none());
+    }
+
+    #[test]
+    fn test_retrieve_request_parsing_with_metadata_filter() {
+        let json = r#"{
+            "query": "用户喜欢什么语言",
+            "owner_id": "owner123",
+            "metadata_filter": {
+                "where": [
+                    {"memory_type": {"in": ["preference", "skill"]}},
+                    {"subject": "programming_language"}
+                ]
+            }
+        }"#;
+
+        let api_request: RetrieveApiRequest = serde_json::from_str(json).unwrap();
+        let filter = api_request.metadata_filter.unwrap();
+        assert_eq!(filter.clauses.len(), 2);
     }
 
     #[test]

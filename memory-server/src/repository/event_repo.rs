@@ -99,7 +99,7 @@ impl EventRepository {
     /// This prevents duplicate workers or repeated requests from processing the
     /// same event concurrently.
     pub async fn claim_for_processing(&self, profile_id: Uuid, id: Uuid) -> AppResult<Event> {
-        let row = sqlx::query_as::<_, EventRow>(
+        let row = sqlx::query_as::<_, EventRow>(&format!(
             r#"
             UPDATE events
             SET processing_status = 'processing'::processing_status,
@@ -111,12 +111,10 @@ impl EventRepository {
             WHERE id = $1
               AND profile_id = $2
               AND processing_status = 'pending'::processing_status
-            RETURNING
-                id, profile_id, owner_id, scope_id, content, context,
-                summary, source, processing_status, error_message, processed_at,
-                skipped, skip_reason, relevance_score, event_time, created_at
+            RETURNING {}
             "#,
-        )
+            EVENT_COLUMNS
+        ))
         .bind(id)
         .bind(profile_id)
         .fetch_optional(&self.pool)

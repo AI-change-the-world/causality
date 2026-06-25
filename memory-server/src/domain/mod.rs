@@ -10,6 +10,7 @@
 
 mod event;
 mod memory;
+mod metadata_filter;
 mod profile;
 mod status;
 
@@ -20,6 +21,9 @@ pub use event::{
 pub use memory::{
     CreateMemoryFromEventInput, CreateMemoryInput, CreateMemoryValidation,
     CreateSupersedingMemoryInput, Memory,
+};
+pub use metadata_filter::{
+    MetadataFilter, MetadataFilterClause, MetadataFilterOperators, MetadataFilterPredicate,
 };
 pub use profile::{
     CreateProfileInput, ParsedProfile, ProfileValidation, SchemaStatus, SystemProfile,
