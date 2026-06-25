@@ -9,6 +9,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
+    response::Html,
     routing::{get, post, put},
     Json, Router,
 };
@@ -178,9 +179,18 @@ pub fn profile_routes() -> Router<AppState> {
     Router::new()
         .route("/", post(create_profile))
         .route("/", get(list_profiles))
+        .route("/ui", get(profile_editor_page))
         .route("/{profile_id}", get(get_profile_by_id))
         .route("/{profile_id}", put(update_profile_by_id))
         .route("/{profile_id}/schema/confirm", post(confirm_profile_schema))
+}
+
+fn profile_editor_html() -> &'static str {
+    include_str!("profile_editor.html")
+}
+
+pub async fn profile_editor_page() -> Html<&'static str> {
+    Html(profile_editor_html())
 }
 
 /// POST /api/v1/systems - Create a system profile namespace
@@ -442,5 +452,12 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"profile\""));
         assert!(json.contains("\"confirmed\""));
+    }
+
+    #[test]
+    fn test_profile_editor_page_contains_prompt_editor() {
+        let html = profile_editor_html();
+        assert!(html.contains("extraction_prompt"));
+        assert!(html.contains("/api/v1/systems"));
     }
 }

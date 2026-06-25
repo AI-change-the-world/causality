@@ -573,3 +573,8 @@ cargo test --test integration
 ---
 
 **Memory Framework - 让 AI 应用拥有可靠的记忆** 🧠✨
+
+
+---
+**ui**: http://localhost:8080/api/v1/systems/ui
+**swagger**: http://localhost:8080/swagger-ui/
